@@ -32,14 +32,14 @@ if not ENTREZ_EMAIL:
 # Rate limits (requests per second)
 RATE_LIMIT_WITHOUT_KEY = 3
 RATE_LIMIT_WITH_KEY = 10
-FETCH_BATCH_SIZE = 100       # PMIDs per Entrez fetch call
+FETCH_BATCH_SIZE = 500       # PMIDs per efetch call (NCBI allows up to 10k; 500 is safe)
 FETCH_RETRIES = 3
 FETCH_RETRY_DELAY = 2        # seconds, doubles on each retry
 
 # ── Query / result sizing ─────────────────────────────────────────────────────
 MAX_RESULTS_DEFAULT = 1000
 MAX_RESULTS_MIN = 100
-MAX_RESULTS_MAX = 2000
+MAX_RESULTS_MAX = 10000
 
 # ── NLP / Embeddings ──────────────────────────────────────────────────────────
 SCISPACY_MODEL = "en_core_sci_lg"
