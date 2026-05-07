@@ -1,0 +1,155 @@
+"""Chat with Literature page — multi-turn Gemini chat grounded in loaded papers."""
+
+import streamlit as st
+import config
+from ui.components.cards import empty_state
+from utils.helpers import pubmed_url
+
+
+_STARTER_QUESTIONS = [
+    "What are the main research themes in this dataset?",
+    "Which entities are most studied in relation to this topic?",
+    "What experimental methods appear most frequently?",
+    "Identify the top research groups in this field.",
+    "What are the most cited findings in these papers?",
+]
+
+
+def render():
+    if not st.session_state.get("pipeline_complete"):
+        empty_state("💬", "No data loaded yet",
+                    "Run a search on the Home page first.")
+        return
+
+    papers_df = st.session_state.get("papers_df")
+    embedder  = st.session_state.get("embedder")
+    db        = st.session_state.get("db")
+
+    # ── Page header ───────────────────────────────────────────────────────────
+    hcol, clr_col = st.columns([5, 1])
+    with hcol:
+        st.markdown(
+            f"<h2 style='margin-bottom:4px'>Chat with Literature</h2>"
+            f"<p style='color:{config.TEXT_SECONDARY};font-size:13px;margin-bottom:0'>"
+            f"Ask questions about the loaded paper set. Responses are grounded strictly "
+            f"in retrieved papers — Gemini cites PMIDs from your dataset.</p>",
+            unsafe_allow_html=True,
+        )
+    with clr_col:
+        if st.button("Clear chat", key="chat_clear"):
+            st.session_state["chat_history"] = []
+            st.rerun()
+
+    st.markdown(
+        f"<hr style='border-color:{config.BORDER_COLOR};margin:0.75rem 0'>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Initialise chat history ───────────────────────────────────────────────
+    if "chat_history" not in st.session_state:
+        st.session_state["chat_history"] = []
+
+    history = st.session_state["chat_history"]
+
+    # ── Starter suggestions (shown only before first message) ─────────────────
+    if not history:
+        st.markdown(
+            f"<p style='font-size:13px;color:{config.TEXT_SECONDARY};"
+            f"margin-bottom:8px'>Suggested questions:</p>",
+            unsafe_allow_html=True,
+        )
+        for q in _STARTER_QUESTIONS:
+            if st.button(q, key=f"starter_{q[:20]}", use_container_width=True):
+                _send_message(q, papers_df, embedder)
+                st.rerun()
+
+    # ── Chat history display ──────────────────────────────────────────────────
+    for turn in history:
+        role = turn.get("role", "user")
+        content = turn.get("content", "")
+        sources = turn.get("sources", [])
+
+        if role == "user":
+            st.markdown(
+                f"<div style='display:flex;justify-content:flex-end;margin-bottom:6px'>"
+                f"<div class='chat-user'>{content}</div></div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f"<div style='margin-bottom:6px'>"
+                f"<div class='chat-ai'>{content}</div></div>",
+                unsafe_allow_html=True,
+            )
+            if sources:
+                with st.expander(f"📄 Sources ({len(sources)} papers)", expanded=False):
+                    for pmid in sources:
+                        url = pubmed_url(pmid)
+                        row = papers_df[papers_df["pmid"] == pmid] if papers_df is not None else None
+                        if row is not None and not row.empty:
+                            title = str(row.iloc[0].get("title", ""))[:80]
+                            year  = row.iloc[0].get("pub_year", "")
+                            st.markdown(
+                                f"<a href='{url}' target='_blank' style='text-decoration:none;"
+                                f"font-size:12px;color:{config.PRIMARY_ACCENT}'>"
+                                f"[PMID:{pmid}] ({year}) {title}</a>",
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                f"<a href='{url}' target='_blank' "
+                                f"class='pmid-tag'>PMID:{pmid}</a>",
+                                unsafe_allow_html=True,
+                            )
+
+    # ── Input bar fixed at bottom ─────────────────────────────────────────────
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    msg_col, send_col = st.columns([5, 1])
+    with msg_col:
+        user_msg = st.text_input(
+            "Message",
+            placeholder="Ask anything about the loaded papers...",
+            label_visibility="collapsed",
+            key="chat_input",
+        )
+    with send_col:
+        send = st.button("Send", type="primary", use_container_width=True, key="chat_send")
+
+    if send and user_msg.strip():
+        _send_message(user_msg.strip(), papers_df, embedder)
+        st.rerun()
+
+
+def _send_message(message: str, papers_df, embedder):
+    """Send a message to Gemini and append to chat history."""
+    history = st.session_state.get("chat_history", [])
+
+    # Append user turn first for immediate display
+    history.append({"role": "user", "content": message})
+
+    with st.spinner("Thinking..."):
+        try:
+            from pipeline.hypothesis_generator import HypothesisGenerator
+            gen = HypothesisGenerator(embedding_engine=embedder)
+            gen.setup()
+
+            response_text, source_pmids = gen.chat_about_literature(
+                user_message=message,
+                conversation_history=history[:-1],  # exclude current user turn
+                papers_df=papers_df,
+            )
+
+            history.append({
+                "role": "assistant",
+                "content": response_text,
+                "sources": source_pmids,
+            })
+
+        except Exception as exc:
+            history.append({
+                "role": "assistant",
+                "content": f"⚠️ Error generating response: {exc}",
+                "sources": [],
+            })
+
+    st.session_state["chat_history"] = history
