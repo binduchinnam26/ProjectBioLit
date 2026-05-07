@@ -275,9 +275,9 @@ class NLPProcessor:
         """
         self._check_ready()
 
-        def _cb(done: int, total: int, msg: str):
+        def _cb(entities: int, rels: int, msg: str):
             if progress_callback:
-                progress_callback(done, total, msg)
+                progress_callback(entities, rels, msg)
 
         if papers_df.empty:
             return pd.DataFrame(), pd.DataFrame()
@@ -349,7 +349,12 @@ class NLPProcessor:
                     })
 
             processed = batch_end
-            _cb(processed, total, f"NLP: {processed}/{total} papers processed...")
+            _cb(
+                len(all_entities),
+                len(all_relationships),
+                f"NLP: {processed}/{total} papers | "
+                f"{len(all_entities):,} entities | {len(all_relationships):,} rels",
+            )
 
         # Batch-persist to database (single transaction — much faster)
         entity_id_map: Dict = {}
@@ -365,8 +370,11 @@ class NLPProcessor:
             except Exception as exc:
                 logger.error("Batch relationship insert failed: %s", exc)
 
-        _cb(total, total,
-            f"NLP complete: {len(all_entities)} entities, {len(all_relationships)} relationships")
+        _cb(
+            len(all_entities),
+            len(all_relationships),
+            f"NLP complete: {len(all_entities):,} entities, {len(all_relationships):,} relationships",
+        )
         logger.info(
             "process_corpus done: %d entities, %d relationships across %d papers",
             len(all_entities), len(all_relationships), total,
