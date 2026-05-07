@@ -29,6 +29,39 @@ def _free_mb() -> int:
     except Exception:
         return 9999  # can't check → assume OK
 
+
+def _auto_cleanup_disk() -> int:
+    """
+    Delete old parquet caches, FAISS indexes, and compact the SQLite WAL file
+    to reclaim disk space.  Returns MB freed (approximate).
+    Safe to call at any time — only removes re-generatable cache files.
+    """
+    import sqlite3 as _sqlite3
+    freed = 0
+    for pattern in ("*.parquet",):
+        for p in Path(config.PROCESSED_DIR).glob(pattern):
+            try:
+                freed += p.stat().st_size
+                p.unlink()
+            except Exception:
+                pass
+    for pattern in ("*.faiss", "*.json"):
+        for p in Path(config.EMBEDDINGS_DIR).glob(pattern):
+            try:
+                freed += p.stat().st_size
+                p.unlink()
+            except Exception:
+                pass
+    # Checkpoint + shrink the SQLite WAL file
+    try:
+        conn = _sqlite3.connect(config.DB_PATH)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("VACUUM")
+        conn.close()
+    except Exception:
+        pass
+    return freed // (1024 * 1024)
+
 _PIPELINE_STEPS = [
     "Fetching Papers",
     "Parsing XML",
@@ -156,21 +189,28 @@ def _run_pipeline(
     from pipeline.network_builder import NetworkBuilder
     from pipeline.knowledge_graph import KnowledgeGraph
 
-    # ── Disk space pre-check ──────────────────────────────────────────────────
+    # ── Disk space pre-check + auto-cleanup ──────────────────────────────────
     free_mb = _free_mb()
+    if free_mb < _DISK_WARN_MB:
+        freed_mb = _auto_cleanup_disk()
+        free_mb  = _free_mb()   # re-measure after cleanup
+        if freed_mb > 0:
+            st.info(f"🧹 Auto-cleaned {freed_mb} MB of old cache files. {free_mb} MB now free.")
+
     low_disk = free_mb < _DISK_WARN_MB
     no_disk  = free_mb < _DISK_MIN_MB
+
     if no_disk:
         st.error(
-            f"❌ Critical: only {free_mb} MB free on disk. "
-            "The pipeline will run in memory-only mode — results will NOT be saved "
-            "and some steps may fail. Free at least 500 MB before running again."
+            f"❌ Critical: only {free_mb} MB free on disk after cleanup. "
+            "The pipeline will run in memory-only mode — results will NOT be saved. "
+            "Please free at least 500 MB on your drive before running again."
         )
     elif low_disk:
         st.warning(
             f"⚠️ Low disk space: {free_mb} MB free. "
-            "Parquet cache and FAISS index will be skipped to avoid write errors. "
-            "Free more space for full persistence."
+            "Parquet cache and FAISS index will be skipped. "
+            "Free more drive space for full persistence between sessions."
         )
 
     db = DatabaseManager(config.DB_PATH)
@@ -317,8 +357,8 @@ def _run_pipeline(
             nlp.setup()
             entities_df, relationships_df = nlp.process_corpus(
                 papers_df,
-                progress_callback=lambda d, t, m: _update(4, m, papers=len(papers_df),
-                                                           ents=d, rels=0),
+                progress_callback=lambda ents, rels, m: _update(4, m, papers=len(papers_df),
+                                                               ents=ents, rels=rels),
             )
         except Exception as exc:
             logger.warning("NLP step skipped (%s). Knowledge graph will be limited.", exc)
