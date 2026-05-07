@@ -87,16 +87,36 @@ HYPOTHESIS_API_DELAY = 2     # seconds between Gemini calls
 
 # ── Visualization ─────────────────────────────────────────────────────────────
 COMMUNITY_COLORS = [
+    "#E8534A",  # red
     "#3B82F6",  # blue
-    "#8B5CF6",  # violet
     "#10B981",  # emerald
     "#F59E0B",  # amber
-    "#EF4444",  # red
+    "#8B5CF6",  # violet
+    "#EC4899",  # pink
     "#06B6D4",  # cyan
     "#F97316",  # orange
-    "#EC4899",  # pink
     "#84CC16",  # lime
     "#14B8A6",  # teal
+    "#A855F7",  # purple
+    "#22C55E",  # green
+    "#EAB308",  # yellow
+    "#6366F1",  # indigo
+    "#D946EF",  # fuchsia
+    "#0EA5E9",  # sky
+    "#FB923C",  # orange-400
+    "#4ADE80",  # green-400
+    "#C084FC",  # purple-400
+    "#F472B6",  # pink-400
+    "#38BDF8",  # sky-400
+    "#FBBF24",  # amber-400
+    "#34D399",  # emerald-400
+    "#60A5FA",  # blue-400
+    "#FB7185",  # rose-400
+    "#A3E635",  # lime-400
+    "#2DD4BF",  # teal-400
+    "#818CF8",  # indigo-400
+    "#FCA5A5",  # red-300
+    "#93C5FD",  # blue-300
 ]
 
 ENTITY_TYPE_COLORS = {
