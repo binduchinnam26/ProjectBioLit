@@ -1,0 +1,381 @@
+"""Home page — search, pipeline execution, session management."""
+
+import logging
+import time
+from typing import Callable, Optional
+
+import pandas as pd
+import streamlit as st
+
+import config
+from ui.components.cards import empty_state
+from ui.components.loaders import live_stats_bar, progress_pipeline
+from ui.components.metrics import pipeline_status_indicator
+
+logger = logging.getLogger(__name__)
+
+_PIPELINE_STEPS = [
+    "Fetching Papers",
+    "Parsing XML",
+    "Cleaning Data",
+    "NLP Processing",
+    "Building Embeddings",
+    "Building Graph",
+]
+
+
+def render():
+    """Render the Home / search page."""
+    # ── Hero ──────────────────────────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <div class="bx-hero">
+          <div class="bx-hero-title">BioLitAI-X</div>
+          <div class="bx-hero-subtitle">
+            From Literature to Discovery —
+            AI-Powered Biomedical Intelligence
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Search bar ────────────────────────────────────────────────────────────
+    with st.container():
+        query = st.text_input(
+            "Search",
+            placeholder="Enter any biomedical research query (e.g. CRISPR cancer therapy, "
+                        "antibiotic resistance, Alzheimer's tau protein...)",
+            label_visibility="collapsed",
+            key="home_query_input",
+        )
+
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            max_results = st.slider(
+                "Max Results",
+                min_value=config.MAX_RESULTS_MIN,
+                max_value=config.MAX_RESULTS_MAX,
+                value=config.MAX_RESULTS_DEFAULT,
+                step=100,
+                help="Number of papers to retrieve from PubMed",
+            )
+        with col2:
+            year_min, year_max = st.slider(
+                "Year Range",
+                min_value=1990, max_value=2025,
+                value=(2000, 2025),
+                help="Filter papers by publication year",
+            )
+        with col3:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            search_clicked = st.button(
+                "🔍  Search & Analyse",
+                use_container_width=True,
+                type="primary",
+            )
+
+    # ── Past sessions chips ───────────────────────────────────────────────────
+    past = st.session_state.get("past_sessions", [])
+    if past:
+        st.markdown(
+            f"<div style='font-size:12px;color:{config.TEXT_SECONDARY};"
+            f"margin:0.5rem 0 0.3rem;font-weight:600'>Past Queries</div>",
+            unsafe_allow_html=True,
+        )
+        chip_cols = st.columns(min(len(past), 5))
+        for i, sess in enumerate(past[-5:][::-1]):
+            with chip_cols[i % len(chip_cols)]:
+                q_short = sess.get("query_text", "")[:35]
+                if st.button(
+                    f"🕐 {q_short}",
+                    key=f"chip_{sess.get('id')}",
+                    help=sess.get("query_text", ""),
+                ):
+                    _restore_session(sess)
+                    st.rerun()
+
+    st.markdown(
+        f"<hr style='border-color:{config.BORDER_COLOR};margin:1.5rem 0'>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Run pipeline on search ────────────────────────────────────────────────
+    if search_clicked:
+        q = (query or "").strip()
+        if not q:
+            st.error("Please enter a biomedical research query.")
+            return
+        _run_pipeline(q, max_results, year_min, year_max)
+
+    # ── Show results summary if pipeline is complete ──────────────────────────
+    elif st.session_state.get("pipeline_complete"):
+        _show_results_summary()
+
+
+# ── Pipeline orchestrator ─────────────────────────────────────────────────────
+
+def _run_pipeline(query: str, max_results: int, year_min: int, year_max: int):
+    """Execute the full 6-step pipeline with live progress updates."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+    from database.db_manager import DatabaseManager
+    from pipeline.retrieval import PubMedRetriever
+    from pipeline.parser import XMLParser
+    from pipeline.cleaner import DataCleaner
+    from pipeline.network_builder import NetworkBuilder
+    from pipeline.knowledge_graph import KnowledgeGraph
+
+    db = DatabaseManager(config.DB_PATH)
+    session_id = db.save_query_session(query, max_results)
+    db.update_query_session(session_id, pipeline_status="running")
+
+    step_container = st.empty()
+    stats_container = st.empty()
+    status_msg = st.empty()
+
+    def _update(step: int, msg: str, papers: int = 0, ents: int = 0, rels: int = 0):
+        with step_container.container():
+            pipeline_status_indicator(step, 6, msg)
+        with stats_container.container():
+            live_stats_bar(papers, ents, rels)
+        status_msg.markdown(
+            f"<p style='font-size:12px;color:{config.TEXT_SECONDARY}'>{msg}</p>",
+            unsafe_allow_html=True,
+        )
+
+    try:
+        # Step 1: Fetch
+        _update(1, "Fetching papers from PubMed...")
+        retriever = PubMedRetriever()
+        pmids, xml_batches = retriever.fetch_with_progress(
+            query, max_results,
+            progress_callback=lambda d, t, m: _update(1, m, papers=d),
+        )
+
+        # Step 2: Parse
+        _update(2, "Parsing XML records...", papers=len(pmids))
+        parser = XMLParser()
+        raw_papers = []
+        for xml_batch in xml_batches:
+            raw_papers.extend(parser.parse_batch(xml_batch, query_used=query))
+
+        # Apply year filter
+        if year_min or year_max:
+            def _in_range(p):
+                try:
+                    y = int((p.get("pub_date") or "")[:4])
+                    return year_min <= y <= year_max
+                except Exception:
+                    return True
+            raw_papers = [p for p in raw_papers if _in_range(p)]
+
+        _update(2, f"Parsed {len(raw_papers)} records.", papers=len(raw_papers))
+
+        # Step 3: Clean
+        _update(3, "Cleaning and normalizing data...")
+        cleaner = DataCleaner()
+        papers_df = cleaner.run_full_pipeline(raw_papers)
+        _update(3, f"Cleaning complete. {len(papers_df)} papers retained.", papers=len(papers_df))
+
+        # Store papers to database
+        for _, row in papers_df.iterrows():
+            try:
+                db.insert_paper(row.to_dict())
+                for auth in (row.get("authors") or []):
+                    if isinstance(auth, dict) and auth.get("name"):
+                        aid = db.insert_author(
+                            auth["name"],
+                            cleaner.normalize_author_name(auth["name"]),
+                            auth.get("affiliation") or "",
+                        )
+                        db.link_paper_author(row["pmid"], aid, 0)
+                for kw in (row.get("author_keywords") or []):
+                    kid = db.insert_keyword(kw, cleaner.normalize_keyword(kw), "author")
+                    db.link_paper_keyword(row["pmid"], kid)
+                for mesh in (row.get("mesh_terms") or []):
+                    if isinstance(mesh, dict):
+                        mid = db.insert_mesh_term(
+                            mesh.get("descriptor", ""),
+                            mesh.get("qualifier"),
+                            bool(mesh.get("is_major_topic")),
+                        )
+                        db.link_paper_mesh(row["pmid"], mid)
+                for chem in (row.get("chemicals") or []):
+                    if isinstance(chem, dict) and chem.get("name"):
+                        cid = db.insert_chemical_term(chem["name"], chem.get("registry_number"))
+                        db.link_paper_chemical(row["pmid"], cid)
+                for pt in (row.get("publication_types") or []):
+                    pid = db.insert_publication_type(pt)
+                    db.link_paper_publication_type(row["pmid"], pid)
+            except Exception as exc:
+                logger.warning("DB insert failed for PMID %s: %s", row.get("pmid"), exc)
+
+        # Step 4: NLP (optional — skip if scispacy not installed)
+        _update(4, "Running NLP entity extraction...")
+        entities_df = pd.DataFrame()
+        relationships_df = pd.DataFrame()
+        try:
+            from pipeline.nlp_processor import NLPProcessor
+            nlp = NLPProcessor(db_manager=db)
+            nlp.setup()
+            entities_df, relationships_df = nlp.process_corpus(
+                papers_df,
+                progress_callback=lambda d, t, m: _update(4, m, papers=len(papers_df),
+                                                           ents=d, rels=0),
+            )
+        except Exception as exc:
+            logger.warning("NLP step skipped (%s). Knowledge graph will be limited.", exc)
+            st.warning(f"NLP processing skipped: {exc}. Knowledge graph will have limited data.")
+
+        _update(4, f"NLP done: {len(entities_df)} entities, {len(relationships_df)} relationships.",
+                papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
+
+        # Step 5: Embeddings (optional)
+        _update(5, "Building semantic embeddings...")
+        embeddings_array = None
+        embedder = None
+        try:
+            from pipeline.embedder import EmbeddingEngine
+            embedder = EmbeddingEngine()
+            embedder.setup()
+            embeddings_array = embedder.embed_corpus(
+                papers_df, query=query,
+                progress_callback=lambda d, t, m: _update(5, m, papers=len(papers_df),
+                                                           ents=len(entities_df)),
+            )
+        except Exception as exc:
+            logger.warning("Embedding step skipped: %s", exc)
+            st.warning(f"Embedding step skipped: {exc}. Semantic search will be unavailable.")
+
+        # Step 6: Networks and knowledge graph
+        _update(6, "Building bibliometric networks and knowledge graph...")
+        nb = NetworkBuilder()
+        coauth_graph    = nb.build_coauthorship_network(papers_df)
+        keyword_graph   = nb.build_keyword_cooccurrence_network(papers_df)
+        coauth_stats    = nb.calculate_network_statistics(coauth_graph)
+        keyword_stats   = nb.calculate_network_statistics(keyword_graph)
+
+        kg = KnowledgeGraph()
+        kg_graph = kg.build_from_entities(entities_df, relationships_df)
+
+        topic_graph = None
+        topic_labels = {}
+        topics_over_time = pd.DataFrame()
+        doc_topics_df = pd.DataFrame()
+        try:
+            from pipeline.topic_modeler import TopicModeler
+            tm = TopicModeler()
+            tm.setup()
+            abstracts = papers_df["abstract"].fillna("").tolist()
+            doc_topics, probs = tm.fit_transform(abstracts, embeddings_array)
+            topic_labels = tm.get_topic_labels()
+            topics_over_time = tm.get_topic_over_time(papers_df)
+            doc_topics_df = tm.get_document_topics(papers_df)
+            topic_graph = nb.build_topic_network({
+                "doc_topics": doc_topics,
+                "topic_labels": topic_labels,
+            })
+        except Exception as exc:
+            logger.warning("Topic modeling skipped: %s", exc)
+
+        db.update_query_session(
+            session_id,
+            papers_fetched=len(papers_df),
+            pipeline_status="complete",
+        )
+
+        # ── Save all results to session state ─────────────────────────────
+        st.session_state.update({
+            "pipeline_complete":   True,
+            "current_query":       query,
+            "active_session_id":   session_id,
+            "papers_df":           papers_df,
+            "entities_df":         entities_df,
+            "relationships_df":    relationships_df,
+            "coauth_graph":        coauth_graph,
+            "keyword_graph":       keyword_graph,
+            "topic_graph":         topic_graph,
+            "knowledge_graph":     kg,
+            "kg_graph":            kg_graph,
+            "coauth_stats":        coauth_stats,
+            "keyword_stats":       keyword_stats,
+            "topic_labels":        topic_labels,
+            "topics_over_time":    topics_over_time,
+            "doc_topics_df":       doc_topics_df,
+            "embedder":            embedder,
+            "embeddings_array":    embeddings_array,
+            "db":                  db,
+        })
+
+        # Track session in past_sessions list
+        past = st.session_state.get("past_sessions", [])
+        past.append({
+            "id": session_id,
+            "query_text": query,
+            "pipeline_status": "complete",
+            "papers_fetched": len(papers_df),
+        })
+        st.session_state["past_sessions"] = past
+
+        _update(7, "Pipeline complete!", papers=len(papers_df),
+                ents=len(entities_df), rels=len(relationships_df))
+        st.success(
+            f"✅ Pipeline complete! {len(papers_df):,} papers analysed. "
+            f"Use the sidebar to explore results."
+        )
+
+    except Exception as exc:
+        db.update_query_session(session_id, pipeline_status="error")
+        logger.error("Pipeline failed: %s", exc, exc_info=True)
+        st.error(f"Pipeline failed: {exc}")
+
+
+def _restore_session(sess: dict):
+    """Reload a past session's results from database."""
+    try:
+        db = DatabaseManager(config.DB_PATH)
+        query = sess.get("query_text", "")
+        papers = db.get_papers_by_query(query)
+        if papers:
+            papers_df = pd.DataFrame(papers)
+            st.session_state.update({
+                "pipeline_complete": True,
+                "current_query": query,
+                "active_session_id": sess.get("id"),
+                "papers_df": papers_df,
+                "db": db,
+            })
+    except Exception as exc:
+        st.error(f"Failed to restore session: {exc}")
+
+
+def _show_results_summary():
+    """Show a summary when pipeline has already run."""
+    papers_df = st.session_state.get("papers_df")
+    query = st.session_state.get("current_query", "")
+    if papers_df is None or papers_df.empty:
+        empty_state("📭", "No results loaded", "Run a search above to get started.")
+        return
+
+    st.success(
+        f"✅ **{len(papers_df):,} papers** loaded for query: **{query}**. "
+        f"Navigate using the sidebar to explore analysis, graphs, and hypotheses."
+    )
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Papers", f"{len(papers_df):,}")
+    with col2:
+        ents = st.session_state.get("entities_df")
+        st.metric("Entities", f"{len(ents):,}" if ents is not None and not ents.empty else "—")
+    with col3:
+        hyps = st.session_state.get("hypotheses", [])
+        st.metric("Hypotheses", str(len(hyps)))
+
+
+# Avoid circular import
+try:
+    from database.db_manager import DatabaseManager
+except ImportError:
+    pass
