@@ -46,7 +46,9 @@ SCISPACY_MODEL = "en_core_sci_lg"
 EMBEDDING_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
 EMBEDDING_DIMENSION = 768    # output size of the model above
 
-# Entity types extracted by SciSpaCy — covers all biomedical domains
+# Entity types extracted by SciSpaCy — covers all biomedical domains.
+# "ENTITY" is the generic label used by en_core_sci_lg; the NLP processor
+# reclassifies it using UMLS semantic types where available.
 NER_ENTITY_TYPES = [
     "DISEASE",
     "GENE_OR_GENOME",
@@ -55,6 +57,7 @@ NER_ENTITY_TYPES = [
     "CELL",
     "ORGANISM",
     "LABORATORY_PROCEDURE",
+    "ENTITY",          # fallback for en_core_sci_lg generic labels
 ]
 
 # ── Topic Modeling ────────────────────────────────────────────────────────────
@@ -100,6 +103,7 @@ ENTITY_TYPE_COLORS = {
     "CELL": "#8B5CF6",
     "ORGANISM": "#06B6D4",
     "BIOLOGICAL_PROCESS": "#F97316",
+    "ENTITY": "#9CA3AF",    # neutral grey for unclassified en_core_sci_lg entities
 }
 
 CANVAS_BACKGROUND = "#0A0F1E"

@@ -13,6 +13,41 @@ from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
+# Maps UMLS semantic type IDs → our entity type labels.
+# en_core_sci_lg labels all entities as generic "ENTITY"; we use this map
+# to reclassify them into specific categories when UMLS info is available.
+_UMLS_SEMTYPE_MAP: Dict[str, str] = {
+    # Diseases / disorders
+    "T047": "DISEASE", "T048": "DISEASE", "T191": "DISEASE",
+    "T019": "DISEASE", "T033": "DISEASE", "T037": "DISEASE",
+    "T046": "DISEASE", "T049": "DISEASE", "T184": "DISEASE",
+    # Genes / genomes
+    "T028": "GENE_OR_GENOME", "T045": "GENE_OR_GENOME",
+    "T085": "GENE_OR_GENOME", "T087": "GENE_OR_GENOME",
+    "T088": "GENE_OR_GENOME", "T086": "GENE_OR_GENOME",
+    # Chemicals / drugs
+    "T109": "CHEMICAL", "T110": "CHEMICAL", "T114": "CHEMICAL",
+    "T116": "CHEMICAL", "T117": "CHEMICAL", "T118": "CHEMICAL",
+    "T119": "CHEMICAL", "T120": "CHEMICAL", "T121": "CHEMICAL",
+    "T122": "CHEMICAL", "T123": "CHEMICAL", "T125": "CHEMICAL",
+    "T126": "CHEMICAL", "T127": "CHEMICAL", "T129": "CHEMICAL",
+    "T130": "CHEMICAL", "T131": "CHEMICAL", "T192": "CHEMICAL",
+    "T195": "CHEMICAL",
+    # Biological processes
+    "T043": "BIOLOGICAL_PROCESS", "T044": "BIOLOGICAL_PROCESS",
+    "T169": "BIOLOGICAL_PROCESS", "T038": "BIOLOGICAL_PROCESS",
+    "T042": "BIOLOGICAL_PROCESS",
+    # Cells / cell components
+    "T025": "CELL", "T026": "CELL",
+    # Organisms
+    "T001": "ORGANISM", "T002": "ORGANISM", "T004": "ORGANISM",
+    "T005": "ORGANISM", "T007": "ORGANISM", "T008": "ORGANISM",
+    "T010": "ORGANISM",
+    # Laboratory procedures
+    "T059": "LABORATORY_PROCEDURE", "T060": "LABORATORY_PROCEDURE",
+    "T061": "LABORATORY_PROCEDURE", "T063": "LABORATORY_PROCEDURE",
+}
+
 
 class NLPProcessor:
     """
@@ -24,6 +59,7 @@ class NLPProcessor:
     def __init__(self, db_manager: Optional[DatabaseManager] = None):
         self.nlp = None
         self.db = db_manager
+        self._linker = None    # reference to the scispacy EntityLinker pipe
         self._ready = False
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -48,6 +84,7 @@ class NLPProcessor:
 
         logger.info("Adding UMLS entity linker to pipeline")
         try:
+            from scispacy.linking import EntityLinker  # noqa: F401 — registers the factory
             self.nlp.add_pipe(
                 "scispacy_linker",
                 config={
@@ -64,6 +101,12 @@ class NLPProcessor:
                 "Entity extraction will proceed without UMLS CUI linking.",
                 exc,
             )
+
+        # Store linker reference for semantic type lookup
+        try:
+            self._linker = self.nlp.get_pipe("scispacy_linker")
+        except Exception:
+            self._linker = None
 
         self._ready = True
         logger.info("NLPProcessor ready. Entity types: %s", config.NER_ENTITY_TYPES)
@@ -113,6 +156,16 @@ class NLPProcessor:
                 try:
                     if ent._.kb_ents:
                         umls_id = ent._.kb_ents[0][0]  # top UMLS CUI
+
+                        # Reclassify generic "ENTITY" label using UMLS semantic types
+                        if ent_type == "ENTITY" and self._linker and umls_id:
+                            kb_ent = self._linker.kb.cui_to_entity.get(umls_id)
+                            if kb_ent and kb_ent.types:
+                                for sem_type in kb_ent.types:
+                                    mapped = _UMLS_SEMTYPE_MAP.get(sem_type)
+                                    if mapped:
+                                        ent_type = mapped
+                                        break
                 except AttributeError:
                     pass
 

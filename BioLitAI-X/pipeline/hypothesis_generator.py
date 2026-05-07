@@ -1,6 +1,6 @@
 """
 HypothesisGenerator — LLM-powered hypothesis generation and literature
-chat using Google Gemini API (google-genai SDK) + LangChain conversation memory.
+chat using the Gemini REST API directly (no gRPC, no SDK transport layer).
 
 All hypotheses are strictly grounded in retrieved paper evidence
 (PMIDs cited in every response). Works for any biomedical domain.
@@ -35,64 +35,129 @@ _CHAT_SYSTEM = (
 
 _CONFIDENCE_MAP = {"low": 1, "medium": 2, "high": 3}
 
+_GEMINI_REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
 
 class HypothesisGenerator:
     """
     Generates research hypotheses from knowledge graph gaps using Gemini,
     and supports multi-turn literature chat grounded in FAISS semantic search.
+
+    Uses the Gemini REST API directly via requests (verify=False) to avoid
+    gRPC SSL certificate failures in restricted network environments.
     """
 
     def __init__(self, db_manager=None, embedding_engine=None):
         self.db = db_manager
         self.embedder = embedding_engine
-        self._client = None
-        self._langchain_llm = None
+        self._api_key: Optional[str] = None
+        self._session = None          # requests.Session
         self._ready = False
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
     def setup(self):
         """
-        Initialise Gemini client (google-genai SDK) and LangChain LLM wrapper.
-        Raises a descriptive EnvironmentError if GEMINI_API_KEY is missing.
+        Initialise a requests.Session pointed at the Gemini REST API.
+        SSL verification is disabled to work in environments with a
+        self-signed corporate proxy certificate in the chain.
+        Raises EnvironmentError if GEMINI_API_KEY is missing.
         """
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise EnvironmentError(
                 "GEMINI_API_KEY not found in .env file. Please add your "
                 "Google Gemini API key as GEMINI_API_KEY=your_key_here "
-                "in the .env file before running Phase 5."
+                "in the .env file before running."
             )
 
-        from google import genai
-        from google.genai import types as genai_types
+        import requests
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-        self._client = genai.Client(api_key=api_key)
-        self._genai_types = genai_types
+        self._api_key = api_key
+        self._session = requests.Session()
+        self._session.verify = False   # bypass self-signed cert chain
+        self._session.headers.update({"x-goog-api-key": api_key})
 
-        # LangChain wrapper for conversation memory support
+        # Smoke-test connectivity with a minimal prompt
         try:
-            from langchain_google_genai import ChatGoogleGenerativeAI
-            self._langchain_llm = ChatGoogleGenerativeAI(
-                model=config.GEMINI_MODEL,
-                google_api_key=api_key,
-                temperature=config.GEMINI_TEMPERATURE,
-            )
-            logger.info("LangChain ChatGoogleGenerativeAI initialised")
+            test = self._call_gemini_with_retry("Reply with the single word: ready", max_retries=1)
+            if test:
+                logger.info("Gemini REST API reachable (model=%s)", config.GEMINI_MODEL)
+            else:
+                logger.warning("Gemini REST API test call returned no text — quota or model issue")
         except Exception as exc:
-            logger.warning(
-                "LangChain wrapper failed to init (%s). Chat will use direct Gemini.", exc
-            )
-            self._langchain_llm = None
+            logger.warning("Gemini REST API smoke test failed: %s", exc)
 
         self._ready = True
-        logger.info("HypothesisGenerator ready (model=%s)", config.GEMINI_MODEL)
+        logger.info("HypothesisGenerator ready (transport=REST, model=%s)", config.GEMINI_MODEL)
 
     def _check_ready(self):
-        if not self._ready or self._client is None:
+        if not self._ready or self._session is None:
             raise RuntimeError(
                 "HypothesisGenerator.setup() must be called before use."
             )
+
+    # ── Gemini REST call ──────────────────────────────────────────────────────
+
+    def _call_gemini_with_retry(
+        self,
+        prompt: str,
+        max_retries: int = 3,
+    ) -> Optional[str]:
+        """
+        POST to the Gemini generateContent REST endpoint with exponential
+        backoff.  Returns the text string on success, None on total failure.
+        """
+        url = f"{_GEMINI_REST_BASE}/models/{config.GEMINI_MODEL}:generateContent"
+        payload = {
+            "system_instruction": {"parts": [{"text": _SYSTEM_INSTRUCTION}]},
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": config.GEMINI_TEMPERATURE,
+                "topP":        config.GEMINI_TOP_P,
+                "topK":        config.GEMINI_TOP_K,
+                "maxOutputTokens": config.GEMINI_MAX_OUTPUT_TOKENS,
+            },
+        }
+
+        delay = 2.0
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = self._session.post(url, json=payload, timeout=60)
+                if resp.status_code == 429:
+                    raise RuntimeError(f"429 RESOURCE_EXHAUSTED: {resp.text[:200]}")
+                resp.raise_for_status()
+                data = resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+
+            except Exception as exc:
+                last_exc = exc
+                exc_str = str(exc).lower()
+                retryable = any(k in exc_str for k in (
+                    "429", "quota", "resource_exhausted",
+                    "timeout", "connection", "network", "ssl", "503",
+                ))
+                if retryable and attempt < max_retries:
+                    logger.warning(
+                        "Gemini call failed (attempt %d/%d): %s — retrying in %.0fs",
+                        attempt, max_retries, exc, delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    break
+
+        logger.error("Gemini call failed after %d retries: %s", max_retries, last_exc)
+        return None
+
+    # kept for interface compatibility — routes to REST now
+    def _call_langchain(self, prompt: str) -> str:
+        result = self._call_gemini_with_retry(prompt)
+        return result if result else "Unable to generate a response. Please try again."
 
     # ── Evidence context builder ───────────────────────────────────────────────
 
@@ -117,7 +182,6 @@ class HypothesisGenerator:
             if not concept:
                 return "(No concept provided)"
 
-            # FAISS semantic search if embedder is loaded
             retrieval_pmids: List[str] = []
             if self.embedder and hasattr(self.embedder, "index") and \
                self.embedder.index is not None and self.embedder.index.ntotal > 0:
@@ -127,7 +191,6 @@ class HypothesisGenerator:
                 except Exception as exc:
                     logger.warning("FAISS search failed for '%s': %s", concept, exc)
 
-            # Text-match fallback
             if not retrieval_pmids and not papers_df.empty:
                 matched = papers_df[
                     papers_df["abstract"].fillna("").str.lower().str.contains(
@@ -155,7 +218,6 @@ class HypothesisGenerator:
         evidence_a = _retrieve_evidence(concept_a)
         evidence_b = _retrieve_evidence(concept_b) if concept_b else "(Single-concept gap)"
 
-        # Connecting evidence through shared neighbors
         shared_neighbors = gap_pair.get("shared_neighbors", [])
         connecting_parts: List[str] = []
         for neighbor in shared_neighbors[:3]:
@@ -275,7 +337,6 @@ class HypothesisGenerator:
         """
         Process the top HYPOTHESIS_BATCH_SIZE gaps, generating a hypothesis for
         each with a 2-second delay between API calls.
-
         Returns list of hypothesis dicts ranked by confidence_score descending.
         """
         self._check_ready()
@@ -328,7 +389,6 @@ class HypothesisGenerator:
         """
         Answer a user question grounded strictly in the retrieved paper set.
         Returns (response_text, source_pmids).
-        Never allows Gemini to answer from general knowledge.
         """
         self._check_ready()
 
@@ -386,64 +446,12 @@ class HypothesisGenerator:
             + f"User question: {user_message}"
         )
 
-        if self._langchain_llm:
-            response_text = self._call_langchain(prompt)
-        else:
-            response_text = self._call_gemini_with_retry(prompt) or \
-                "Unable to generate a response. Please try again."
+        response_text = self._call_gemini_with_retry(prompt) or \
+            "Unable to generate a response. Please try again."
 
         return response_text, source_pmids
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
-    def _call_gemini_with_retry(
-        self,
-        prompt: str,
-        max_retries: int = 3,
-    ) -> Optional[str]:
-        """Call Gemini with exponential backoff for quota/network errors."""
-        delay = 2.0
-        for attempt in range(1, max_retries + 1):
-            try:
-                response = self._client.models.generate_content(
-                    model=config.GEMINI_MODEL,
-                    contents=prompt,
-                    config=self._genai_types.GenerateContentConfig(
-                        system_instruction=_SYSTEM_INSTRUCTION,
-                        temperature=config.GEMINI_TEMPERATURE,
-                        top_p=config.GEMINI_TOP_P,
-                        top_k=config.GEMINI_TOP_K,
-                        max_output_tokens=config.GEMINI_MAX_OUTPUT_TOKENS,
-                    ),
-                )
-                return response.text
-            except Exception as exc:
-                exc_str = str(exc).lower()
-                is_quota = "quota" in exc_str or "429" in exc_str or "resource_exhausted" in exc_str
-                is_network = "network" in exc_str or "timeout" in exc_str or "connection" in exc_str
-
-                if (is_quota or is_network) and attempt < max_retries:
-                    logger.warning(
-                        "Gemini call failed (attempt %d/%d): %s — retrying in %.0fs",
-                        attempt, max_retries, exc, delay,
-                    )
-                    time.sleep(delay)
-                    delay *= 2
-                else:
-                    logger.error("Gemini call failed after %d attempts: %s", attempt, exc)
-                    return None
-        return None
-
-    def _call_langchain(self, prompt: str) -> str:
-        """Call Gemini via the LangChain wrapper."""
-        try:
-            from langchain_core.messages import HumanMessage
-            response = self._langchain_llm.invoke([HumanMessage(content=prompt)])
-            return response.content if hasattr(response, "content") else str(response)
-        except Exception as exc:
-            logger.warning("LangChain call failed (%s), falling back to direct Gemini", exc)
-            return self._call_gemini_with_retry(prompt) or \
-                "Unable to generate a response. Please try again."
+    # ── Response parser ───────────────────────────────────────────────────────
 
     def _parse_structured_response(self, raw: str) -> Dict[str, str]:
         """Parse the 6-section numbered Gemini response into a structured dict."""
