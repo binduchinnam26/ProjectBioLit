@@ -70,7 +70,7 @@ GAP_TOP_N = 20
 
 # ── Hypothesis Generation ─────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-1.5-pro"
+GEMINI_MODEL = "gemini-2.0-flash"
 GEMINI_TEMPERATURE = 0.3
 GEMINI_TOP_P = 0.85
 GEMINI_TOP_K = 40
