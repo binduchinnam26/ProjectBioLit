@@ -224,11 +224,11 @@ class XMLParser:
                 article.find(".//ArticleTitle")
             )
             if not title:
-                logger.warning("PMID %s: missing title", pmid)
+                logger.debug("PMID %s: missing title", pmid)
 
             abstract = self._extract_abstract(article)
             if not abstract:
-                logger.warning("PMID %s: missing abstract", pmid)
+                logger.debug("PMID %s: missing abstract", pmid)
 
             journal_el = article.find(".//Journal/Title")
             journal = _text(journal_el)

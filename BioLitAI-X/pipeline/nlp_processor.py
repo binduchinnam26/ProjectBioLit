@@ -82,31 +82,37 @@ class NLPProcessor:
                 f"releases/v0.5.4/en_core_sci_lg-0.5.4.tar.gz"
             )
 
-        logger.info("Adding UMLS entity linker to pipeline")
-        try:
-            from scispacy.linking import EntityLinker  # noqa: F401 — registers the factory
-            self.nlp.add_pipe(
-                "scispacy_linker",
-                config={
-                    "resolve_abbreviations": True,
-                    "linker_name": "umls",
-                    "threshold": 0.85,
-                    "filter_for_definitions": False,
-                    "no_definition_threshold": 0.95,
-                },
-            )
-        except Exception as exc:
-            logger.warning(
-                "UMLS linker could not be loaded (%s). "
-                "Entity extraction will proceed without UMLS CUI linking.",
-                exc,
-            )
+        if config.USE_UMLS_LINKER:
+            logger.info("Adding UMLS entity linker to pipeline (USE_UMLS_LINKER=true)")
+            try:
+                from scispacy.linking import EntityLinker  # noqa: F401 — registers the factory
+                self.nlp.add_pipe(
+                    "scispacy_linker",
+                    config={
+                        "resolve_abbreviations": True,
+                        "linker_name": "umls",
+                        "threshold": 0.85,
+                        "filter_for_definitions": False,
+                        "no_definition_threshold": 0.95,
+                    },
+                )
+            except Exception as exc:
+                logger.warning(
+                    "UMLS linker could not be loaded (%s). "
+                    "Entity extraction will proceed without UMLS CUI linking.",
+                    exc,
+                )
 
-        # Store linker reference for semantic type lookup
-        try:
-            self._linker = self.nlp.get_pipe("scispacy_linker")
-        except Exception:
-            self._linker = None
+            # Store linker reference for semantic type lookup
+            try:
+                self._linker = self.nlp.get_pipe("scispacy_linker")
+            except Exception:
+                self._linker = None
+        else:
+            logger.info(
+                "UMLS linker skipped (USE_UMLS_LINKER=false). "
+                "Set USE_UMLS_LINKER=true in .env to enable entity reclassification."
+            )
 
         self._ready = True
         logger.info("NLPProcessor ready. Entity types: %s", config.NER_ENTITY_TYPES)

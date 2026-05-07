@@ -46,6 +46,10 @@ SCISPACY_MODEL = "en_core_sci_lg"
 EMBEDDING_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
 EMBEDDING_DIMENSION = 768    # output size of the model above
 
+# Set to True to enable UMLS entity linking (downloads ~724 MB index on first run).
+# When False, NER still runs but entities keep the generic "ENTITY" label.
+USE_UMLS_LINKER = os.getenv("USE_UMLS_LINKER", "false").lower() == "true"
+
 # Entity types extracted by SciSpaCy — covers all biomedical domains.
 # "ENTITY" is the generic label used by en_core_sci_lg; the NLP processor
 # reclassifies it using UMLS semantic types where available.
