@@ -38,11 +38,12 @@ class EmbeddingEngine:
     stores / retrieves them via FAISS for cosine-similarity search.
     """
 
-    def __init__(self):
+    def __init__(self, persist_index: bool = True):
         self.model = None
         self.index = None
         self._pmid_list: List[str] = []      # ordered — position i → FAISS vector i
         self._current_query_hash: Optional[str] = None
+        self._persist_index = persist_index  # False when disk space is low
         self._ready = False
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -142,9 +143,12 @@ class EmbeddingEngine:
         self.index.add(embeddings)
         self._pmid_list.extend(pmids)
 
-        self._persist_index(query)
+        if self._persist_index:
+            self._save_index(query)
+        else:
+            logger.info("embed_corpus: skipping FAISS index save (low disk mode)")
         _cb(total, total, f"Embeddings complete: {total} vectors stored.")
-        logger.info("embed_corpus done: %d vectors, index saved", total)
+        logger.info("embed_corpus done: %d vectors", total)
         return embeddings
 
     # ── Persistence ───────────────────────────────────────────────────────────
@@ -155,13 +159,15 @@ class EmbeddingEngine:
         base = Path(config.EMBEDDINGS_DIR) / qh
         return base.with_suffix(".faiss"), base.with_suffix(".json")
 
-    def _persist_index(self, query: str):
+    def _save_index(self, query: str):
         import faiss
         faiss_path, map_path = self._index_paths(query)
         try:
             faiss.write_index(self.index, str(faiss_path))
             map_path.write_text(json.dumps(self._pmid_list), encoding="utf-8")
             logger.info("FAISS index saved to %s", faiss_path)
+        except OSError as exc:
+            logger.error("Failed to save FAISS index (disk full?): %s", exc)
         except Exception as exc:
             logger.error("Failed to save FAISS index: %s", exc)
 
