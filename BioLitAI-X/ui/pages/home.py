@@ -2,6 +2,7 @@
 
 import logging
 import time
+from datetime import datetime
 from typing import Callable, Optional
 
 import pandas as pd
@@ -61,10 +62,11 @@ def render():
                 help="Number of papers to retrieve from PubMed",
             )
         with col2:
+            _cur_year = datetime.now().year
             year_min, year_max = st.slider(
                 "Year Range",
-                min_value=1990, max_value=2025,
-                value=(2000, 2025),
+                min_value=1990, max_value=_cur_year,
+                value=(2000, _cur_year),
                 help="Filter papers by publication year",
             )
         with col3:
@@ -161,22 +163,25 @@ def _run_pipeline(query: str, max_results: int, year_min: int, year_max: int):
         for xml_batch in xml_batches:
             raw_papers.extend(parser.parse_batch(xml_batch, query_used=query))
 
-        # Apply year filter
-        if year_min or year_max:
-            def _in_range(p):
-                try:
-                    y = int((p.get("pub_date") or "")[:4])
-                    return year_min <= y <= year_max
-                except Exception:
-                    return True
-            raw_papers = [p for p in raw_papers if _in_range(p)]
-
         _update(2, f"Parsed {len(raw_papers)} records.", papers=len(raw_papers))
 
         # Step 3: Clean
         _update(3, "Cleaning and normalizing data...")
         cleaner = DataCleaner()
         papers_df = cleaner.run_full_pipeline(raw_papers)
+
+        # Apply year filter using pub_year (integer) produced by the cleaner —
+        # more reliable than slicing the raw pub_date string from the parser.
+        if "pub_year" in papers_df.columns:
+            before = len(papers_df)
+            papers_df = papers_df[
+                papers_df["pub_year"].fillna(0).astype(int).between(year_min, year_max)
+                | papers_df["pub_year"].isna()
+            ].reset_index(drop=True)
+            filtered_out = before - len(papers_df)
+            if filtered_out:
+                logger.info("Year filter removed %d papers outside %d–%d", filtered_out, year_min, year_max)
+
         _update(3, f"Cleaning complete. {len(papers_df)} papers retained.", papers=len(papers_df))
 
         # Store papers to database
