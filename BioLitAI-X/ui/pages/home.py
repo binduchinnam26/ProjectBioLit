@@ -1,6 +1,7 @@
 """Home page — search, pipeline execution, session management."""
 
 import logging
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,17 @@ from ui.components.metrics import pipeline_status_indicator
 from utils.helpers import query_hash
 
 logger = logging.getLogger(__name__)
+
+_DISK_WARN_MB = 500    # warn when free space < 500 MB
+_DISK_MIN_MB  = 100    # disable all disk writes below 100 MB
+
+
+def _free_mb() -> int:
+    """Return free disk space in MB on the data directory's partition."""
+    try:
+        return shutil.disk_usage(config.DATA_DIR).free // (1024 * 1024)
+    except Exception:
+        return 9999  # can't check → assume OK
 
 _PIPELINE_STEPS = [
     "Fetching Papers",
@@ -144,6 +156,23 @@ def _run_pipeline(
     from pipeline.network_builder import NetworkBuilder
     from pipeline.knowledge_graph import KnowledgeGraph
 
+    # ── Disk space pre-check ──────────────────────────────────────────────────
+    free_mb = _free_mb()
+    low_disk = free_mb < _DISK_WARN_MB
+    no_disk  = free_mb < _DISK_MIN_MB
+    if no_disk:
+        st.error(
+            f"❌ Critical: only {free_mb} MB free on disk. "
+            "The pipeline will run in memory-only mode — results will NOT be saved "
+            "and some steps may fail. Free at least 500 MB before running again."
+        )
+    elif low_disk:
+        st.warning(
+            f"⚠️ Low disk space: {free_mb} MB free. "
+            "Parquet cache and FAISS index will be skipped to avoid write errors. "
+            "Free more space for full persistence."
+        )
+
     db = DatabaseManager(config.DB_PATH)
     session_id = db.save_query_session(query, max_results)
     db.update_query_session(session_id, pipeline_status="running")
@@ -220,22 +249,24 @@ def _run_pipeline(
                         filtered_out, year_min, year_max,
                     )
 
-            # Persist to parquet cache for instant future loads
-            try:
-                # Parquet cannot serialise list/dict columns directly — store
-                # them as JSON strings, then restore on load via _restore_list_cols.
-                cache_df = papers_df.copy()
-                for col in ("authors", "author_keywords", "mesh_terms",
-                            "chemicals", "publication_types", "grants"):
-                    if col in cache_df.columns:
-                        import json as _json
-                        cache_df[col] = cache_df[col].apply(
-                            lambda v: _json.dumps(v) if not isinstance(v, str) else v
-                        )
-                cache_df.to_parquet(cache_path, index=False)
-                logger.info("Parquet cache saved: %s", cache_path)
-            except Exception as exc:
-                logger.warning("Parquet cache save failed: %s", exc)
+            # Persist to parquet cache (skipped when disk is low)
+            if not low_disk:
+                try:
+                    import json as _json
+                    cache_df = papers_df.copy()
+                    for col in ("authors", "author_keywords", "mesh_terms",
+                                "chemicals", "publication_types", "grants"):
+                        if col in cache_df.columns:
+                            cache_df[col] = cache_df[col].apply(
+                                lambda v: _json.dumps(v) if not isinstance(v, str) else v
+                            )
+                    cache_df.to_parquet(cache_path, index=False)
+                    logger.info("Parquet cache saved: %s", cache_path)
+                except OSError as exc:
+                    logger.warning("Parquet cache save failed (disk full?): %s", exc)
+                    st.warning(f"Cache not saved: {exc}")
+                except Exception as exc:
+                    logger.warning("Parquet cache save failed: %s", exc)
 
             _update(3, f"Cleaning complete. {len(papers_df):,} papers retained.",
                     papers=len(papers_df))
@@ -255,23 +286,26 @@ def _run_pipeline(
                     papers_df[col] = papers_df[col].apply(_try_parse)
 
         # Store papers + all relational metadata to database (single transaction each)
-        _update(3, f"Storing {len(papers_df):,} papers to database...", papers=len(papers_df))
-        try:
-            db.insert_papers_batch(papers_df.to_dict("records"))
-        except Exception as exc:
-            logger.warning("Batch paper insert failed, falling back row-by-row: %s", exc)
-            for _, row in papers_df.iterrows():
-                try:
-                    db.insert_paper(row.to_dict())
-                except Exception as e2:
-                    logger.warning("Row insert failed PMID %s: %s", row.get("pmid"), e2)
+        if no_disk:
+            st.warning("Disk full — skipping database writes. Results are in memory only.")
+        else:
+            _update(3, f"Storing {len(papers_df):,} papers to database...", papers=len(papers_df))
+            try:
+                db.insert_papers_batch(papers_df.to_dict("records"))
+            except OSError as exc:
+                logger.error("Paper batch insert failed (disk full): %s", exc)
+                st.error(f"Database write failed — disk is full ({_free_mb()} MB free). Free space and retry.")
+            except Exception as exc:
+                logger.warning("Batch paper insert failed: %s", exc)
 
-        # Authors, keywords, MeSH, chemicals, pub types — all in ONE transaction
-        _update(3, f"Indexing authors, keywords, MeSH terms...", papers=len(papers_df))
-        try:
-            db.insert_paper_metadata_batch(papers_df.to_dict("records"))
-        except Exception as exc:
-            logger.warning("Batch metadata insert failed: %s", exc)
+            _update(3, "Indexing authors, keywords, MeSH terms...", papers=len(papers_df))
+            try:
+                db.insert_paper_metadata_batch(papers_df.to_dict("records"))
+            except OSError as exc:
+                logger.error("Metadata batch insert failed (disk full): %s", exc)
+                st.error(f"Metadata write failed — disk is full ({_free_mb()} MB free).")
+            except Exception as exc:
+                logger.warning("Batch metadata insert failed: %s", exc)
 
         # Step 4: NLP (optional — skip if scispacy not installed)
         _update(4, "Running NLP entity extraction...")
@@ -299,7 +333,7 @@ def _run_pipeline(
         embedder = None
         try:
             from pipeline.embedder import EmbeddingEngine
-            embedder = EmbeddingEngine()
+            embedder = EmbeddingEngine(persist_index=not low_disk)
             embedder.setup()
             embeddings_array = embedder.embed_corpus(
                 papers_df, query=query,
