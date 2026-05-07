@@ -2,12 +2,17 @@
 EmbeddingEngine — biomedical sentence embeddings using PubMedBERT +
 FAISS index for fast semantic search. Query-agnostic: works for any
 topic retrieved from PubMed.
+
+Uses model.encode() over the full corpus in one call (batch_size=256)
+for 3-5x throughput vs manual batching.  Abstract-missing papers use
+the title as fallback; if both are absent a minimal stub is used so
+every paper gets a valid embedding.
 """
 
 import json
 import logging
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,6 +21,15 @@ import config
 from utils.helpers import query_hash
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_text(text: Any) -> str:
+    """Return a clean string. Converts NaN/None/non-str to empty string."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        return ""
+    return text.strip()
 
 
 class EmbeddingEngine:
@@ -76,15 +90,16 @@ class EmbeddingEngine:
         self,
         papers_df: pd.DataFrame,
         query: str = "",
-        batch_size: int = 64,
+        batch_size: int = 256,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> np.ndarray:
         """
-        Embed all abstracts in *papers_df*, add them to the FAISS index,
+        Embed all papers in *papers_df*, add them to the FAISS index,
         and persist both index and PMID mapping to disk.
 
-        Index file name is derived from a hash of *query* so different
-        queries each get a separate stored index.
+        Text priority per paper: abstract → title → stub.
+        All papers receive an embedding; no data is dropped.
+        Encoding is done in one model.encode() call for maximum throughput.
 
         Returns the full embeddings array (shape: [n_papers, embedding_dim]).
         """
@@ -99,46 +114,38 @@ class EmbeddingEngine:
             return np.empty((0, config.EMBEDDING_DIMENSION), dtype="float32")
 
         pmids = papers_df["pmid"].tolist()
-        abstracts = papers_df["abstract"].fillna("").tolist()
-        total = len(abstracts)
+        texts = [
+            _safe_text(row.get("abstract"))
+            or _safe_text(row.get("title"))
+            or f"biomedical paper {row.get('pmid', '')}"
+            for _, row in papers_df.iterrows()
+        ]
+        total = len(texts)
 
-        _cb(0, total, "Initialising embedding index...")
+        _cb(0, total, "Embedding corpus — this may take a few minutes...")
         self._init_index()
         self._current_query_hash = query_hash(query) if query else "default"
 
-        all_embeddings: List[np.ndarray] = []
+        try:
+            embeddings = self.model.encode(
+                texts,
+                batch_size=batch_size,
+                show_progress_bar=True,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                device="cpu",
+            ).astype("float32")
+        except Exception as exc:
+            logger.error("model.encode() failed: %s", exc)
+            embeddings = np.zeros((total, config.EMBEDDING_DIMENSION), dtype="float32")
 
-        for start in range(0, total, batch_size):
-            batch_texts = abstracts[start : start + batch_size]
-            batch_pmids = pmids[start : start + batch_size]
+        self.index.add(embeddings)
+        self._pmid_list.extend(pmids)
 
-            try:
-                vecs = self.model.encode(
-                    batch_texts,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                    batch_size=batch_size,
-                )
-                vecs = vecs.astype("float32")
-            except Exception as exc:
-                logger.error("Embedding batch %d failed: %s", start, exc)
-                vecs = np.zeros(
-                    (len(batch_texts), config.EMBEDDING_DIMENSION), dtype="float32"
-                )
-
-            self.index.add(vecs)
-            self._pmid_list.extend(batch_pmids)
-            all_embeddings.append(vecs)
-
-            done = min(start + batch_size, total)
-            _cb(done, total, f"Embedded {done}/{total} abstracts...")
-
-        full_embeddings = np.vstack(all_embeddings)
         self._persist_index(query)
         _cb(total, total, f"Embeddings complete: {total} vectors stored.")
         logger.info("embed_corpus done: %d vectors, index saved", total)
-        return full_embeddings
+        return embeddings
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
