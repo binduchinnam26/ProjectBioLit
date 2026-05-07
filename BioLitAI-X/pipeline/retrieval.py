@@ -1,9 +1,15 @@
 """
 PubMedRetriever — fetch PMIDs and raw XML records from PubMed via Biopython Entrez.
+
+fetch_with_progress() uses a ThreadPoolExecutor (5 workers) to fetch XML batches
+in parallel while a threading.Lock serialises rate-limit accounting so we never
+exceed the NCBI API quota.  Results are re-ordered to match the original PMID list.
 """
 
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Generator, List, Optional, Tuple
 
 from Bio import Entrez
@@ -31,14 +37,16 @@ class PubMedRetriever:
         )
         self._min_interval = 1.0 / self._rate_limit
         self._last_call_time: float = 0.0
+        self._rate_lock = threading.Lock()
 
-    # ── Rate limiting ─────────────────────────────────────────────────────────
+    # ── Rate limiting (thread-safe) ───────────────────────────────────────────
 
     def _wait(self):
-        elapsed = time.monotonic() - self._last_call_time
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-        self._last_call_time = time.monotonic()
+        with self._rate_lock:
+            elapsed = time.monotonic() - self._last_call_time
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
+            self._last_call_time = time.monotonic()
 
     # ── Retry wrapper ─────────────────────────────────────────────────────────
 
@@ -108,7 +116,7 @@ class PubMedRetriever:
         )
         xml_data = handle.read()
         handle.close()
-        return xml_data
+        return xml_data if isinstance(xml_data, str) else xml_data.decode("utf-8", errors="replace")
 
     def _batch_pmids(self, pmids: List[str]) -> Generator[List[str], None, None]:
         """Yield FETCH_BATCH_SIZE-sized chunks of pmids."""
@@ -123,12 +131,15 @@ class PubMedRetriever:
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> Tuple[List[str], List[str]]:
         """
-        Search and fetch all records, reporting progress via *progress_callback*.
+        Search and fetch all records in parallel, reporting progress via
+        *progress_callback(completed, total, message)*.
 
-        progress_callback(completed_count, total_count, status_message)
+        Up to 5 batches are fetched concurrently while the thread-safe rate
+        limiter ensures NCBI quota compliance.  Results are returned in the
+        same order as the original PMID list.
 
-        Returns (pmids, xml_batches) where xml_batches is a list of raw XML strings,
-        one per batch of FETCH_BATCH_SIZE.
+        Returns (pmids, xml_batches) where xml_batches is a list of raw XML
+        strings, one per batch of FETCH_BATCH_SIZE.
         """
         def _cb(done: int, total: int, msg: str):
             if progress_callback:
@@ -139,18 +150,40 @@ class PubMedRetriever:
         total = len(pmids)
         _cb(0, total, f"Found {total} papers. Fetching records...")
 
-        xml_batches: List[str] = []
-        fetched = 0
+        batches = list(self._batch_pmids(pmids))
+        xml_batches_map: dict = {}
+        fetched_lock = threading.Lock()
+        fetched_count = [0]
 
-        for batch in self._batch_pmids(pmids):
-            try:
-                xml_data = self.fetch_records(batch)
-                xml_batches.append(xml_data if isinstance(xml_data, str) else xml_data.decode("utf-8", errors="replace"))
-                fetched += len(batch)
-                _cb(fetched, total, f"Fetched {fetched}/{total} records...")
-            except Exception as exc:
-                logger.error("fetch_records batch failed (fetched=%d): %s", fetched, exc)
-                _cb(fetched, total, f"Warning: batch failed — {exc}")
+        def _fetch_batch(idx_batch):
+            idx, batch = idx_batch
+            xml = self.fetch_records(batch)
+            return idx, xml, len(batch)
 
-        _cb(total, total, f"Fetch complete. {fetched} records retrieved.")
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(_fetch_batch, (i, batch)): i
+                for i, batch in enumerate(batches)
+            }
+            for future in as_completed(futures):
+                try:
+                    idx, xml, n = future.result()
+                    xml_batches_map[idx] = xml
+                    with fetched_lock:
+                        fetched_count[0] += n
+                        done = fetched_count[0]
+                    _cb(done, total, f"Fetched {done}/{total} records...")
+                except Exception as exc:
+                    batch_idx = futures[future]
+                    logger.error("fetch_records batch %d failed: %s", batch_idx, exc)
+                    _cb(fetched_count[0], total, f"Warning: batch {batch_idx} failed — {exc}")
+
+        # Reconstruct in original order, skipping failed batches
+        xml_batches = [
+            xml_batches_map[i]
+            for i in range(len(batches))
+            if i in xml_batches_map
+        ]
+
+        _cb(total, total, f"Fetch complete. {fetched_count[0]} records retrieved.")
         return pmids, xml_batches

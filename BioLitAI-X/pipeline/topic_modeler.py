@@ -33,22 +33,48 @@ class TopicModeler:
 
     def setup(self):
         """
-        Initialise BERTopic with the biomedical embedding model,
-        auto topic count, and minimum topic size from config.
+        Initialise BERTopic with custom UMAP/HDBSCAN for performance.
+        embedding_model=None because pre-computed embeddings are passed in
+        fit_transform(); this avoids a second full-corpus encoding pass.
+        calculate_probabilities=False cuts memory and time significantly.
         """
         from bertopic import BERTopic
-        from sentence_transformers import SentenceTransformer
+        from umap import UMAP
+        from hdbscan import HDBSCAN
+        from sklearn.feature_extraction.text import CountVectorizer
 
         logger.info("Initialising BERTopic (min_topic_size=%d)", config.BERTOPIC_MIN_TOPIC_SIZE)
 
-        embedding_model = SentenceTransformer(config.EMBEDDING_MODEL)
+        umap_model = UMAP(
+            n_components=5,
+            n_neighbors=15,
+            min_dist=0.0,
+            metric="cosine",
+            low_memory=True,
+            random_state=42,
+        )
+        hdbscan_model = HDBSCAN(
+            min_cluster_size=config.BERTOPIC_MIN_TOPIC_SIZE,
+            metric="euclidean",
+            cluster_selection_method="eom",
+            prediction_data=True,
+            core_dist_n_jobs=-1,
+        )
+        vectorizer_model = CountVectorizer(
+            stop_words="english",
+            min_df=2,
+            ngram_range=(1, 2),
+        )
 
         self.model = BERTopic(
-            embedding_model=embedding_model,
+            embedding_model=None,
+            umap_model=umap_model,
+            hdbscan_model=hdbscan_model,
+            vectorizer_model=vectorizer_model,
             min_topic_size=config.BERTOPIC_MIN_TOPIC_SIZE,
             nr_topics="auto",
             verbose=True,
-            calculate_probabilities=True,
+            calculate_probabilities=False,
         )
 
         self._ready = True
@@ -69,11 +95,12 @@ class TopicModeler:
         """
         Fit BERTopic on the corpus and return (topic_assignments, probabilities).
 
-        If *embeddings_array* is provided (pre-computed from EmbeddingEngine),
-        BERTopic skips its own embedding step — faster and consistent.
+        Empty abstracts are excluded from BERTopic (which crashes on blank strings)
+        but the returned topic list is padded back to the original length with -1
+        so callers always get one topic ID per input document.
 
-        topic_assignments: list of int topic IDs per document (-1 = outlier)
-        probabilities:     array of shape [n_docs, n_topics]
+        If *embeddings_array* is provided (pre-computed from EmbeddingEngine),
+        only the rows for valid documents are passed, avoiding a full re-encode.
         """
         self._check_ready()
 
@@ -81,34 +108,52 @@ class TopicModeler:
             if progress_callback:
                 progress_callback(done, total, msg)
 
-        valid_abstracts = [a if isinstance(a, str) and a.strip() else "" for a in abstracts_list]
+        n_total = len(abstracts_list)
 
-        if not any(valid_abstracts):
+        # Build valid-document mask
+        valid_indices = [
+            i for i, a in enumerate(abstracts_list)
+            if isinstance(a, str) and a.strip()
+        ]
+
+        if not valid_indices:
             logger.warning("fit_transform: no non-empty abstracts")
-            self._topics = []
+            self._topics = [-1] * n_total
             self._probs = np.array([])
-            return [], np.array([])
+            return self._topics, np.array([])
 
-        _cb(0, len(valid_abstracts), "Fitting topic model on corpus...")
+        valid_docs = [abstracts_list[i] for i in valid_indices]
+        valid_embeddings = (
+            embeddings_array[valid_indices]
+            if embeddings_array is not None and len(embeddings_array) == n_total
+            else None
+        )
+
+        _cb(0, len(valid_docs), "Fitting topic model on corpus...")
 
         try:
-            if embeddings_array is not None and len(embeddings_array) == len(valid_abstracts):
-                topics, probs = self.model.fit_transform(valid_abstracts, embeddings_array)
+            if valid_embeddings is not None:
+                topics_valid, probs = self.model.fit_transform(valid_docs, valid_embeddings)
             else:
-                topics, probs = self.model.fit_transform(valid_abstracts)
+                topics_valid, probs = self.model.fit_transform(valid_docs)
         except Exception as exc:
             logger.error("BERTopic fit_transform failed: %s", exc)
             raise
 
-        self._topics = topics
+        # Reconstruct full-length topic list; empty docs → outlier (-1)
+        full_topics = [-1] * n_total
+        for idx, topic in zip(valid_indices, topics_valid):
+            full_topics[idx] = int(topic)
+
+        self._topics = full_topics
         self._probs = probs if probs is not None else np.array([])
 
         topic_info = self.model.get_topic_info()
         n_topics = len(topic_info[topic_info["Topic"] >= 0])
-        _cb(len(valid_abstracts), len(valid_abstracts), f"Topic modeling complete: {n_topics} topics discovered")
-        logger.info("fit_transform done: %d topics, %d documents", n_topics, len(valid_abstracts))
+        _cb(n_total, n_total, f"Topic modeling complete: {n_topics} topics discovered")
+        logger.info("fit_transform done: %d topics, %d/%d documents used", n_topics, len(valid_docs), n_total)
 
-        return topics, self._probs
+        return full_topics, self._probs
 
     # ── Topic-over-time ───────────────────────────────────────────────────────
 

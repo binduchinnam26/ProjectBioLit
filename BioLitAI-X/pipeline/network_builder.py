@@ -440,6 +440,32 @@ class NetworkBuilder:
 
         return G
 
+    # ── Display thinning ──────────────────────────────────────────────────────
+
+    def prepare_graph_for_display(
+        self, full_graph: nx.Graph, max_display_nodes: int = 2000
+    ) -> nx.Graph:
+        """
+        Return a subgraph suitable for interactive rendering.
+
+        If the graph has more than *max_display_nodes* nodes, keep only the
+        top-N by degree centrality (the most connected, most informative nodes).
+        The full graph is unchanged and still available for analysis.
+        """
+        if full_graph.number_of_nodes() <= max_display_nodes:
+            return full_graph
+        try:
+            deg_cent = nx.degree_centrality(full_graph)
+        except Exception:
+            deg_cent = {n: full_graph.degree(n) for n in full_graph.nodes()}
+        top_nodes = sorted(deg_cent, key=deg_cent.get, reverse=True)[:max_display_nodes]
+        sub = full_graph.subgraph(top_nodes).copy()
+        logger.info(
+            "prepare_graph_for_display: thinned %d → %d nodes for rendering",
+            full_graph.number_of_nodes(), sub.number_of_nodes(),
+        )
+        return sub
+
     # ── Network statistics ────────────────────────────────────────────────────
 
     def calculate_network_statistics(self, G) -> Dict[str, Any]:

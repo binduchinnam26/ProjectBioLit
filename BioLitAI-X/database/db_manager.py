@@ -30,6 +30,10 @@ class DatabaseManager:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=100000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA mmap_size=268435456")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
@@ -161,6 +165,30 @@ class DatabaseManager:
         except Exception as exc:
             logger.error("get_papers_by_query failed: %s", exc)
             return []
+
+    def insert_papers_batch(self, papers_list: List[Dict[str, Any]]):
+        """Insert or replace a list of paper dicts in a single transaction."""
+        now = datetime.utcnow().isoformat()
+        rows = [
+            (
+                p.get("pmid"), p.get("title"), p.get("abstract"), p.get("journal"),
+                p.get("volume"), p.get("issue"), p.get("pages"), p.get("pub_date"),
+                p.get("doi"), p.get("language"), p.get("query_used"), now,
+            )
+            for p in papers_list
+        ]
+        try:
+            with self._lock, self._conn() as conn:
+                conn.executemany(
+                    """INSERT OR REPLACE INTO papers
+                       (pmid, title, abstract, journal, volume, issue, pages,
+                        pub_date, doi, language, query_used, fetched_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+        except Exception as exc:
+            logger.error("insert_papers_batch failed: %s", exc)
+            raise
 
     def search_papers(self, search_term: str, limit: int = 50) -> List[Dict]:
         try:
@@ -461,6 +489,94 @@ class DatabaseManager:
                 return cur.lastrowid
         except Exception as exc:
             logger.error("insert_relationship failed: %s", exc)
+            raise
+
+    def insert_entities_batch(self, entity_rows: List[Dict]) -> Dict:
+        """
+        Batch-insert entities and paper-entity links in a single transaction.
+
+        Returns {(entity_text, entity_type): entity_id} for use by
+        insert_relationships_batch().
+        """
+        # Collect unique (name, type) pairs
+        unique: Dict[tuple, Optional[str]] = {}
+        for row in entity_rows:
+            key = (row["entity_text"], row["entity_type"])
+            if key not in unique:
+                unique[key] = row.get("umls_id")
+
+        entity_id_map: Dict = {}
+        try:
+            with self._lock, self._conn() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO entities (name, entity_type, umls_id) VALUES (?, ?, ?)",
+                    [(name, etype, umls_id) for (name, etype), umls_id in unique.items()],
+                )
+                for name, etype in unique:
+                    row = conn.execute(
+                        "SELECT id FROM entities WHERE name = ? AND entity_type = ?",
+                        (name, etype),
+                    ).fetchone()
+                    if row:
+                        entity_id_map[(name, etype)] = row["id"]
+
+                pe_rows = []
+                for row in entity_rows:
+                    key = (row["entity_text"], row["entity_type"])
+                    eid = entity_id_map.get(key)
+                    if eid:
+                        pe_rows.append((row["pmid"], eid, row.get("sentence_context", "")))
+                if pe_rows:
+                    conn.executemany(
+                        """INSERT OR IGNORE INTO paper_entities
+                           (paper_pmid, entity_id, sentence_context) VALUES (?, ?, ?)""",
+                        pe_rows,
+                    )
+        except Exception as exc:
+            logger.error("insert_entities_batch failed: %s", exc)
+            raise
+        return entity_id_map
+
+    def insert_relationships_batch(
+        self, rel_rows: List[Dict], entity_id_map: Dict
+    ):
+        """
+        Batch-insert relationships using the entity_id_map returned by
+        insert_entities_batch().  Rows where either endpoint cannot be
+        resolved are silently skipped (entity not extracted for that paper).
+        """
+        # Build text-lower → entity_id lookup (first entity type wins)
+        text_to_id: Dict[str, int] = {}
+        for (name, _etype), eid in entity_id_map.items():
+            key = name.lower()
+            if key not in text_to_id:
+                text_to_id[key] = eid
+
+        rows = []
+        for rel in rel_rows:
+            src_id = text_to_id.get(rel.get("subject_entity", "").lower())
+            tgt_id = text_to_id.get(rel.get("object_entity", "").lower())
+            if src_id and tgt_id and src_id != tgt_id:
+                rows.append((
+                    src_id, tgt_id,
+                    rel.get("relationship_verb", ""),
+                    rel.get("pmid"),
+                    1.0,
+                ))
+
+        if not rows:
+            return
+        try:
+            with self._lock, self._conn() as conn:
+                conn.executemany(
+                    """INSERT INTO relationships
+                       (source_entity_id, target_entity_id, relationship_type,
+                        evidence_pmid, confidence_score)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    rows,
+                )
+        except Exception as exc:
+            logger.error("insert_relationships_batch failed: %s", exc)
             raise
 
     # ── Hypotheses ────────────────────────────────────────────────────────────

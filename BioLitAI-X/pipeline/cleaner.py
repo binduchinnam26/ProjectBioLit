@@ -400,15 +400,9 @@ class DataCleaner:
         # ── Step 6: Deduplicate ───────────────────────────────────────────────
         df = self.detect_duplicates(df)
 
-        # ── Step 7: Drop rows with neither title nor abstract ─────────────────
-        before = len(df)
-        mask = df["title"].notna() | df["abstract"].notna()
-        df = df[mask].reset_index(drop=True)
-        dropped = before - len(df)
-        if dropped:
-            logger.warning(
-                "Dropped %d records with no title and no abstract", dropped
-            )
+        # Papers with neither title nor abstract are kept — all retrieved records
+        # go into the database.  The NLP processor skips them silently via the
+        # title-fallback + empty-text guard in nlp_processor._safe_text().
 
         logger.info("Cleaning pipeline complete: %d papers ready for NLP", len(df))
         return df

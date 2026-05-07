@@ -3,6 +3,7 @@
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
 
 import pandas as pd
@@ -12,6 +13,7 @@ import config
 from ui.components.cards import empty_state
 from ui.components.loaders import live_stats_bar, progress_pipeline
 from ui.components.metrics import pipeline_status_indicator
+from utils.helpers import query_hash
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +53,7 @@ def render():
             key="home_query_input",
         )
 
-        col1, col2, col3 = st.columns([2, 1, 1])
+        col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
         with col1:
             max_results = st.slider(
                 "Max Results",
@@ -75,6 +77,13 @@ def render():
                 "🔍  Search & Analyse",
                 use_container_width=True,
                 type="primary",
+            )
+        with col4:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            force_rerun = st.button(
+                "↺  Force Rerun",
+                use_container_width=True,
+                help="Ignore cached results and re-fetch from PubMed",
             )
 
     # ── Past sessions chips ───────────────────────────────────────────────────
@@ -103,12 +112,12 @@ def render():
     )
 
     # ── Run pipeline on search ────────────────────────────────────────────────
-    if search_clicked:
+    if search_clicked or force_rerun:
         q = (query or "").strip()
         if not q:
             st.error("Please enter a biomedical research query.")
             return
-        _run_pipeline(q, max_results, year_min, year_max)
+        _run_pipeline(q, max_results, year_min, year_max, force_rerun=force_rerun)
 
     # ── Show results summary if pipeline is complete ──────────────────────────
     elif st.session_state.get("pipeline_complete"):
@@ -117,8 +126,14 @@ def render():
 
 # ── Pipeline orchestrator ─────────────────────────────────────────────────────
 
-def _run_pipeline(query: str, max_results: int, year_min: int, year_max: int):
-    """Execute the full 6-step pipeline with live progress updates."""
+def _run_pipeline(
+    query: str,
+    max_results: int,
+    year_min: int,
+    year_max: int,
+    force_rerun: bool = False,
+):
+    """Execute the full 6-step pipeline with live progress and parquet caching."""
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
@@ -136,6 +151,11 @@ def _run_pipeline(query: str, max_results: int, year_min: int, year_max: int):
     step_container = st.empty()
     stats_container = st.empty()
     status_msg = st.empty()
+    pipeline_start = time.monotonic()
+
+    def _elapsed() -> str:
+        secs = int(time.monotonic() - pipeline_start)
+        return f"{secs // 60}m {secs % 60}s" if secs >= 60 else f"{secs}s"
 
     def _update(step: int, msg: str, papers: int = 0, ents: int = 0, rels: int = 0):
         with step_container.container():
@@ -143,51 +163,111 @@ def _run_pipeline(query: str, max_results: int, year_min: int, year_max: int):
         with stats_container.container():
             live_stats_bar(papers, ents, rels)
         status_msg.markdown(
-            f"<p style='font-size:12px;color:{config.TEXT_SECONDARY}'>{msg}</p>",
+            f"<p style='font-size:12px;color:{config.TEXT_SECONDARY}'>"
+            f"{msg} <span style='opacity:0.5'>({_elapsed()})</span></p>",
             unsafe_allow_html=True,
         )
 
+    # ── Parquet cache ─────────────────────────────────────────────────────────
+    qhash = query_hash(query)
+    cache_path = Path(config.PROCESSED_DIR) / f"{qhash}.parquet"
+    papers_df = pd.DataFrame()
+
+    if cache_path.exists() and not force_rerun:
+        try:
+            papers_df = pd.read_parquet(cache_path)
+            _update(3, f"Loaded {len(papers_df):,} papers from cache.", papers=len(papers_df))
+            logger.info("Loaded %d papers from parquet cache: %s", len(papers_df), cache_path)
+        except Exception as exc:
+            logger.warning("Cache load failed (%s); re-running pipeline.", exc)
+            papers_df = pd.DataFrame()
+
     try:
-        # Step 1: Fetch
-        _update(1, "Fetching papers from PubMed...")
-        retriever = PubMedRetriever()
-        pmids, xml_batches = retriever.fetch_with_progress(
-            query, max_results,
-            progress_callback=lambda d, t, m: _update(1, m, papers=d),
-        )
+        if papers_df.empty:
+            # Step 1: Fetch
+            _update(1, "Fetching papers from PubMed...")
+            retriever = PubMedRetriever()
+            pmids, xml_batches = retriever.fetch_with_progress(
+                query, max_results,
+                progress_callback=lambda d, t, m: _update(1, m, papers=d),
+            )
 
-        # Step 2: Parse
-        _update(2, "Parsing XML records...", papers=len(pmids))
-        parser = XMLParser()
-        raw_papers = []
-        for xml_batch in xml_batches:
-            raw_papers.extend(parser.parse_batch(xml_batch, query_used=query))
+            # Step 2: Parse
+            _update(2, "Parsing XML records...", papers=len(pmids))
+            parser = XMLParser()
+            raw_papers = []
+            for xml_batch in xml_batches:
+                raw_papers.extend(parser.parse_batch(xml_batch, query_used=query))
+            _update(2, f"Parsed {len(raw_papers)} records.", papers=len(raw_papers))
 
-        _update(2, f"Parsed {len(raw_papers)} records.", papers=len(raw_papers))
+            # Step 3: Clean
+            _update(3, "Cleaning and normalizing data...")
+            cleaner = DataCleaner()
+            papers_df = cleaner.run_full_pipeline(raw_papers)
 
-        # Step 3: Clean
-        _update(3, "Cleaning and normalizing data...")
-        cleaner = DataCleaner()
-        papers_df = cleaner.run_full_pipeline(raw_papers)
+            # Apply year filter
+            if "pub_year" in papers_df.columns:
+                before = len(papers_df)
+                papers_df = papers_df[
+                    papers_df["pub_year"].fillna(0).astype(int).between(year_min, year_max)
+                    | papers_df["pub_year"].isna()
+                ].reset_index(drop=True)
+                filtered_out = before - len(papers_df)
+                if filtered_out:
+                    logger.info(
+                        "Year filter removed %d papers outside %d–%d",
+                        filtered_out, year_min, year_max,
+                    )
 
-        # Apply year filter using pub_year (integer) produced by the cleaner —
-        # more reliable than slicing the raw pub_date string from the parser.
-        if "pub_year" in papers_df.columns:
-            before = len(papers_df)
-            papers_df = papers_df[
-                papers_df["pub_year"].fillna(0).astype(int).between(year_min, year_max)
-                | papers_df["pub_year"].isna()
-            ].reset_index(drop=True)
-            filtered_out = before - len(papers_df)
-            if filtered_out:
-                logger.info("Year filter removed %d papers outside %d–%d", filtered_out, year_min, year_max)
+            # Persist to parquet cache for instant future loads
+            try:
+                # Parquet cannot serialise list/dict columns directly — store
+                # them as JSON strings, then restore on load via _restore_list_cols.
+                cache_df = papers_df.copy()
+                for col in ("authors", "author_keywords", "mesh_terms",
+                            "chemicals", "publication_types", "grants"):
+                    if col in cache_df.columns:
+                        import json as _json
+                        cache_df[col] = cache_df[col].apply(
+                            lambda v: _json.dumps(v) if not isinstance(v, str) else v
+                        )
+                cache_df.to_parquet(cache_path, index=False)
+                logger.info("Parquet cache saved: %s", cache_path)
+            except Exception as exc:
+                logger.warning("Parquet cache save failed: %s", exc)
 
-        _update(3, f"Cleaning complete. {len(papers_df)} papers retained.", papers=len(papers_df))
+            _update(3, f"Cleaning complete. {len(papers_df):,} papers retained.",
+                    papers=len(papers_df))
+        else:
+            # Restore list columns serialised as JSON strings in the cache
+            import json as _json
+            for col in ("authors", "author_keywords", "mesh_terms",
+                        "chemicals", "publication_types", "grants"):
+                if col in papers_df.columns:
+                    def _try_parse(v):
+                        if isinstance(v, str):
+                            try:
+                                return _json.loads(v)
+                            except Exception:
+                                return []
+                        return v if isinstance(v, list) else []
+                    papers_df[col] = papers_df[col].apply(_try_parse)
+            cleaner = DataCleaner()
 
-        # Store papers to database
+        # Store papers to database using batch insert (single transaction)
+        try:
+            db.insert_papers_batch(papers_df.to_dict("records"))
+        except Exception as exc:
+            logger.warning("Batch paper insert failed, falling back to row-by-row: %s", exc)
+            for _, row in papers_df.iterrows():
+                try:
+                    db.insert_paper(row.to_dict())
+                except Exception as e2:
+                    logger.warning("Row insert failed PMID %s: %s", row.get("pmid"), e2)
+
+        # Relational data (authors, keywords, mesh, chemicals, pub_types) row-by-row
         for _, row in papers_df.iterrows():
             try:
-                db.insert_paper(row.to_dict())
                 for auth in (row.get("authors") or []):
                     if isinstance(auth, dict) and auth.get("name"):
                         aid = db.insert_author(
@@ -215,7 +295,7 @@ def _run_pipeline(query: str, max_results: int, year_min: int, year_max: int):
                     pid = db.insert_publication_type(pt)
                     db.link_paper_publication_type(row["pmid"], pid)
             except Exception as exc:
-                logger.warning("DB insert failed for PMID %s: %s", row.get("pmid"), exc)
+                logger.warning("Relational DB insert failed for PMID %s: %s", row.get("pmid"), exc)
 
         # Step 4: NLP (optional — skip if scispacy not installed)
         _update(4, "Running NLP entity extraction...")
@@ -234,7 +314,7 @@ def _run_pipeline(query: str, max_results: int, year_min: int, year_max: int):
             logger.warning("NLP step skipped (%s). Knowledge graph will be limited.", exc)
             st.warning(f"NLP processing skipped: {exc}. Knowledge graph will have limited data.")
 
-        _update(4, f"NLP done: {len(entities_df)} entities, {len(relationships_df)} relationships.",
+        _update(4, f"NLP done: {len(entities_df):,} entities, {len(relationships_df):,} relationships.",
                 papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
 
         # Step 5: Embeddings (optional)
@@ -257,10 +337,10 @@ def _run_pipeline(query: str, max_results: int, year_min: int, year_max: int):
         # Step 6: Networks and knowledge graph
         _update(6, "Building bibliometric networks and knowledge graph...")
         nb = NetworkBuilder()
-        coauth_graph    = nb.build_coauthorship_network(papers_df)
-        keyword_graph   = nb.build_keyword_cooccurrence_network(papers_df)
-        coauth_stats    = nb.calculate_network_statistics(coauth_graph)
-        keyword_stats   = nb.calculate_network_statistics(keyword_graph)
+        coauth_graph  = nb.build_coauthorship_network(papers_df)
+        keyword_graph = nb.build_keyword_cooccurrence_network(papers_df)
+        coauth_stats  = nb.calculate_network_statistics(coauth_graph)
+        keyword_stats = nb.calculate_network_statistics(keyword_graph)
 
         kg = KnowledgeGraph()
         kg_graph = kg.build_from_entities(entities_df, relationships_df)
@@ -324,10 +404,11 @@ def _run_pipeline(query: str, max_results: int, year_min: int, year_max: int):
         })
         st.session_state["past_sessions"] = past
 
-        _update(7, "Pipeline complete!", papers=len(papers_df),
+        total_elapsed = _elapsed()
+        _update(7, f"Pipeline complete! ({total_elapsed})", papers=len(papers_df),
                 ents=len(entities_df), rels=len(relationships_df))
         st.success(
-            f"✅ Pipeline complete! {len(papers_df):,} papers analysed. "
+            f"✅ Pipeline complete in {total_elapsed}! {len(papers_df):,} papers analysed. "
             f"Use the sidebar to explore results."
         )
 
