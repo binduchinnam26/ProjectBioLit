@@ -155,6 +155,197 @@ class DatabaseManager:
             logger.error("get_all_papers failed: %s", exc)
             return []
 
+    def insert_paper_metadata_batch(self, papers_records: List[Dict[str, Any]]):
+        """
+        Insert all relational metadata (authors, keywords, MeSH terms, chemicals,
+        publication types) for a list of papers in a SINGLE SQLite transaction.
+
+        For 10k papers this replaces ~200k individual transactions with ~10
+        executemany calls, reducing wall time from minutes to seconds.
+        Authors and keywords in papers_records are assumed already normalised by
+        DataCleaner.run_full_pipeline().
+        """
+        if not papers_records:
+            return
+
+        # ── Collect unique entities and links across all papers ───────────────
+        unique_authors: Dict[tuple, None] = {}
+        author_links: List[tuple] = []
+
+        unique_keywords: Dict[tuple, None] = {}
+        keyword_links: List[tuple] = []
+
+        unique_mesh: Dict[tuple, None] = {}
+        mesh_links: List[tuple] = []
+
+        unique_chemicals: Dict[tuple, None] = {}
+        chemical_links: List[tuple] = []
+
+        unique_pub_types: Dict[str, None] = {}
+        pub_type_links: List[tuple] = []
+
+        for paper in papers_records:
+            pmid = paper.get("pmid")
+            if not pmid:
+                continue
+
+            for auth in (paper.get("authors") or []):
+                if isinstance(auth, dict) and auth.get("name"):
+                    name = auth["name"]
+                    aff = auth.get("affiliation") or ""
+                    unique_authors[(name, name, aff)] = None
+                    author_links.append((pmid, name, aff))
+
+            for kw in (paper.get("author_keywords") or []):
+                if kw:
+                    unique_keywords[(kw, kw, "author")] = None
+                    keyword_links.append((pmid, kw))
+
+            for mesh in (paper.get("mesh_terms") or []):
+                if isinstance(mesh, dict) and mesh.get("descriptor"):
+                    desc = mesh["descriptor"]
+                    qual = mesh.get("qualifier")
+                    is_major = int(bool(mesh.get("is_major_topic")))
+                    unique_mesh[(desc, qual, is_major)] = None
+                    mesh_links.append((pmid, desc, qual, is_major))
+
+            for chem in (paper.get("chemicals") or []):
+                if isinstance(chem, dict) and chem.get("name"):
+                    name = chem["name"]
+                    reg = chem.get("registry_number")
+                    unique_chemicals[(name, reg)] = None
+                    chemical_links.append((pmid, name))
+
+            for pt in (paper.get("publication_types") or []):
+                if pt:
+                    unique_pub_types[pt] = None
+                    pub_type_links.append((pmid, pt))
+
+        try:
+            with self._lock, self._conn() as conn:
+                # ── Authors ───────────────────────────────────────────────────
+                if unique_authors:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO authors (name, normalized_name, affiliation) VALUES (?, ?, ?)",
+                        list(unique_authors.keys()),
+                    )
+                if author_links:
+                    needed = {(n, a) for _, n, a in author_links}
+                    author_id_map = {
+                        (r["name"], r["affiliation"] or ""): r["id"]
+                        for r in conn.execute(
+                            "SELECT id, name, affiliation FROM authors"
+                        ).fetchall()
+                        if (r["name"], r["affiliation"] or "") in needed
+                    }
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO paper_authors (paper_pmid, author_id, author_order) VALUES (?, ?, ?)",
+                        [
+                            (pmid, author_id_map[(name, aff)], 0)
+                            for pmid, name, aff in author_links
+                            if (name, aff) in author_id_map
+                        ],
+                    )
+
+                # ── Keywords ──────────────────────────────────────────────────
+                if unique_keywords:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO keywords (keyword, normalized_keyword, keyword_type) VALUES (?, ?, ?)",
+                        list(unique_keywords.keys()),
+                    )
+                if keyword_links:
+                    kw_id_map = {
+                        (r["keyword"], r["keyword_type"]): r["id"]
+                        for r in conn.execute(
+                            "SELECT id, keyword, keyword_type FROM keywords"
+                        ).fetchall()
+                    }
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO paper_keywords (paper_pmid, keyword_id) VALUES (?, ?)",
+                        [
+                            (pmid, kw_id_map[(kw, "author")])
+                            for pmid, kw in keyword_links
+                            if (kw, "author") in kw_id_map
+                        ],
+                    )
+
+                # ── MeSH terms ────────────────────────────────────────────────
+                if unique_mesh:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO mesh_terms (descriptor, qualifier, is_major_topic) VALUES (?, ?, ?)",
+                        list(unique_mesh.keys()),
+                    )
+                if mesh_links:
+                    mesh_id_map = {
+                        (r["descriptor"], r["qualifier"], r["is_major_topic"]): r["id"]
+                        for r in conn.execute(
+                            "SELECT id, descriptor, qualifier, is_major_topic FROM mesh_terms"
+                        ).fetchall()
+                    }
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO paper_mesh (paper_pmid, mesh_term_id) VALUES (?, ?)",
+                        [
+                            (pmid, mesh_id_map.get((desc, qual, is_major)))
+                            for pmid, desc, qual, is_major in mesh_links
+                            if mesh_id_map.get((desc, qual, is_major))
+                        ],
+                    )
+
+                # ── Chemicals ─────────────────────────────────────────────────
+                if unique_chemicals:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO chemical_terms (name, registry_number) VALUES (?, ?)",
+                        list(unique_chemicals.keys()),
+                    )
+                if chemical_links:
+                    chem_id_map = {
+                        r["name"]: r["id"]
+                        for r in conn.execute(
+                            "SELECT id, name FROM chemical_terms"
+                        ).fetchall()
+                    }
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO paper_chemicals (paper_pmid, chemical_term_id) VALUES (?, ?)",
+                        [
+                            (pmid, chem_id_map[name])
+                            for pmid, name in chemical_links
+                            if name in chem_id_map
+                        ],
+                    )
+
+                # ── Publication types ─────────────────────────────────────────
+                if unique_pub_types:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO publication_types (publication_type) VALUES (?)",
+                        [(pt,) for pt in unique_pub_types],
+                    )
+                if pub_type_links:
+                    pt_id_map = {
+                        r["publication_type"]: r["id"]
+                        for r in conn.execute(
+                            "SELECT id, publication_type FROM publication_types"
+                        ).fetchall()
+                    }
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO paper_publication_types (paper_pmid, publication_type_id) VALUES (?, ?)",
+                        [
+                            (pmid, pt_id_map[pt])
+                            for pmid, pt in pub_type_links
+                            if pt in pt_id_map
+                        ],
+                    )
+
+        except Exception as exc:
+            logger.error("insert_paper_metadata_batch failed: %s", exc)
+            raise
+
+        logger.info(
+            "insert_paper_metadata_batch: %d authors, %d keywords, %d mesh, "
+            "%d chemicals, %d pub_types across %d papers",
+            len(unique_authors), len(unique_keywords), len(unique_mesh),
+            len(unique_chemicals), len(unique_pub_types), len(papers_records),
+        )
+
     def get_papers_by_query(self, query_used: str) -> List[Dict]:
         try:
             with self._conn() as conn:

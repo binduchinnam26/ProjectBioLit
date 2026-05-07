@@ -201,7 +201,8 @@ def _run_pipeline(
             _update(2, f"Parsed {len(raw_papers)} records.", papers=len(raw_papers))
 
             # Step 3: Clean
-            _update(3, "Cleaning and normalizing data...")
+            n_raw = len(raw_papers)
+            _update(3, f"Cleaning and normalising {n_raw:,} papers — please wait...")
             cleaner = DataCleaner()
             papers_df = cleaner.run_full_pipeline(raw_papers)
 
@@ -252,50 +253,25 @@ def _run_pipeline(
                                 return []
                         return v if isinstance(v, list) else []
                     papers_df[col] = papers_df[col].apply(_try_parse)
-            cleaner = DataCleaner()
 
-        # Store papers to database using batch insert (single transaction)
+        # Store papers + all relational metadata to database (single transaction each)
+        _update(3, f"Storing {len(papers_df):,} papers to database...", papers=len(papers_df))
         try:
             db.insert_papers_batch(papers_df.to_dict("records"))
         except Exception as exc:
-            logger.warning("Batch paper insert failed, falling back to row-by-row: %s", exc)
+            logger.warning("Batch paper insert failed, falling back row-by-row: %s", exc)
             for _, row in papers_df.iterrows():
                 try:
                     db.insert_paper(row.to_dict())
                 except Exception as e2:
                     logger.warning("Row insert failed PMID %s: %s", row.get("pmid"), e2)
 
-        # Relational data (authors, keywords, mesh, chemicals, pub_types) row-by-row
-        for _, row in papers_df.iterrows():
-            try:
-                for auth in (row.get("authors") or []):
-                    if isinstance(auth, dict) and auth.get("name"):
-                        aid = db.insert_author(
-                            auth["name"],
-                            cleaner.normalize_author_name(auth["name"]),
-                            auth.get("affiliation") or "",
-                        )
-                        db.link_paper_author(row["pmid"], aid, 0)
-                for kw in (row.get("author_keywords") or []):
-                    kid = db.insert_keyword(kw, cleaner.normalize_keyword(kw), "author")
-                    db.link_paper_keyword(row["pmid"], kid)
-                for mesh in (row.get("mesh_terms") or []):
-                    if isinstance(mesh, dict):
-                        mid = db.insert_mesh_term(
-                            mesh.get("descriptor", ""),
-                            mesh.get("qualifier"),
-                            bool(mesh.get("is_major_topic")),
-                        )
-                        db.link_paper_mesh(row["pmid"], mid)
-                for chem in (row.get("chemicals") or []):
-                    if isinstance(chem, dict) and chem.get("name"):
-                        cid = db.insert_chemical_term(chem["name"], chem.get("registry_number"))
-                        db.link_paper_chemical(row["pmid"], cid)
-                for pt in (row.get("publication_types") or []):
-                    pid = db.insert_publication_type(pt)
-                    db.link_paper_publication_type(row["pmid"], pid)
-            except Exception as exc:
-                logger.warning("Relational DB insert failed for PMID %s: %s", row.get("pmid"), exc)
+        # Authors, keywords, MeSH, chemicals, pub types — all in ONE transaction
+        _update(3, f"Indexing authors, keywords, MeSH terms...", papers=len(papers_df))
+        try:
+            db.insert_paper_metadata_batch(papers_df.to_dict("records"))
+        except Exception as exc:
+            logger.warning("Batch metadata insert failed: %s", exc)
 
         # Step 4: NLP (optional — skip if scispacy not installed)
         _update(4, "Running NLP entity extraction...")
