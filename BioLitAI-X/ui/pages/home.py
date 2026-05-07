@@ -60,8 +60,8 @@ def render():
                 min_value=config.MAX_RESULTS_MIN,
                 max_value=config.MAX_RESULTS_MAX,
                 value=config.MAX_RESULTS_DEFAULT,
-                step=100,
-                help="Number of papers to retrieve from PubMed",
+                step=500,
+                help="Number of papers to retrieve from PubMed (up to 10,000)",
             )
         with col2:
             _cur_year = datetime.now().year
