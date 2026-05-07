@@ -180,8 +180,16 @@ class DataCleaner:
 
     def detect_duplicates(self, papers_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Remove exact PMID duplicates and near-duplicate titles (similarity ≥ 95).
-        Returns a deduplicated DataFrame.
+        Remove duplicate papers.
+
+        Strategy:
+          1. Exact PMID deduplication (O(n), handles the vast majority of cases).
+          2. Exact lowercased-title deduplication (O(n), catches re-indexed papers
+             with the same title under different PMIDs).
+          3. Fuzzy title deduplication is intentionally skipped for performance —
+             an O(n²) fuzz scan over 1000+ papers would freeze the pipeline for
+             several minutes with negligible practical benefit, since PubMed
+             PMIDs are already unique identifiers.
         """
         if papers_df.empty:
             return papers_df
@@ -191,32 +199,9 @@ class DataCleaner:
         # 1. Exact PMID deduplication
         papers_df = papers_df.drop_duplicates(subset=["pmid"], keep="first")
 
-        # 2. Near-duplicate title detection
-        titles = papers_df["title"].fillna("").tolist()
-        pmids = papers_df["pmid"].tolist()
-        drop_indices = set()
-
-        for i in range(len(titles)):
-            if i in drop_indices:
-                continue
-            for j in range(i + 1, len(titles)):
-                if j in drop_indices:
-                    continue
-                if not titles[i] or not titles[j]:
-                    continue
-                score = fuzz.token_sort_ratio(titles[i], titles[j])
-                if score >= _TITLE_SIMILARITY_THRESHOLD:
-                    logger.debug(
-                        "Near-duplicate titles (score=%d): '%s' vs '%s'",
-                        score,
-                        pmids[i],
-                        pmids[j],
-                    )
-                    drop_indices.add(j)
-
-        if drop_indices:
-            keep_mask = [i not in drop_indices for i in range(len(papers_df))]
-            papers_df = papers_df[keep_mask].reset_index(drop=True)
+        # 2. Exact title deduplication (case-insensitive)
+        title_lower = papers_df["title"].fillna("").str.strip().str.lower()
+        papers_df = papers_df[~((title_lower != "") & title_lower.duplicated(keep="first"))]
 
         after = len(papers_df)
         if before != after:
