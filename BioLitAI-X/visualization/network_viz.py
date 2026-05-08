@@ -3,7 +3,7 @@ network_viz.py — VOSviewer-accurate bibliometric network visualizations.
 
 Three visualization modes matching VOSviewer 1.6.18+:
 
-  Network Visualization  — cluster-colored nodes, fixed VOS-like layout,
+  Network Visualization  — cluster-colored nodes, UMAP+ForceAtlas2 layout,
                            interactive (drag/zoom), colored edges.
 
   Overlay Visualization  — same positions, Viridis color gradient mapped
@@ -13,8 +13,9 @@ Three visualization modes matching VOSviewer 1.6.18+:
                            formula: D(x) = Σ wᵢ·K(‖x−xᵢ‖ / (d̄·h))
                            with Viridis colorscale, white node circles on top.
 
-All three modes share the same pre-computed kamada-kawai layout so positions
-are consistent when switching between modes.
+All three modes share the same pre-computed UMAP+ForceAtlas2 layout so
+positions are consistent when switching between modes — identical to the
+way VOSviewer keeps positions stable across its Network/Overlay/Density tabs.
 """
 
 import json
@@ -29,6 +30,7 @@ import networkx as nx
 import streamlit as st
 
 import config
+from visualization.layout_engine import compute_vos_layout
 
 logger = logging.getLogger(__name__)
 
@@ -75,57 +77,69 @@ _VOS_CSS = """
 </style>
 """
 
-# Barnes-Hut physics used when the physics toggle is ON
+# Near-zero gravity ForceAtlas2 physics used only when the physics toggle is ON
+# (organic refinement mode, no central pull)
 _VOS_PHYSICS_ON = {
-    "barnesHut": {
-        "gravitationalConstant": -8000,
-        "centralGravity": 0.15,
-        "springLength": 130,
-        "springConstant": 0.04,
-        "damping": 0.10,
-        "avoidOverlap": 0.8,
+    "forceAtlas2Based": {
+        "gravitationalConstant": -50,
+        "centralGravity": 0.0,
+        "springLength": 100,
+        "springConstant": 0.08,
+        "damping": 0.4,
+        "avoidOverlap": 0.5,
     },
     "minVelocity": 0.5,
-    "stabilization": {"enabled": True, "iterations": 200, "updateInterval": 50},
+    "solver": "forceAtlas2Based",
+    "stabilization": {"enabled": True, "iterations": 150, "updateInterval": 25},
 }
 
 
 # ── Layout computation (shared across all three modes) ────────────────────────
 
-def _compute_layout(G: nx.Graph, layout_key: str = "") -> Dict[str, Tuple[float, float]]:
+def _compute_layout(
+    G: nx.Graph,
+    layout_key: str = "",
+    network_type: str = "",
+) -> Dict[str, Tuple[float, float]]:
     """
-    Compute and cache the VOS-like layout for graph G.
+    Compute and cache the VOSviewer-style layout for graph G.
 
-    Uses kamada_kawai_layout (≤300 nodes) or spring_layout for larger graphs —
-    both approximate the multidimensional-scaling approach that VOSviewer uses.
-    Results are cached in st.session_state so all three viz modes share the
-    same positions.
+    Uses a two-stage pipeline: UMAP semantic positioning from paper embeddings
+    followed by ForceAtlas2 refinement (near-zero gravity, edge-weight attraction).
+    Falls back to kamada_kawai / spring_layout when embeddings are unavailable.
+
+    Embeddings and papers_df are read from st.session_state so all three viz
+    modes share identical positions when switching tabs.
 
     Returns {str(node): (x, y)} with values in approximately [-1, 1].
     """
-    cache_key = f"__pos_{layout_key}_{G.number_of_nodes()}_{G.number_of_edges()}"
-    cached = st.session_state.get(cache_key)
-    if cached is not None:
-        return cached
-
     n = G.number_of_nodes()
     if n == 0:
         return {}
 
-    try:
-        if n <= 150:
-            pos = nx.kamada_kawai_layout(G, weight="weight")
-        else:
-            k = 2.5 / math.sqrt(n)
-            pos = nx.spring_layout(G, weight="weight", seed=42, k=k, iterations=30)
-    except Exception:
-        pos = nx.random_layout(G, seed=42)
+    # Session-state cache key — includes node/edge count to invalidate on graph change
+    ss_key = f"__pos_{layout_key}_{network_type}_{n}_{G.number_of_edges()}"
+    cached = st.session_state.get(ss_key)
+    if cached is not None:
+        return cached
 
-    result: Dict[str, Tuple[float, float]] = {
-        str(node): (float(x), float(y)) for node, (x, y) in pos.items()
-    }
-    st.session_state[cache_key] = result
-    return result
+    # Pull embeddings + metadata from session state (set by the pipeline)
+    embeddings_array = st.session_state.get("embeddings_array")
+    papers_df        = st.session_state.get("papers_df")
+    doc_topics_df    = st.session_state.get("doc_topics_df")
+    query            = st.session_state.get("current_query", "")
+
+    pos = compute_vos_layout(
+        G,
+        network_type=network_type or layout_key,
+        papers_df=papers_df,
+        embeddings_array=embeddings_array,
+        doc_topics_df=doc_topics_df,
+        query=query,
+    )
+
+    st.session_state[ss_key] = pos
+    return pos
 
 
 def _compute_d_bar(pos: Dict[str, Tuple[float, float]]) -> float:
@@ -182,7 +196,7 @@ def _get_vosviewer_net(height: str = "700px", physics: bool = False):
         "interaction": {
             "hover": True, "tooltipDelay": 100,
             "navigationButtons": True, "keyboard": True,
-            "zoomView": True, "dragNodes": True, "dragView": True,
+            "zoomView": True, "dragNodes": False, "dragView": True,
         },
         "layout": {"improvedLayout": False},
     }
@@ -643,7 +657,7 @@ def render_coauthorship_network(
     s3.metric("Clusters", clusters)
     s4.metric("Total link strength", sum(d.get("weight", 1) for _, _, d in G2.edges(data=True)))
 
-    pos = _compute_layout(G2, layout_key="coauth")
+    pos = _compute_layout(G2, layout_key="coauth", network_type="coauth")
     _render_network_plotly(G2, pos, "paper_count", controls, height)
 
 
@@ -684,7 +698,7 @@ def render_keyword_network(
     s2.metric("Links", f"{min(total_edges, _MAX_RENDER_EDGES):,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
     s3.metric("Clusters", clusters)
 
-    pos = _compute_layout(G2, layout_key="keyword")
+    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword")
     _render_network_plotly(G2, pos, "frequency", controls, height)
 
 
@@ -708,7 +722,7 @@ def render_topic_network(
         st.warning("All nodes filtered out — lower the minimum weight thresholds.")
         return
 
-    pos = _compute_layout(G2, layout_key="topic")
+    pos = _compute_layout(G2, layout_key="topic", network_type="topic")
     net = _get_vosviewer_net(height=f"{height}px", physics=controls.get("physics", False))
     search_lower = controls.get("search", "").lower()
 
@@ -780,8 +794,8 @@ def render_overlay_visualization(
     # Compute overlay score
     overlay_vals = _overlay_year_per_node(G2, papers_df, network_type)
 
-    # Shared layout positions
-    pos = _compute_layout(G2, layout_key=network_type)
+    # Shared layout positions (reuses same cache as Network view for this network_type)
+    pos = _compute_layout(G2, layout_key=network_type, network_type=network_type)
 
     node_strs = [str(n) for n in G2.nodes()]
     weights   = [G2.nodes[n].get(weight_attr, 1) for n in G2.nodes()]
@@ -905,8 +919,8 @@ def render_density_visualization(
         st.warning("All nodes filtered out.")
         return
 
-    # Shared layout
-    pos = _compute_layout(G2, layout_key=network_type)
+    # Shared layout (reuses same cache as Network view for this network_type)
+    pos = _compute_layout(G2, layout_key=network_type, network_type=network_type)
 
     node_strs = [str(n) for n in G2.nodes()]
     weights   = np.array([G2.nodes[n].get(weight_attr, 1) for n in G2.nodes()], dtype=float)

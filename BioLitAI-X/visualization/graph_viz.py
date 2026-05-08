@@ -12,12 +12,13 @@ import json
 import logging
 import os
 import tempfile
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 import streamlit as st
 
 import config
+from visualization.layout_engine import compute_vos_layout
 
 logger = logging.getLogger(__name__)
 
@@ -87,22 +88,8 @@ def _color_opacity(hex_color: str, opacity: float) -> str:
 _MAX_KG_NODES = 150   # cap entity KG nodes sent to vis.js
 _MAX_KG_EDGES = 500   # cap entity KG edges sent to vis.js
 
-_KG_PHYSICS = {
-    "barnesHut": {
-        "gravitationalConstant": -8000,
-        "centralGravity": 0.3,
-        "springLength": 150,
-        "springConstant": 0.04,
-        "damping": 0.09,
-        "avoidOverlap": 0.5,
-    },
-    "minVelocity": 0.75,
-    "stabilization": {
-        "enabled": True,
-        "iterations": 200,   # was 1000 — 200 is enough and 5x faster
-        "updateInterval": 25,
-    },
-}
+# Scale factor applied to normalised [-1,1] positions when injecting into PyVis
+_KG_LAYOUT_SCALE = 2000
 
 
 def _get_pyvis_net(height: str = "800px"):
@@ -116,7 +103,8 @@ def _get_pyvis_net(height: str = "800px"):
         notebook=False,
     )
     net.set_options(json.dumps({
-        "physics": _KG_PHYSICS,
+        # Physics fully disabled — positions are pre-computed by UMAP + ForceAtlas2
+        "physics": {"enabled": False},
         "nodes": {
             "font": {"face": "Open Sans", "color": config.TEXT_PRIMARY},
             "borderWidth": 1.5,
@@ -131,11 +119,42 @@ def _get_pyvis_net(height: str = "800px"):
             "tooltipDelay": 80,
             "navigationButtons": True,
             "keyboard": True,
-            "multiselect": True,
+            "zoomView": True,
+            "dragView": True,
+            "dragNodes": False,
+            "multiselect": False,
             "selectConnectedEdges": True,
         },
     }))
     return net
+
+
+def _compute_kg_layout(G_sub: nx.MultiDiGraph) -> Dict[str, Tuple[float, float]]:
+    """
+    Compute and cache UMAP + ForceAtlas2 layout for the knowledge graph subgraph.
+    Positions returned in ~[-1, 1] range.
+    """
+    n = G_sub.number_of_nodes()
+    ss_key = f"__kgpos_{n}_{G_sub.number_of_edges()}"
+    cached = st.session_state.get(ss_key)
+    if cached is not None:
+        return cached
+
+    papers_df     = st.session_state.get("papers_df")
+    embeddings    = st.session_state.get("embeddings_array")
+    entities_df   = st.session_state.get("entities_df")
+    query         = st.session_state.get("current_query", "")
+
+    pos = compute_vos_layout(
+        G_sub,
+        network_type="kg",
+        papers_df=papers_df,
+        embeddings_array=embeddings,
+        entities_df=entities_df,
+        query=query,
+    )
+    st.session_state[ss_key] = pos
+    return pos
 
 
 def _render_html(net, height: int, extra_css: str = "", cache_key: str = ""):
@@ -235,7 +254,10 @@ def render_knowledge_graph(
     net = _get_pyvis_net(height=f"{height}px")
     search_lower = search_term.lower().strip()
 
-    # ── Add nodes ─────────────────────────────────────────────────────────────
+    # ── Pre-compute UMAP + ForceAtlas2 layout ─────────────────────────────────
+    positions = _compute_kg_layout(G_sub)
+
+    # ── Add nodes with pre-computed positions (physics=False per node) ────────
     counts = [d.get("paper_count", 1) for _, d in G_sub.nodes(data=True)]
     median_count = sorted(counts)[len(counts) // 2] if counts else 1
 
@@ -287,10 +309,14 @@ def render_knowledge_graph(
             f"Outgoing relationships:<br>{edge_summary or '(none)'}"
         )
 
+        px, py = positions.get(node_str, (0.0, 0.0))
         net.add_node(
             node_str,
             label=display_label,
             size=size,
+            x=px * _KG_LAYOUT_SCALE,
+            y=py * _KG_LAYOUT_SCALE,
+            physics=False,
             color={
                 "background": final_color,
                 "border": border_color,
