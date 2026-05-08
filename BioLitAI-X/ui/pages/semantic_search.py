@@ -1,8 +1,62 @@
 """Semantic similarity search page."""
 
+import logging
+
 import streamlit as st
 import config
 from ui.components.cards import empty_state, paper_card
+
+logger = logging.getLogger(__name__)
+
+
+def _build_embeddings_lazy(papers_df):
+    """Build and cache embeddings on first visit; updates session state."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    from pipeline.embedder import EmbeddingEngine
+    from utils.helpers import query_hash
+    query = st.session_state.get("current_query", "")
+    low_disk = st.session_state.get("_low_disk", False)
+    with st.spinner(f"Building semantic embeddings for {len(papers_df):,} papers…"):
+        try:
+            emb = EmbeddingEngine(persist_index=not low_disk)
+            emb.setup()
+            if emb.index_exists(query):
+                emb.load_index(query)
+                arr = emb.load_embeddings(query)
+                if arr is None:
+                    arr = emb.embed_corpus(papers_df, query=query)
+            else:
+                arr = emb.embed_corpus(papers_df, query=query)
+            st.session_state["embedder"] = emb
+            st.session_state["embeddings_array"] = arr
+            st.session_state["embeddings_ready"] = True
+            # Patch derived cache with embeddings so FAST PATH gets them next time
+            _patch_derived_cache(query, embedder=emb, embeddings_array=arr)
+            st.success(f"Embeddings ready: {len(arr):,} vectors.")
+        except Exception as exc:
+            logger.error("Lazy embedding build failed: %s", exc)
+            st.error(f"Embedding failed: {exc}")
+
+
+def _patch_derived_cache(query: str, **kwargs):
+    """Merge new keys into the existing derived pickle without rewriting everything."""
+    import pickle
+    from pathlib import Path
+    import config as _cfg
+    from utils.helpers import query_hash as _qh
+    qh = _qh(query) if query else "default"
+    derived_cache = Path(_cfg.PROCESSED_DIR) / f"{qh}_derived.pkl"
+    if not derived_cache.exists():
+        return
+    try:
+        with open(derived_cache, "rb") as _f:
+            _d = pickle.load(_f)
+        _d.update(kwargs)
+        with open(derived_cache, "wb") as _f:
+            pickle.dump(_d, _f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:
+        logger.warning("_patch_derived_cache failed: %s", exc)
 
 
 def render():
@@ -20,6 +74,19 @@ def render():
         f"Search within the currently loaded paper set using meaning, not just keywords.</p>",
         unsafe_allow_html=True,
     )
+
+    # ── Embeddings are built in the main pipeline. Recovery button if they failed.
+    if embedder is None and papers_df is not None and not papers_df.empty:
+        st.warning(
+            "Semantic embeddings are not ready (they may have failed during pipeline, "
+            "e.g. model download required on first run). Click below to build them now."
+        )
+        if st.button("Build Embeddings", type="primary", key="build_emb_btn"):
+            _build_embeddings_lazy(papers_df)
+            st.rerun()
+        return
+
+    embedder = st.session_state.get("embedder")
 
     # ── Search controls ───────────────────────────────────────────────────────
     search_q = st.text_input(
@@ -39,7 +106,7 @@ def render():
         )
     with c2:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        run = st.button("Search", type="primary", use_container_width=True, key="sem_run")
+        run = st.button("Search", type="primary", width="stretch", key="sem_run")
 
     st.markdown(
         f"<hr style='border-color:{config.BORDER_COLOR};margin:1rem 0'>",
@@ -67,7 +134,7 @@ def render():
                 if st.button(
                     f"💬 {s}",
                     key=f"sug_{i}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     st.session_state["sem_prefill"] = s
                     st.rerun()

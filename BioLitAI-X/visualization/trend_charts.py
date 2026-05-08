@@ -171,6 +171,13 @@ def render_topic_evolution(topics_over_time_df: pd.DataFrame) -> go.Figure:
         words = topic_df["Words"].iloc[0] if "Words" in topic_df.columns and len(topic_df) else f"Topic {topic_id}"
         label = str(words)[:30]
         color = palette[i % len(palette)]
+        if color.startswith("#") and len(color) == 7:
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
+            fill_color = f"rgba({r},{g},{b},0.6)"
+        else:
+            fill_color = color
 
         fig.add_trace(go.Scatter(
             x=topic_df["Timestamp"],
@@ -179,7 +186,7 @@ def render_topic_evolution(topics_over_time_df: pd.DataFrame) -> go.Figure:
             mode="lines",
             stackgroup="one",
             line=dict(color=color, width=1),
-            fillcolor=color.replace("#", "rgba(") + ",0.6)" if color.startswith("#") else color,
+            fillcolor=fill_color,
             hovertemplate=f"<b>{label}</b><br>Year: %{{x}}<br>Freq: %{{y:.2f}}<extra></extra>",
         ))
 

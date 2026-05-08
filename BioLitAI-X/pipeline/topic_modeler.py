@@ -31,28 +31,72 @@ class TopicModeler:
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
-    def setup(self):
+    def setup(self, n_papers: int = 1000):
         """
-        Initialise BERTopic with the biomedical embedding model,
-        auto topic count, and minimum topic size from config.
+        Initialise BERTopic with UMAP/HDBSCAN parameters scaled to *n_papers*.
+        embedding_model=None because pre-computed embeddings are passed in
+        fit_transform(); this avoids a second full-corpus encoding pass.
+        calculate_probabilities=False cuts memory and time significantly.
         """
+        import warnings
+        # Suppress transformers internal path access noise
+        warnings.filterwarnings("ignore", message=".*Accessing.*__path__.*")
+        warnings.filterwarnings("ignore", message=".*image_processing.*")
+
         from bertopic import BERTopic
-        from sentence_transformers import SentenceTransformer
+        from umap import UMAP
+        from hdbscan import HDBSCAN
+        from sklearn.feature_extraction.text import CountVectorizer
 
-        logger.info("Initialising BERTopic (min_topic_size=%d)", config.BERTOPIC_MIN_TOPIC_SIZE)
+        # Scale UMAP/HDBSCAN to dataset size for balanced granularity.
+        # n_neighbors capped at 15: UMAP complexity is O(N * n_neighbors) so
+        # 15 is ~3x faster than 50 with negligible quality loss for NLP tasks.
+        # n_components=3 keeps enough structure for HDBSCAN while being faster.
+        n_neighbors = max(10, min(15, n_papers // 100))
+        min_cluster_size = max(config.BERTOPIC_MIN_TOPIC_SIZE, min(30, n_papers // 100))
+        min_samples = max(5, min_cluster_size // 3)
 
-        embedding_model = SentenceTransformer(config.EMBEDDING_MODEL)
+        logger.info(
+            "Initialising BERTopic (n_papers=%d, n_neighbors=%d, min_cluster_size=%d)",
+            n_papers, n_neighbors, min_cluster_size,
+        )
+
+        umap_model = UMAP(
+            n_components=3,
+            n_neighbors=n_neighbors,
+            min_dist=0.0,
+            metric="cosine",
+            low_memory=True,
+            verbose=False,
+            random_state=42,
+        )
+        hdbscan_model = HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric="euclidean",
+            cluster_selection_method="leaf",
+            prediction_data=True,
+            core_dist_n_jobs=-1,
+        )
+        vectorizer_model = CountVectorizer(
+            stop_words="english",
+            min_df=2,
+            ngram_range=(1, 2),
+        )
 
         self.model = BERTopic(
-            embedding_model=embedding_model,
-            min_topic_size=config.BERTOPIC_MIN_TOPIC_SIZE,
-            nr_topics="auto",
-            verbose=True,
-            calculate_probabilities=True,
+            embedding_model=None,
+            umap_model=umap_model,
+            hdbscan_model=hdbscan_model,
+            vectorizer_model=vectorizer_model,
+            min_topic_size=min_cluster_size,
+            nr_topics=None,
+            verbose=False,
+            calculate_probabilities=False,
         )
 
         self._ready = True
-        logger.info("TopicModeler ready")
+        logger.info("TopicModeler ready (n_papers=%d)", n_papers)
 
     def _check_ready(self):
         if not self._ready or self.model is None:
@@ -69,11 +113,12 @@ class TopicModeler:
         """
         Fit BERTopic on the corpus and return (topic_assignments, probabilities).
 
-        If *embeddings_array* is provided (pre-computed from EmbeddingEngine),
-        BERTopic skips its own embedding step — faster and consistent.
+        Empty abstracts are excluded from BERTopic (which crashes on blank strings)
+        but the returned topic list is padded back to the original length with -1
+        so callers always get one topic ID per input document.
 
-        topic_assignments: list of int topic IDs per document (-1 = outlier)
-        probabilities:     array of shape [n_docs, n_topics]
+        If *embeddings_array* is provided (pre-computed from EmbeddingEngine),
+        only the rows for valid documents are passed, avoiding a full re-encode.
         """
         self._check_ready()
 
@@ -81,34 +126,52 @@ class TopicModeler:
             if progress_callback:
                 progress_callback(done, total, msg)
 
-        valid_abstracts = [a if isinstance(a, str) and a.strip() else "" for a in abstracts_list]
+        n_total = len(abstracts_list)
 
-        if not any(valid_abstracts):
+        # Build valid-document mask
+        valid_indices = [
+            i for i, a in enumerate(abstracts_list)
+            if isinstance(a, str) and a.strip()
+        ]
+
+        if not valid_indices:
             logger.warning("fit_transform: no non-empty abstracts")
-            self._topics = []
+            self._topics = [-1] * n_total
             self._probs = np.array([])
-            return [], np.array([])
+            return self._topics, np.array([])
 
-        _cb(0, len(valid_abstracts), "Fitting topic model on corpus...")
+        valid_docs = [abstracts_list[i] for i in valid_indices]
+        valid_embeddings = (
+            embeddings_array[valid_indices]
+            if embeddings_array is not None and len(embeddings_array) == n_total
+            else None
+        )
+
+        _cb(0, len(valid_docs), "Fitting topic model on corpus...")
 
         try:
-            if embeddings_array is not None and len(embeddings_array) == len(valid_abstracts):
-                topics, probs = self.model.fit_transform(valid_abstracts, embeddings_array)
+            if valid_embeddings is not None:
+                topics_valid, probs = self.model.fit_transform(valid_docs, valid_embeddings)
             else:
-                topics, probs = self.model.fit_transform(valid_abstracts)
+                topics_valid, probs = self.model.fit_transform(valid_docs)
         except Exception as exc:
             logger.error("BERTopic fit_transform failed: %s", exc)
             raise
 
-        self._topics = topics
+        # Reconstruct full-length topic list; empty docs → outlier (-1)
+        full_topics = [-1] * n_total
+        for idx, topic in zip(valid_indices, topics_valid):
+            full_topics[idx] = int(topic)
+
+        self._topics = full_topics
         self._probs = probs if probs is not None else np.array([])
 
         topic_info = self.model.get_topic_info()
         n_topics = len(topic_info[topic_info["Topic"] >= 0])
-        _cb(len(valid_abstracts), len(valid_abstracts), f"Topic modeling complete: {n_topics} topics discovered")
-        logger.info("fit_transform done: %d topics, %d documents", n_topics, len(valid_abstracts))
+        _cb(n_total, n_total, f"Topic modeling complete: {n_topics} topics discovered")
+        logger.info("fit_transform done: %d topics, %d/%d documents used", n_topics, len(valid_docs), n_total)
 
-        return topics, self._probs
+        return full_topics, self._probs
 
     # ── Topic-over-time ───────────────────────────────────────────────────────
 
@@ -124,6 +187,7 @@ class TopicModeler:
         if self._topics is None:
             raise RuntimeError("fit_transform must be called before get_topic_over_time.")
 
+        n_papers = len(papers_df)
         abstracts = papers_df["abstract"].fillna("").tolist()
         timestamps = papers_df["pub_year"].fillna(0).astype(int).tolist()
 
@@ -131,14 +195,35 @@ class TopicModeler:
             logger.warning("get_topic_over_time: no publication years available")
             return pd.DataFrame()
 
+        # BERTopic.topics_over_time requires all three arrays to be the same length.
+        # self._topics is padded to n_papers in fit_transform, so we must pass it
+        # explicitly rather than letting BERTopic use its internal self.topics_
+        # (which has length n_valid_docs, not n_papers).
+        topics = self._topics[:n_papers] if len(self._topics) >= n_papers else self._topics
+        if len(topics) != n_papers:
+            logger.warning(
+                "get_topic_over_time: topics length %d != papers %d, skipping",
+                len(topics), n_papers,
+            )
+            return pd.DataFrame()
+
         try:
             tot_df = self.model.topics_over_time(
                 abstracts,
                 timestamps,
-                global_tuning=True,
-                evolution_tuning=True,
+                topics=topics,
+                global_tuning=False,    # retuning adds 1-2 min; skip for speed
+                evolution_tuning=False,
             )
             return tot_df
+        except TypeError:
+            # Older BERTopic versions don't accept the topics kwarg — fall back
+            try:
+                tot_df = self.model.topics_over_time(abstracts, timestamps)
+                return tot_df
+            except Exception as exc:
+                logger.error("topics_over_time failed: %s", exc)
+                return pd.DataFrame()
         except Exception as exc:
             logger.error("topics_over_time failed: %s", exc)
             return pd.DataFrame()

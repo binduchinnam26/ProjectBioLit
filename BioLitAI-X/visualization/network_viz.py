@@ -39,6 +39,10 @@ _VOS_FONT      = "#1F2937"
 _VOS_HIGHLIGHT = "#FFD700"
 _LAYOUT_SCALE  = 1400.0          # NetworkX [-1,1] → PyVis pixel space
 
+# Hard render caps — beyond these numbers vis.js freezes the browser
+_MAX_RENDER_NODES = 300
+_MAX_RENDER_EDGES = 1500
+
 # VOSviewer v1.6.7+ uses Viridis for both overlay and density
 _OVERLAY_COLORSCALE = "Viridis"  # dark-blue (low/old) → bright-yellow (high/new)
 _DENSITY_COLORSCALE = "Viridis"  # dark-blue (sparse)  → bright-yellow (dense)
@@ -82,7 +86,7 @@ _VOS_PHYSICS_ON = {
         "avoidOverlap": 0.8,
     },
     "minVelocity": 0.5,
-    "stabilization": {"enabled": True, "iterations": 1500, "updateInterval": 50},
+    "stabilization": {"enabled": True, "iterations": 200, "updateInterval": 50},
 }
 
 
@@ -109,11 +113,11 @@ def _compute_layout(G: nx.Graph, layout_key: str = "") -> Dict[str, Tuple[float,
         return {}
 
     try:
-        if n <= 300:
+        if n <= 150:
             pos = nx.kamada_kawai_layout(G, weight="weight")
         else:
             k = 2.5 / math.sqrt(n)
-            pos = nx.spring_layout(G, weight="weight", seed=42, k=k, iterations=100)
+            pos = nx.spring_layout(G, weight="weight", seed=42, k=k, iterations=30)
     except Exception:
         pos = nx.random_layout(G, seed=42)
 
@@ -191,18 +195,25 @@ def _get_vosviewer_net(height: str = "700px", physics: bool = False):
     return net
 
 
-def _render_vosviewer_html(net, height: int):
-    with tempfile.NamedTemporaryFile(
-        suffix=".html", delete=False, mode="w", encoding="utf-8"
-    ) as f:
-        net.save_graph(f.name)
-        path = f.name
+def _render_vosviewer_html(net, height: int, cache_key: str = ""):
+    """Render PyVis HTML, caching the generated string in session_state."""
+    html: Optional[str] = None
+    if cache_key:
+        html = st.session_state.get(f"__html_{cache_key}")
 
-    with open(path, "r", encoding="utf-8") as f:
-        html = f.read()
-    os.unlink(path)
+    if html is None:
+        with tempfile.NamedTemporaryFile(
+            suffix=".html", delete=False, mode="w", encoding="utf-8"
+        ) as f:
+            net.save_graph(f.name)
+            path = f.name
+        with open(path, "r", encoding="utf-8") as f:
+            html = f.read()
+        os.unlink(path)
+        html = html.replace("</head>", _VOS_CSS + "</head>", 1)
+        if cache_key:
+            st.session_state[f"__html_{cache_key}"] = html
 
-    html = html.replace("</head>", _VOS_CSS + "</head>", 1)
     st.components.v1.html(html, height=height + 30, scrolling=False)
 
 
@@ -238,6 +249,25 @@ def _apply_filters(
     ])
     G2.remove_nodes_from(list(nx.isolates(G2)))
     return G2
+
+
+def _trim_for_render(
+    G: nx.Graph, weight_attr: str = "paper_count"
+) -> Tuple[nx.Graph, bool]:
+    """
+    Return a subgraph capped at _MAX_RENDER_NODES (top nodes by weight).
+    Second return value is True if the graph was trimmed.
+    """
+    n = G.number_of_nodes()
+    if n <= _MAX_RENDER_NODES:
+        return G, False
+    top_nodes = sorted(
+        G.nodes(data=True),
+        key=lambda nd: nd[1].get(weight_attr, nd[1].get("frequency", 1)),
+        reverse=True,
+    )[:_MAX_RENDER_NODES]
+    keep = {nd[0] for nd in top_nodes}
+    return G.subgraph(keep).copy(), True
 
 
 # ── Controls panel ────────────────────────────────────────────────────────────
@@ -375,8 +405,14 @@ def _add_keyword_nodes(
         )
 
 
-def _add_edges_to_net(net, G: nx.Graph):
-    for u, v, data in G.edges(data=True):
+def _add_edges_to_net(net, G: nx.Graph) -> int:
+    """Add edges to PyVis network, capped at _MAX_RENDER_EDGES (top by weight)."""
+    all_edges = sorted(
+        G.edges(data=True),
+        key=lambda e: e[2].get("weight", 1),
+        reverse=True,
+    )[:_MAX_RENDER_EDGES]
+    for u, v, data in all_edges:
         weight    = data.get("weight", 1)
         width     = float(data.get("width", config.EDGE_WIDTH_MIN))
         src_color = G.nodes[u].get("color", config.COMMUNITY_COLORS[0])
@@ -390,6 +426,7 @@ def _add_edges_to_net(net, G: nx.Graph):
             title=f"<b>{u}</b> — <b>{v}</b><br>Shared publications: {weight}",
             arrows={"to": {"enabled": False}},
         )
+    return len(all_edges)
 
 
 # ── Overlay helper — average year per node ───────────────────────────────────
@@ -445,12 +482,13 @@ def _overlay_year_per_node(
 # ── Plotly edge + node builders ───────────────────────────────────────────────
 
 def _plotly_edge_trace(G2: nx.Graph, pos: Dict[str, Tuple[float, float]]):
-    """Build a single Plotly Scatter trace for all edges."""
+    """Build a single Plotly Scatter trace for edges (capped at _MAX_RENDER_EDGES)."""
     import plotly.graph_objects as go
 
+    edges = sorted(G2.edges(data=True), key=lambda e: e[2].get("weight", 1), reverse=True)[:_MAX_RENDER_EDGES]
     edge_x: List[float] = []
     edge_y: List[float] = []
-    for u, v in G2.edges():
+    for u, v, _ in edges:
         xu, yu = pos.get(str(u), (0.0, 0.0))
         xv, yv = pos.get(str(v), (0.0, 0.0))
         edge_x += [xu, xv, None]
@@ -473,9 +511,94 @@ def _plotly_layout(height: int) -> "plotly.graph_objects.Layout":
                    scaleanchor="x", scaleratio=1),
         margin=dict(l=10, r=110, t=10, b=10),
         height=height, hovermode="closest",
-        legend=dict(x=0.01, y=0.01, bgcolor="rgba(255,255,255,0.85)",
+        legend=dict(x=1.01, y=1, bgcolor="rgba(255,255,255,0.85)",
                     bordercolor="#E5E7EB", borderwidth=1, font=dict(size=10)),
     )
+
+
+def _render_network_plotly(
+    G: nx.Graph,
+    pos: Dict[str, Tuple[float, float]],
+    weight_attr: str,
+    controls: Dict[str, Any],
+    height: int,
+) -> None:
+    """
+    Render the Network view using Plotly instead of vis.js/PyVis.
+    One Scatter trace per community → cluster legend; edge trace underneath.
+    Plotly renders via Canvas so it never freezes regardless of node/edge count.
+    """
+    import plotly.graph_objects as go
+
+    search_lower = controls.get("search", "").lower().strip()
+    labels_all   = controls.get("labels_all", True)
+
+    # Capped edge trace (top-weight edges only)
+    edge_trace = _plotly_edge_trace(G, pos)
+
+    # Median weight threshold — only nodes above median get a label when labels_all=False
+    all_weights = [d.get(weight_attr, d.get("frequency", 1)) for _, d in G.nodes(data=True)]
+    median_w = sorted(all_weights)[len(all_weights) // 2] if all_weights else 1
+
+    communities = sorted({d.get("community", 0) for _, d in G.nodes(data=True)})
+    node_traces = []
+
+    for cid in communities:
+        comm_nodes = [(n, d) for n, d in G.nodes(data=True) if d.get("community", 0) == cid]
+        if not comm_nodes:
+            continue
+
+        color = config.COMMUNITY_COLORS[cid % len(config.COMMUNITY_COLORS)]
+        xs, ys, labels, sizes, hovers, borders_c, borders_w = [], [], [], [], [], [], []
+
+        for n, d in comm_nodes:
+            ns = str(n)
+            x, y = pos.get(ns, (0.0, 0.0))
+            w    = d.get(weight_attr, d.get("frequency", 1))
+            size = float(d.get("size", config.NODE_SIZE_MIN))
+            is_match = bool(search_lower and search_lower in ns.lower())
+
+            xs.append(x); ys.append(y); sizes.append(size)
+            labels.append(ns[:22] if (labels_all or is_match or w >= median_w) else "")
+            borders_c.append("#FFD700" if is_match else _darken(color, 0.78))
+            borders_w.append(3 if is_match else 1)
+
+            neighbors = sorted(
+                [(str(nb), G[n][nb].get("weight", 1)) for nb in G.neighbors(n)],
+                key=lambda e: e[1], reverse=True,
+            )[:5]
+            nb_html = "<br>".join(f"  • {nb} ({w2})" for nb, w2 in neighbors)
+            hovers.append(
+                f"<b>{ns}</b><br>Papers:&nbsp;{w}<br>Cluster:&nbsp;{cid + 1}"
+                f"<br>Top connections:<br>{nb_html or '—'}"
+            )
+
+        node_traces.append(go.Scatter(
+            x=xs, y=ys,
+            mode="markers+text",
+            marker=dict(
+                size=sizes, color=color, opacity=0.88,
+                line=dict(width=borders_w, color=borders_c),
+            ),
+            text=labels,
+            textposition="bottom center",
+            textfont=dict(size=9, color=_VOS_FONT, family="Open Sans"),
+            hovertext=hovers,
+            hoverinfo="text",
+            name=f"Cluster {cid + 1}",
+        ))
+
+    layout = _plotly_layout(height)
+    layout.update(
+        showlegend=len(communities) <= 20,
+        legend=dict(
+            x=1.01, y=1, bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="#E5E7EB", borderwidth=1,
+            font=dict(size=9), itemsizing="constant",
+        ),
+    )
+    fig = go.Figure(data=[edge_trace] + node_traces, layout=layout)
+    st.plotly_chart(fig, width="stretch")
 
 
 # ── Public render functions ────────────────────────────────────────────────────
@@ -488,8 +611,8 @@ def render_coauthorship_network(
     height: int = 750,
 ):
     """
-    VOSviewer Network Visualization — co-authorship.
-    Positions come from pre-computed kamada-kawai layout (shared with overlay/density).
+    Co-authorship Network view — rendered with Plotly (not vis.js).
+    Plotly uses Canvas rendering so it never freezes the browser.
     """
     if G is None or G.number_of_nodes() == 0:
         st.info("No co-authorship data available. Run the pipeline first.")
@@ -504,18 +627,24 @@ def render_coauthorship_network(
         st.warning("All nodes filtered out — lower the minimum weight thresholds.")
         return
 
+    total_nodes = G2.number_of_nodes()
+    total_edges = G2.number_of_edges()
+    G2, trimmed = _trim_for_render(G2, "paper_count")
+    if trimmed:
+        st.info(
+            f"Showing top {_MAX_RENDER_NODES} authors of {total_nodes:,}. "
+            "Raise Min node weight to focus on more-published authors."
+        )
+
     clusters = len({d.get("community", 0) for _, d in G2.nodes(data=True)})
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Items", G2.number_of_nodes())
-    s2.metric("Links", G2.number_of_edges())
+    s2.metric("Links", f"{min(total_edges, _MAX_RENDER_EDGES):,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
     s3.metric("Clusters", clusters)
     s4.metric("Total link strength", sum(d.get("weight", 1) for _, _, d in G2.edges(data=True)))
 
     pos = _compute_layout(G2, layout_key="coauth")
-    net = _get_vosviewer_net(height=f"{height}px", physics=controls.get("physics", False))
-    _add_coauth_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
-    _add_edges_to_net(net, G2)
-    _render_vosviewer_html(net, height=height)
+    _render_network_plotly(G2, pos, "paper_count", controls, height)
 
 
 def render_keyword_network(
@@ -523,7 +652,10 @@ def render_keyword_network(
     controls: Optional[Dict] = None,
     height: int = 750,
 ):
-    """VOSviewer Network Visualization — keyword co-occurrence."""
+    """
+    Keyword co-occurrence Network view — rendered with Plotly (not vis.js).
+    Plotly uses Canvas rendering so it never freezes the browser.
+    """
     if G is None or G.number_of_nodes() == 0:
         st.info("No keyword co-occurrence data available. Run the pipeline first.")
         return
@@ -537,17 +669,23 @@ def render_keyword_network(
         st.warning("All nodes filtered out — lower the minimum weight thresholds.")
         return
 
+    total_nodes = G2.number_of_nodes()
+    total_edges = G2.number_of_edges()
+    G2, trimmed = _trim_for_render(G2, "frequency")
+    if trimmed:
+        st.info(
+            f"Showing top {_MAX_RENDER_NODES} keywords of {total_nodes:,}. "
+            "Raise Min node weight to narrow the graph."
+        )
+
     clusters = len({d.get("community", 0) for _, d in G2.nodes(data=True)})
     s1, s2, s3 = st.columns(3)
     s1.metric("Keywords", G2.number_of_nodes())
-    s2.metric("Links", G2.number_of_edges())
+    s2.metric("Links", f"{min(total_edges, _MAX_RENDER_EDGES):,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
     s3.metric("Clusters", clusters)
 
     pos = _compute_layout(G2, layout_key="keyword")
-    net = _get_vosviewer_net(height=f"{height}px", physics=controls.get("physics", False))
-    _add_keyword_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
-    _add_edges_to_net(net, G2)
-    _render_vosviewer_html(net, height=height)
+    _render_network_plotly(G2, pos, "frequency", controls, height)
 
 
 def render_topic_network(
@@ -602,7 +740,8 @@ def render_topic_network(
         )
 
     _add_edges_to_net(net, G2)
-    _render_vosviewer_html(net, height=height)
+    html_key = f"topic_{G2.number_of_nodes()}_{G2.number_of_edges()}_{controls.get('search','')}_{controls.get('physics')}"
+    _render_vosviewer_html(net, height=height, cache_key=html_key)
 
 
 # B — Overlay Visualization ───────────────────────────────────────────────────
@@ -716,7 +855,7 @@ def render_overlay_visualization(
         data=[edge_trace, gray_trace, color_trace],
         layout=_plotly_layout(height),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.markdown(
         "<div style='font-size:11px;color:#6B7280;text-align:center;margin-top:-8px'>"
@@ -855,7 +994,7 @@ def render_density_visualization(
     layout.yaxis.update(range=[y_min, y_max])
 
     fig = go.Figure(data=[heatmap, node_overlay], layout=layout)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.markdown(
         "<div style='font-size:11px;color:#6B7280;text-align:center;margin-top:-8px'>"

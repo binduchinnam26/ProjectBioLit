@@ -68,7 +68,7 @@ class NetworkBuilder:
         author_papers: Dict[str, int] = defaultdict(int)
         pair_counts: Dict[Tuple[str, str], int] = defaultdict(int)
 
-        for _, row in papers_df.iterrows():
+        for row in papers_df.to_dict("records"):
             authors = row.get("authors", [])
             if not isinstance(authors, list):
                 continue
@@ -78,6 +78,8 @@ class NetworkBuilder:
                 if a
             ]
             names = [n for n in names if n]
+            # Cap authors per paper to avoid O(n²) explosion on papers with 50+ authors
+            names = names[:20]
             for name in names:
                 author_papers[name] += 1
             for a, b in combinations(sorted(set(names)), 2):
@@ -94,13 +96,12 @@ class NetworkBuilder:
         if G.number_of_nodes() == 0:
             return G
 
-        # Centrality metrics
+        # Degree centrality only — betweenness is O(n²k) and takes 2-5 min on
+        # large co-authorship graphs; it is not shown in any display element.
         try:
             deg_cent = nx.degree_centrality(G)
-            bet_cent = nx.betweenness_centrality(G, normalized=True)
-            clu_coef = nx.clustering(G, weight="weight")
         except Exception:
-            deg_cent = bet_cent = clu_coef = {n: 0.0 for n in G.nodes()}
+            deg_cent = {n: 0.0 for n in G.nodes()}
 
         # Community detection
         partition = _louvain_communities(G)
@@ -116,8 +117,6 @@ class NetworkBuilder:
             G.nodes[node].update(
                 {
                     "degree_centrality": deg_cent.get(node, 0.0),
-                    "betweenness_centrality": bet_cent.get(node, 0.0),
-                    "clustering_coefficient": clu_coef.get(node, 0.0),
                     "community": comm,
                     "color": color_palette[comm % len(color_palette)],
                     "size": _scale_node_size(pc, w_min, w_max),
@@ -152,7 +151,7 @@ class NetworkBuilder:
         kw_type: Dict[str, str] = {}
         paper_kws: List[List[str]] = []
 
-        for _, row in papers_df.iterrows():
+        for row in papers_df.to_dict("records"):
             kws_this_paper: List[str] = []
 
             # Author keywords
@@ -431,7 +430,8 @@ class NetworkBuilder:
             if descriptors:
                 pmid_mesh[pmid] = descriptors
 
-        pmids = list(pmid_mesh.keys())
+        # Cap to 500 papers for the O(n²) loop — beyond that it becomes too slow
+        pmids = list(pmid_mesh.keys())[:500]
         for i in range(len(pmids)):
             for j in range(i + 1, len(pmids)):
                 shared = len(pmid_mesh[pmids[i]] & pmid_mesh[pmids[j]])
@@ -439,6 +439,32 @@ class NetworkBuilder:
                     G.add_edge(pmids[i], pmids[j], weight=shared)
 
         return G
+
+    # ── Display thinning ──────────────────────────────────────────────────────
+
+    def prepare_graph_for_display(
+        self, full_graph: nx.Graph, max_display_nodes: int = None
+    ) -> nx.Graph:
+        """
+        Return a subgraph suitable for interactive browser rendering.
+
+        Keeps only the top-N most-connected nodes. Default cap comes from
+        config.GRAPH_MAX_DISPLAY_NODES (500) which is safe for browser canvas.
+        The full graph is unchanged and still available for analysis.
+        """
+        if max_display_nodes is None:
+            max_display_nodes = config.GRAPH_MAX_DISPLAY_NODES
+
+        if full_graph.number_of_nodes() <= max_display_nodes:
+            return full_graph
+        # Use raw degree (fast, O(n)) instead of degree_centrality (same ranking for subgraph)
+        top_nodes = sorted(full_graph.nodes(), key=lambda n: full_graph.degree(n), reverse=True)[:max_display_nodes]
+        sub = full_graph.subgraph(top_nodes).copy()
+        logger.info(
+            "prepare_graph_for_display: thinned %d → %d nodes for rendering",
+            full_graph.number_of_nodes(), sub.number_of_nodes(),
+        )
+        return sub
 
     # ── Network statistics ────────────────────────────────────────────────────
 
@@ -458,20 +484,31 @@ class NetworkBuilder:
             density = 0.0
 
         try:
-            avg_clustering = nx.average_clustering(undirected, weight="weight")
+            # For large graphs, sample 500 nodes to estimate clustering quickly
+            n = undirected.number_of_nodes()
+            if n > 500:
+                import random
+                sample = random.sample(list(undirected.nodes()), 500)
+                avg_clustering = nx.average_clustering(
+                    undirected, nodes=sample, weight="weight"
+                )
+            else:
+                avg_clustering = nx.average_clustering(undirected, weight="weight")
         except Exception:
             avg_clustering = 0.0
 
-        # Centrality (on largest connected component to avoid failures)
+        # Degree centrality on largest connected component only.
+        # Betweenness (O(n²k)) and closeness (O(n²)) are skipped — they take
+        # 2-10 min on graphs with thousands of authors and are not displayed.
         try:
             lcc = undirected.subgraph(
                 max(nx.connected_components(undirected), key=len)
             ).copy()
             deg_cent = nx.degree_centrality(lcc)
-            bet_cent = nx.betweenness_centrality(lcc, normalized=True)
-            clo_cent = nx.closeness_centrality(lcc)
         except Exception:
-            deg_cent = bet_cent = clo_cent = {}
+            deg_cent = {}
+        bet_cent: dict = {}
+        clo_cent: dict = {}
 
         def top10(cent_dict):
             return sorted(cent_dict.items(), key=lambda x: x[1], reverse=True)[:10]

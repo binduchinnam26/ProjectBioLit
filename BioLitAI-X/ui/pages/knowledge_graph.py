@@ -10,9 +10,114 @@ Three visualization modes (matching VOSviewer):
 Four network types: Co-authorship · Keyword Co-occurrence · Topic · Entity KG.
 """
 
+import logging
+import pickle
+
 import streamlit as st
 import config
 from ui.components.cards import empty_state
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_entities_lazy(papers_df):
+    """
+    Run NER-only entity extraction on demand (first visit to Entity KG tab).
+    Dep parser is disabled for speed. Updates session_state and patches cache.
+    """
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    from pipeline.nlp_processor import NLPProcessor
+    from pipeline.knowledge_graph import KnowledgeGraph
+    from pathlib import Path
+    from utils.helpers import query_hash
+    import pandas as pd
+
+    query = st.session_state.get("current_query", "")
+
+    with st.spinner(
+        f"Extracting entities from {len(papers_df):,} papers "
+        f"(NER-only — typically 30-90 sec)…"
+    ):
+        try:
+            nlp_p = NLPProcessor(db_manager=None)
+            nlp_p.setup()
+            entities_df, _ = nlp_p.process_corpus(papers_df)
+
+            # Build initial KG from entities only (no relationships yet)
+            kg = KnowledgeGraph()
+            kg_graph = kg.build_from_entities(entities_df, pd.DataFrame())
+
+            st.session_state["entities_df"] = entities_df
+            st.session_state["kg_graph"] = kg_graph
+            st.session_state["knowledge_graph"] = kg
+
+            # Patch derived cache
+            qh = query_hash(query) if query else "default"
+            derived_cache = Path(config.PROCESSED_DIR) / f"{qh}_derived.pkl"
+            if derived_cache.exists():
+                with open(derived_cache, "rb") as _f:
+                    _d = pickle.load(_f)
+                _d.update({"entities_df": entities_df, "kg_graph": kg_graph})
+                with open(derived_cache, "wb") as _f:
+                    pickle.dump(_d, _f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            st.success(
+                f"Entity extraction complete: {len(entities_df):,} entities from "
+                f"{len(papers_df):,} papers."
+            )
+        except Exception as exc:
+            logger.error("Lazy entity extraction failed: %s", exc)
+            st.error(f"Entity extraction failed: {exc}")
+
+
+def _extract_relationships_lazy(papers_df, entities_df):
+    """
+    Run dep-parse relationship extraction on demand (first visit to Entity KG tab).
+    Updates session_state and patches the derived cache.
+    """
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    from pipeline.nlp_processor import NLPProcessor
+    from pipeline.knowledge_graph import KnowledgeGraph
+    from pathlib import Path
+    from utils.helpers import query_hash
+
+    query = st.session_state.get("current_query", "")
+
+    with st.spinner(
+        f"Extracting relationships from {len(papers_df):,} papers "
+        f"(dep parser — may take 3-6 min)…"
+    ):
+        try:
+            nlp_p = NLPProcessor(db_manager=None)
+            nlp_p.setup()
+            rels_df = nlp_p.extract_relationships_corpus(papers_df, entities_df)
+
+            # Rebuild KG with relationships
+            kg = KnowledgeGraph()
+            kg_graph = kg.build_from_entities(entities_df, rels_df)
+
+            st.session_state["relationships_df"] = rels_df
+            st.session_state["kg_graph"] = kg_graph
+            st.session_state["knowledge_graph"] = kg
+
+            # Patch derived cache
+            qh = query_hash(query) if query else "default"
+            derived_cache = Path(config.PROCESSED_DIR) / f"{qh}_derived.pkl"
+            if derived_cache.exists():
+                with open(derived_cache, "rb") as _f:
+                    _d = pickle.load(_f)
+                _d.update({"relationships_df": rels_df, "kg_graph": kg_graph})
+                with open(derived_cache, "wb") as _f:
+                    pickle.dump(_d, _f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            st.success(
+                f"Relationships extracted: {len(rels_df):,} edges added to knowledge graph."
+            )
+        except Exception as exc:
+            logger.error("Lazy relationship extraction failed: %s", exc)
+            st.error(f"Relationship extraction failed: {exc}")
 
 
 # ── Mode selector widget ──────────────────────────────────────────────────────
@@ -107,12 +212,16 @@ def render():
     query         = st.session_state.get("current_query", "")
 
     # ── Page header ───────────────────────────────────────────────────────────
+    n_papers = len(papers_df) if papers_df is not None else 0
+    coauth_n = coauth_graph.number_of_nodes() if coauth_graph else 0
+    kw_n = keyword_graph.number_of_nodes() if keyword_graph else 0
     st.markdown(
         f"<h2 style='margin-bottom:2px'>Bibliometric Network Explorer</h2>"
         f"<p style='color:{config.TEXT_SECONDARY};font-size:13px;margin-bottom:0.8rem'>"
         f"Query: <b>{query}</b> &nbsp;·&nbsp; "
-        f"Three visualization modes — Network / Overlay / Density — "
-        f"matching VOSviewer 1.6.x</p>",
+        f"{n_papers:,} papers &nbsp;·&nbsp; "
+        f"{coauth_n:,} authors &nbsp;·&nbsp; {kw_n:,} keywords &nbsp;·&nbsp; "
+        f"Network / Overlay / Density views</p>",
         unsafe_allow_html=True,
     )
 
@@ -194,18 +303,19 @@ def render():
             )
             import networkx as nx
 
-            # Keyword type filter (only relevant for network view, applied before all modes)
+            # Keyword type filter
             kw_types = sorted({d.get("keyword_type", "author")
                                for _, d in keyword_graph.nodes(data=True)})
             selected_types = st.multiselect(
                 "Keyword types", options=kw_types, default=kw_types, key="kg_kw_types",
             )
-            kw_g = keyword_graph.copy()
-            if selected_types:
-                kw_g.remove_nodes_from([
-                    n for n, d in kw_g.nodes(data=True)
-                    if d.get("keyword_type") not in selected_types
-                ])
+            # Filter nodes by type — work on a view (subgraph) not a full copy
+            if selected_types and len(selected_types) < len(kw_types):
+                keep = [n for n, d in keyword_graph.nodes(data=True)
+                        if d.get("keyword_type") in selected_types]
+                kw_g = keyword_graph.subgraph(keep)
+            else:
+                kw_g = keyword_graph
 
             st.markdown(
                 "<div style='font-size:12px;color:#6B7280;margin-bottom:4px'>"
@@ -305,11 +415,40 @@ def render():
     # TAB 4 — Entity Knowledge Graph (NLP-derived)
     # ══════════════════════════════════════════════════════════════════════════
     with tab_entity:
-        if kg_graph is None or kg_graph.number_of_nodes() == 0:
-            st.info(
-                "Entity knowledge graph is empty. "
-                "NLP processing must complete successfully to extract entities."
+        papers_df_local   = st.session_state.get("papers_df")
+        entities_df_local = st.session_state.get("entities_df")
+        _has_entities = (
+            entities_df_local is not None and not entities_df_local.empty
+        )
+        _has_rels = rels_df is not None and not rels_df.empty
+
+        # Entities are extracted in the main pipeline (NLP runs in parallel with
+        # embeddings). Show recovery button only if NLP failed for some reason.
+        if not _has_entities and papers_df_local is not None and not papers_df_local.empty:
+            st.warning(
+                "Entity extraction did not complete during the main pipeline "
+                "(this can happen if the spaCy model is not installed). "
+                "Click below to re-run it now (~30-90 sec)."
             )
+            if st.button("Extract Entities", type="primary", key="extract_ents_btn"):
+                _extract_entities_lazy(papers_df_local)
+                st.rerun()
+
+        # Relationship dep-parse is deferred (2-5 min); offer it on demand.
+        elif _has_entities and not _has_rels:
+            st.info(
+                "Relationship edges (dependency-parse) not yet extracted — optional, ~2-5 min. "
+                "The entity graph above is fully interactive without them."
+            )
+            if st.button("Extract Relationships", type="primary", key="extract_rels_btn"):
+                _extract_relationships_lazy(papers_df_local, entities_df_local)
+                st.rerun()
+
+        if kg_graph is None or kg_graph.number_of_nodes() == 0:
+            if not _has_entities:
+                pass  # recovery button already shown above
+            else:
+                st.info("Entity knowledge graph is empty — no entities were found for this corpus.")
         else:
             from visualization.graph_viz import (
                 render_knowledge_graph,
@@ -318,13 +457,21 @@ def render():
             )
             from pipeline.gap_detector import GapDetector
 
+            kg_nodes = kg_graph.number_of_nodes() if kg_graph else 0
+            kg_edges = kg_graph.number_of_edges() if kg_graph else 0
             st.markdown(
-                "<p style='font-size:13px;color:#6B7280;margin-bottom:6px'>"
-                "Node&nbsp;size&nbsp;=&nbsp;evidence strength &nbsp;·&nbsp; "
-                "Color&nbsp;=&nbsp;entity type &nbsp;·&nbsp; "
-                "Arrows&nbsp;=&nbsp;relationship direction</p>",
+                f"<p style='font-size:13px;color:#6B7280;margin-bottom:6px'>"
+                f"Node&nbsp;size&nbsp;=&nbsp;evidence strength &nbsp;·&nbsp; "
+                f"Color&nbsp;=&nbsp;entity type &nbsp;·&nbsp; "
+                f"Arrows&nbsp;=&nbsp;relationship direction &nbsp;·&nbsp; "
+                f"{kg_nodes:,} nodes, {kg_edges:,} edges</p>",
                 unsafe_allow_html=True,
             )
+            if kg_nodes > config.GRAPH_MAX_DISPLAY_NODES:
+                st.info(
+                    f"Entity graph has {kg_nodes:,} nodes. "
+                    f"Use the filters on the left to focus on specific entity types or relationships."
+                )
 
             ctrl_col, graph_col = st.columns([1, 4])
 

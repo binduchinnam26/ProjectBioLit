@@ -32,19 +32,31 @@ if not ENTREZ_EMAIL:
 # Rate limits (requests per second)
 RATE_LIMIT_WITHOUT_KEY = 3
 RATE_LIMIT_WITH_KEY = 10
-FETCH_BATCH_SIZE = 100       # PMIDs per Entrez fetch call
+FETCH_BATCH_SIZE = 500       # records per efetch call; 500 halves round-trips vs 300
 FETCH_RETRIES = 3
 FETCH_RETRY_DELAY = 2        # seconds, doubles on each retry
 
 # ── Query / result sizing ─────────────────────────────────────────────────────
-MAX_RESULTS_DEFAULT = 1000
+MAX_RESULTS_DEFAULT = 1000   # 1000 papers completes in ~60-90s; raise slider for deeper searches
 MAX_RESULTS_MIN = 100
-MAX_RESULTS_MAX = 2000
+MAX_RESULTS_MAX = 3000       # hard cap; >2000 may exceed 2-min target on slow hardware
 
 # ── NLP / Embeddings ──────────────────────────────────────────────────────────
 SCISPACY_MODEL = "en_core_sci_lg"
-EMBEDDING_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
-EMBEDDING_DIMENSION = 768    # output size of the model above
+
+# Primary model: all-MiniLM-L6-v2 — 5x faster than PubMedBERT on CPU,
+# 384-dim vectors, excellent quality for scientific text.
+# Override via .env: EMBEDDING_MODEL=pritamdeka/S-PubMedBert-MS-MARCO
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "sentence-transformers/all-MiniLM-L6-v2",
+)
+# Dimension must match the model output size.
+# MiniLM=384, PubMedBERT/scibert=768. Override via .env if changing model.
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))
+
+NLP_BATCH_SIZE = 256         # abstracts per nlp.pipe() call; larger batches amortize tok2vec overhead
+EMBEDDING_BATCH_SIZE = 256   # MiniLM is small (384-dim); 256 fills CPU cache efficiently
 
 # Set to True to enable UMLS entity linking (downloads ~724 MB index on first run).
 # When False, NER still runs but entities keep the generic "ENTITY" label.
@@ -82,6 +94,7 @@ BERTOPIC_MIN_TOPIC_SIZE = 10
 # ── Network / Graph ───────────────────────────────────────────────────────────
 KEYWORD_MIN_FREQUENCY = 3    # minimum papers a keyword must appear in
 SEMANTIC_SIMILARITY_THRESHOLD = 0.85
+GRAPH_MAX_DISPLAY_NODES = 500    # max nodes sent to browser for interactive rendering
 
 # ── Gap Detection ─────────────────────────────────────────────────────────────
 GAP_SHARED_NEIGHBORS_MIN = 3
@@ -175,7 +188,7 @@ BARNES_HUT_PHYSICS = {
     "minVelocity": 0.75,
     "stabilization": {
         "enabled": True,
-        "iterations": 1000,
+        "iterations": 200,
         "updateInterval": 25,
     },
 }

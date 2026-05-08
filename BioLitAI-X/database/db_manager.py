@@ -27,10 +27,20 @@ class DatabaseManager:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # timeout=30: wait up to 30 s for the lock instead of the default 5 s.
+        # On Windows with WAL mode, Streamlit reruns can leave a connection
+        # holding the lock for a few seconds; 30 s gives ample headroom.
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=100000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA mmap_size=268435456")
         conn.execute("PRAGMA foreign_keys=ON")
+        # busy_timeout (ms) is a belt-and-suspenders duplicate of the Python
+        # timeout above; it also covers lock waits inside multi-statement scripts.
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     @contextmanager
@@ -151,6 +161,197 @@ class DatabaseManager:
             logger.error("get_all_papers failed: %s", exc)
             return []
 
+    def insert_paper_metadata_batch(self, papers_records: List[Dict[str, Any]]):
+        """
+        Insert all relational metadata (authors, keywords, MeSH terms, chemicals,
+        publication types) for a list of papers in a SINGLE SQLite transaction.
+
+        For 10k papers this replaces ~200k individual transactions with ~10
+        executemany calls, reducing wall time from minutes to seconds.
+        Authors and keywords in papers_records are assumed already normalised by
+        DataCleaner.run_full_pipeline().
+        """
+        if not papers_records:
+            return
+
+        # ── Collect unique entities and links across all papers ───────────────
+        unique_authors: Dict[tuple, None] = {}
+        author_links: List[tuple] = []
+
+        unique_keywords: Dict[tuple, None] = {}
+        keyword_links: List[tuple] = []
+
+        unique_mesh: Dict[tuple, None] = {}
+        mesh_links: List[tuple] = []
+
+        unique_chemicals: Dict[tuple, None] = {}
+        chemical_links: List[tuple] = []
+
+        unique_pub_types: Dict[str, None] = {}
+        pub_type_links: List[tuple] = []
+
+        for paper in papers_records:
+            pmid = paper.get("pmid")
+            if not pmid:
+                continue
+
+            for auth in (paper.get("authors") or []):
+                if isinstance(auth, dict) and auth.get("name"):
+                    name = auth["name"]
+                    aff = auth.get("affiliation") or ""
+                    unique_authors[(name, name, aff)] = None
+                    author_links.append((pmid, name, aff))
+
+            for kw in (paper.get("author_keywords") or []):
+                if kw:
+                    unique_keywords[(kw, kw, "author")] = None
+                    keyword_links.append((pmid, kw))
+
+            for mesh in (paper.get("mesh_terms") or []):
+                if isinstance(mesh, dict) and mesh.get("descriptor"):
+                    desc = mesh["descriptor"]
+                    qual = mesh.get("qualifier")
+                    is_major = int(bool(mesh.get("is_major_topic")))
+                    unique_mesh[(desc, qual, is_major)] = None
+                    mesh_links.append((pmid, desc, qual, is_major))
+
+            for chem in (paper.get("chemicals") or []):
+                if isinstance(chem, dict) and chem.get("name"):
+                    name = chem["name"]
+                    reg = chem.get("registry_number")
+                    unique_chemicals[(name, reg)] = None
+                    chemical_links.append((pmid, name))
+
+            for pt in (paper.get("publication_types") or []):
+                if pt:
+                    unique_pub_types[pt] = None
+                    pub_type_links.append((pmid, pt))
+
+        try:
+            with self._lock, self._conn() as conn:
+                # ── Authors ───────────────────────────────────────────────────
+                if unique_authors:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO authors (name, normalized_name, affiliation) VALUES (?, ?, ?)",
+                        list(unique_authors.keys()),
+                    )
+                if author_links:
+                    needed = {(n, a) for _, n, a in author_links}
+                    author_id_map = {
+                        (r["name"], r["affiliation"] or ""): r["id"]
+                        for r in conn.execute(
+                            "SELECT id, name, affiliation FROM authors"
+                        ).fetchall()
+                        if (r["name"], r["affiliation"] or "") in needed
+                    }
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO paper_authors (paper_pmid, author_id, author_order) VALUES (?, ?, ?)",
+                        [
+                            (pmid, author_id_map[(name, aff)], 0)
+                            for pmid, name, aff in author_links
+                            if (name, aff) in author_id_map
+                        ],
+                    )
+
+                # ── Keywords ──────────────────────────────────────────────────
+                if unique_keywords:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO keywords (keyword, normalized_keyword, keyword_type) VALUES (?, ?, ?)",
+                        list(unique_keywords.keys()),
+                    )
+                if keyword_links:
+                    kw_id_map = {
+                        (r["keyword"], r["keyword_type"]): r["id"]
+                        for r in conn.execute(
+                            "SELECT id, keyword, keyword_type FROM keywords"
+                        ).fetchall()
+                    }
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO paper_keywords (paper_pmid, keyword_id) VALUES (?, ?)",
+                        [
+                            (pmid, kw_id_map[(kw, "author")])
+                            for pmid, kw in keyword_links
+                            if (kw, "author") in kw_id_map
+                        ],
+                    )
+
+                # ── MeSH terms ────────────────────────────────────────────────
+                if unique_mesh:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO mesh_terms (descriptor, qualifier, is_major_topic) VALUES (?, ?, ?)",
+                        list(unique_mesh.keys()),
+                    )
+                if mesh_links:
+                    mesh_id_map = {
+                        (r["descriptor"], r["qualifier"], r["is_major_topic"]): r["id"]
+                        for r in conn.execute(
+                            "SELECT id, descriptor, qualifier, is_major_topic FROM mesh_terms"
+                        ).fetchall()
+                    }
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO paper_mesh (paper_pmid, mesh_term_id) VALUES (?, ?)",
+                        [
+                            (pmid, mesh_id_map.get((desc, qual, is_major)))
+                            for pmid, desc, qual, is_major in mesh_links
+                            if mesh_id_map.get((desc, qual, is_major))
+                        ],
+                    )
+
+                # ── Chemicals ─────────────────────────────────────────────────
+                if unique_chemicals:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO chemical_terms (name, registry_number) VALUES (?, ?)",
+                        list(unique_chemicals.keys()),
+                    )
+                if chemical_links:
+                    chem_id_map = {
+                        r["name"]: r["id"]
+                        for r in conn.execute(
+                            "SELECT id, name FROM chemical_terms"
+                        ).fetchall()
+                    }
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO paper_chemicals (paper_pmid, chemical_term_id) VALUES (?, ?)",
+                        [
+                            (pmid, chem_id_map[name])
+                            for pmid, name in chemical_links
+                            if name in chem_id_map
+                        ],
+                    )
+
+                # ── Publication types ─────────────────────────────────────────
+                if unique_pub_types:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO publication_types (publication_type) VALUES (?)",
+                        [(pt,) for pt in unique_pub_types],
+                    )
+                if pub_type_links:
+                    pt_id_map = {
+                        r["publication_type"]: r["id"]
+                        for r in conn.execute(
+                            "SELECT id, publication_type FROM publication_types"
+                        ).fetchall()
+                    }
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO paper_publication_types (paper_pmid, publication_type_id) VALUES (?, ?)",
+                        [
+                            (pmid, pt_id_map[pt])
+                            for pmid, pt in pub_type_links
+                            if pt in pt_id_map
+                        ],
+                    )
+
+        except Exception as exc:
+            logger.error("insert_paper_metadata_batch failed: %s", exc)
+            raise
+
+        logger.info(
+            "insert_paper_metadata_batch: %d authors, %d keywords, %d mesh, "
+            "%d chemicals, %d pub_types across %d papers",
+            len(unique_authors), len(unique_keywords), len(unique_mesh),
+            len(unique_chemicals), len(unique_pub_types), len(papers_records),
+        )
+
     def get_papers_by_query(self, query_used: str) -> List[Dict]:
         try:
             with self._conn() as conn:
@@ -161,6 +362,30 @@ class DatabaseManager:
         except Exception as exc:
             logger.error("get_papers_by_query failed: %s", exc)
             return []
+
+    def insert_papers_batch(self, papers_list: List[Dict[str, Any]]):
+        """Insert or replace a list of paper dicts in a single transaction."""
+        now = datetime.utcnow().isoformat()
+        rows = [
+            (
+                p.get("pmid"), p.get("title"), p.get("abstract"), p.get("journal"),
+                p.get("volume"), p.get("issue"), p.get("pages"), p.get("pub_date"),
+                p.get("doi"), p.get("language"), p.get("query_used"), now,
+            )
+            for p in papers_list
+        ]
+        try:
+            with self._lock, self._conn() as conn:
+                conn.executemany(
+                    """INSERT OR REPLACE INTO papers
+                       (pmid, title, abstract, journal, volume, issue, pages,
+                        pub_date, doi, language, query_used, fetched_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+        except Exception as exc:
+            logger.error("insert_papers_batch failed: %s", exc)
+            raise
 
     def search_papers(self, search_term: str, limit: int = 50) -> List[Dict]:
         try:
@@ -461,6 +686,94 @@ class DatabaseManager:
                 return cur.lastrowid
         except Exception as exc:
             logger.error("insert_relationship failed: %s", exc)
+            raise
+
+    def insert_entities_batch(self, entity_rows: List[Dict]) -> Dict:
+        """
+        Batch-insert entities and paper-entity links in a single transaction.
+
+        Returns {(entity_text, entity_type): entity_id} for use by
+        insert_relationships_batch().
+        """
+        # Collect unique (name, type) pairs
+        unique: Dict[tuple, Optional[str]] = {}
+        for row in entity_rows:
+            key = (row["entity_text"], row["entity_type"])
+            if key not in unique:
+                unique[key] = row.get("umls_id")
+
+        entity_id_map: Dict = {}
+        try:
+            with self._lock, self._conn() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO entities (name, entity_type, umls_id) VALUES (?, ?, ?)",
+                    [(name, etype, umls_id) for (name, etype), umls_id in unique.items()],
+                )
+                for name, etype in unique:
+                    row = conn.execute(
+                        "SELECT id FROM entities WHERE name = ? AND entity_type = ?",
+                        (name, etype),
+                    ).fetchone()
+                    if row:
+                        entity_id_map[(name, etype)] = row["id"]
+
+                pe_rows = []
+                for row in entity_rows:
+                    key = (row["entity_text"], row["entity_type"])
+                    eid = entity_id_map.get(key)
+                    if eid:
+                        pe_rows.append((row["pmid"], eid, row.get("sentence_context", "")))
+                if pe_rows:
+                    conn.executemany(
+                        """INSERT OR IGNORE INTO paper_entities
+                           (paper_pmid, entity_id, sentence_context) VALUES (?, ?, ?)""",
+                        pe_rows,
+                    )
+        except Exception as exc:
+            logger.error("insert_entities_batch failed: %s", exc)
+            raise
+        return entity_id_map
+
+    def insert_relationships_batch(
+        self, rel_rows: List[Dict], entity_id_map: Dict
+    ):
+        """
+        Batch-insert relationships using the entity_id_map returned by
+        insert_entities_batch().  Rows where either endpoint cannot be
+        resolved are silently skipped (entity not extracted for that paper).
+        """
+        # Build text-lower → entity_id lookup (first entity type wins)
+        text_to_id: Dict[str, int] = {}
+        for (name, _etype), eid in entity_id_map.items():
+            key = name.lower()
+            if key not in text_to_id:
+                text_to_id[key] = eid
+
+        rows = []
+        for rel in rel_rows:
+            src_id = text_to_id.get(rel.get("subject_entity", "").lower())
+            tgt_id = text_to_id.get(rel.get("object_entity", "").lower())
+            if src_id and tgt_id and src_id != tgt_id:
+                rows.append((
+                    src_id, tgt_id,
+                    rel.get("relationship_verb", ""),
+                    rel.get("pmid"),
+                    1.0,
+                ))
+
+        if not rows:
+            return
+        try:
+            with self._lock, self._conn() as conn:
+                conn.executemany(
+                    """INSERT INTO relationships
+                       (source_entity_id, target_entity_id, relationship_type,
+                        evidence_pmid, confidence_score)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    rows,
+                )
+        except Exception as exc:
+            logger.error("insert_relationships_batch failed: %s", exc)
             raise
 
     # ── Hypotheses ────────────────────────────────────────────────────────────
