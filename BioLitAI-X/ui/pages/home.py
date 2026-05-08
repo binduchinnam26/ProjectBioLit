@@ -46,7 +46,7 @@ def _auto_cleanup_disk() -> int:
                 p.unlink()
             except Exception:
                 pass
-    for pattern in ("*.faiss", "*.json"):
+    for pattern in ("*.faiss", "*.json", "*.npy"):
         for p in Path(config.EMBEDDINGS_DIR).glob(pattern):
             try:
                 freed += p.stat().st_size
@@ -372,6 +372,9 @@ def _run_pipeline(
                 papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
 
         # Step 5: Embeddings (optional)
+        # On re-runs of the same query the encoded numpy array is loaded from
+        # disk — this avoids the ~8-minute re-encode and brings re-run time to
+        # under 30 seconds for the embedding step.
         _update(5, "Building semantic embeddings...")
         embeddings_array = None
         embedder = None
@@ -379,11 +382,24 @@ def _run_pipeline(
             from pipeline.embedder import EmbeddingEngine
             embedder = EmbeddingEngine(persist_index=not low_disk)
             embedder.setup()
-            embeddings_array = embedder.embed_corpus(
-                papers_df, query=query,
-                progress_callback=lambda d, t, m: _update(5, m, papers=len(papers_df),
-                                                           ents=len(entities_df)),
-            )
+
+            if not force_rerun and embedder.index_exists(query):
+                # Cache hit: load FAISS index + numpy array from disk
+                if embedder.load_index(query):
+                    embeddings_array = embedder.load_embeddings(query)
+                    _update(5,
+                            f"Loaded {len(embeddings_array) if embeddings_array is not None else 0:,} "
+                            f"cached embeddings from disk (skipped re-encode).",
+                            papers=len(papers_df), ents=len(entities_df))
+                    logger.info("Embedding cache hit for query %r", query)
+
+            if embeddings_array is None:
+                # Cache miss or force rerun: encode the full corpus
+                embeddings_array = embedder.embed_corpus(
+                    papers_df, query=query,
+                    progress_callback=lambda d, t, m: _update(5, m, papers=len(papers_df),
+                                                               ents=len(entities_df)),
+                )
         except Exception as exc:
             logger.warning("Embedding step skipped: %s", exc)
             st.warning(f"Embedding step skipped: {exc}. Semantic search will be unavailable.")

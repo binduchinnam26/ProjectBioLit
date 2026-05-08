@@ -46,8 +46,8 @@ SCISPACY_MODEL = "en_core_sci_lg"
 EMBEDDING_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
 EMBEDDING_DIMENSION = 768    # output size of the model above
 
-NLP_BATCH_SIZE = 32          # abstracts per nlp.pipe() call; lower = less RAM spike
-EMBEDDING_BATCH_SIZE = 64    # abstracts per model.encode() batch; lower = less RAM spike
+NLP_BATCH_SIZE = 64          # abstracts per nlp.pipe() call
+EMBEDDING_BATCH_SIZE = 128   # abstracts per model.encode() batch; 128 is the CPU sweet spot
 
 # Set to True to enable UMLS entity linking (downloads ~724 MB index on first run).
 # When False, NER still runs but entities keep the generic "ENTITY" label.

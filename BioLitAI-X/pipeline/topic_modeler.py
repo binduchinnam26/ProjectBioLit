@@ -38,6 +38,11 @@ class TopicModeler:
         fit_transform(); this avoids a second full-corpus encoding pass.
         calculate_probabilities=False cuts memory and time significantly.
         """
+        import warnings
+        # Suppress transformers internal path access noise
+        warnings.filterwarnings("ignore", message=".*Accessing.*__path__.*")
+        warnings.filterwarnings("ignore", message=".*image_processing.*")
+
         from bertopic import BERTopic
         from umap import UMAP
         from hdbscan import HDBSCAN
@@ -169,6 +174,7 @@ class TopicModeler:
         if self._topics is None:
             raise RuntimeError("fit_transform must be called before get_topic_over_time.")
 
+        n_papers = len(papers_df)
         abstracts = papers_df["abstract"].fillna("").tolist()
         timestamps = papers_df["pub_year"].fillna(0).astype(int).tolist()
 
@@ -176,14 +182,35 @@ class TopicModeler:
             logger.warning("get_topic_over_time: no publication years available")
             return pd.DataFrame()
 
+        # BERTopic.topics_over_time requires all three arrays to be the same length.
+        # self._topics is padded to n_papers in fit_transform, so we must pass it
+        # explicitly rather than letting BERTopic use its internal self.topics_
+        # (which has length n_valid_docs, not n_papers).
+        topics = self._topics[:n_papers] if len(self._topics) >= n_papers else self._topics
+        if len(topics) != n_papers:
+            logger.warning(
+                "get_topic_over_time: topics length %d != papers %d, skipping",
+                len(topics), n_papers,
+            )
+            return pd.DataFrame()
+
         try:
             tot_df = self.model.topics_over_time(
                 abstracts,
                 timestamps,
+                topics=topics,
                 global_tuning=True,
                 evolution_tuning=True,
             )
             return tot_df
+        except TypeError:
+            # Older BERTopic versions don't accept the topics kwarg — fall back
+            try:
+                tot_df = self.model.topics_over_time(abstracts, timestamps)
+                return tot_df
+            except Exception as exc:
+                logger.error("topics_over_time failed: %s", exc)
+                return pd.DataFrame()
         except Exception as exc:
             logger.error("topics_over_time failed: %s", exc)
             return pd.DataFrame()
