@@ -3,6 +3,7 @@
 import gc
 import logging
 import shutil
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -552,7 +553,7 @@ def _run_pipeline(
                         _db.insert_paper_metadata_batch(_df.to_dict("records"))
                     except Exception as _e:
                         logger.warning("Background DB write failed: %s", _e)
-                _thread.Thread(target=_bg_db_write, daemon=True).start()
+                threading.Thread(target=_bg_db_write, daemon=True).start()
 
             db.update_query_session(session_id, papers_fetched=_n_papers,
                                     pipeline_status="complete")

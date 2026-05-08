@@ -55,10 +55,18 @@ class EmbeddingEngine:
         import warnings
         import torch
 
-        # Pin CPU threads before model load so they apply to all downstream compute
+        # Pin CPU thread counts. set_num_interop_threads() must be called before
+        # any inter-op parallelism starts; guard with a try so it's a no-op if
+        # another library (spaCy, NLP pipeline) already started the PyTorch runtime.
         num_threads = os.cpu_count() or 4
-        torch.set_num_threads(num_threads)
-        torch.set_num_interop_threads(num_threads)
+        try:
+            torch.set_num_threads(num_threads)
+        except RuntimeError:
+            pass
+        try:
+            torch.set_num_interop_threads(num_threads)
+        except RuntimeError:
+            pass
         os.environ["OMP_NUM_THREADS"] = str(num_threads)
         os.environ["MKL_NUM_THREADS"] = str(num_threads)
         os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
