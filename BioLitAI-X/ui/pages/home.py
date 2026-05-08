@@ -55,7 +55,8 @@ def _auto_cleanup_disk() -> int:
                 pass
     # Checkpoint + shrink the SQLite WAL file
     try:
-        conn = _sqlite3.connect(config.DB_PATH)
+        conn = _sqlite3.connect(config.DB_PATH, timeout=10)
+        conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.execute("VACUUM")
         conn.close()
