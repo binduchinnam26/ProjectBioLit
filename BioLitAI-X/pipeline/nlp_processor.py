@@ -102,6 +102,13 @@ class NLPProcessor:
                 f"ai2-s2-scispacy/releases/v0.5.4/en_core_sci_lg-0.5.4.tar.gz"
             )
 
+        # When the dep parser is disabled for speed, doc.sents raises E030
+        # (sentence boundaries unset). The sentencizer provides rule-based
+        # sentence splitting so _extract_from_doc() can iterate over sentences.
+        if "parser" in _DISABLE_PIPES and "sentencizer" not in self.nlp.pipe_names:
+            self.nlp.add_pipe("sentencizer", first=True)
+            logger.info("Added sentencizer (parser disabled for fast NER pass).")
+
         if config.USE_UMLS_LINKER:
             logger.info("Adding UMLS entity linker (USE_UMLS_LINKER=true)")
             try:
