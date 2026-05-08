@@ -176,7 +176,7 @@ BARNES_HUT_PHYSICS = {
     "minVelocity": 0.75,
     "stabilization": {
         "enabled": True,
-        "iterations": 1000,
+        "iterations": 200,
         "updateInterval": 25,
     },
 }

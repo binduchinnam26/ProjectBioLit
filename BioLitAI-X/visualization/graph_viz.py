@@ -84,6 +84,26 @@ def _color_opacity(hex_color: str, opacity: float) -> str:
     return f"rgba({r},{g},{b},{opacity})"
 
 
+_MAX_KG_EDGES = 1500  # hard cap for entity KG edges — beyond this vis.js freezes
+
+_KG_PHYSICS = {
+    "barnesHut": {
+        "gravitationalConstant": -8000,
+        "centralGravity": 0.3,
+        "springLength": 150,
+        "springConstant": 0.04,
+        "damping": 0.09,
+        "avoidOverlap": 0.5,
+    },
+    "minVelocity": 0.75,
+    "stabilization": {
+        "enabled": True,
+        "iterations": 200,   # was 1000 — 200 is enough and 5x faster
+        "updateInterval": 25,
+    },
+}
+
+
 def _get_pyvis_net(height: str = "800px"):
     from pyvis.network import Network
     net = Network(
@@ -95,7 +115,7 @@ def _get_pyvis_net(height: str = "800px"):
         notebook=False,
     )
     net.set_options(json.dumps({
-        "physics": config.BARNES_HUT_PHYSICS,
+        "physics": _KG_PHYSICS,
         "nodes": {
             "font": {"face": "Open Sans", "color": config.TEXT_PRIMARY},
             "borderWidth": 1.5,
@@ -117,18 +137,26 @@ def _get_pyvis_net(height: str = "800px"):
     return net
 
 
-def _render_html(net, height: int, extra_css: str = ""):
-    with tempfile.NamedTemporaryFile(
-        suffix=".html", delete=False, mode="w", encoding="utf-8"
-    ) as f:
-        net.save_graph(f.name)
-        html_path = f.name
+def _render_html(net, height: int, extra_css: str = "", cache_key: str = ""):
+    """Render PyVis HTML, caching in session_state to speed up page navigation."""
+    from typing import Optional
+    html: Optional[str] = None
+    if cache_key:
+        html = st.session_state.get(f"__kghtml_{cache_key}")
 
-    with open(html_path, "r", encoding="utf-8") as f:
-        html = f.read()
-    os.unlink(html_path)
+    if html is None:
+        with tempfile.NamedTemporaryFile(
+            suffix=".html", delete=False, mode="w", encoding="utf-8"
+        ) as f:
+            net.save_graph(f.name)
+            html_path = f.name
+        with open(html_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        os.unlink(html_path)
+        html = html.replace("</head>", _SHARED_STYLE + extra_css + "</head>", 1)
+        if cache_key:
+            st.session_state[f"__kghtml_{cache_key}"] = html
 
-    html = html.replace("</head>", _SHARED_STYLE + extra_css + "</head>", 1)
     st.components.v1.html(html, height=height + 30, scrolling=False)
 
 
@@ -247,9 +275,17 @@ def render_knowledge_graph(
             font={"size": max(8, int(size * 0.3)), "color": config.TEXT_PRIMARY},
         )
 
-    # ── Add edges ─────────────────────────────────────────────────────────────
+    # ── Add edges (capped at _MAX_KG_EDGES, top by confidence) ────────────────
+    total_edges = G_sub.number_of_edges()
+    all_edges = sorted(
+        G_sub.edges(data=True),
+        key=lambda e: e[2].get("confidence_score", 0.5),
+        reverse=True,
+    )
     seen_edges: Set[tuple] = set()
-    for u, v, data in G_sub.edges(data=True):
+    for u, v, data in all_edges:
+        if len(seen_edges) >= _MAX_KG_EDGES:
+            break
         edge_key = (str(u), str(v))
         if edge_key in seen_edges:
             continue
@@ -273,12 +309,19 @@ def render_knowledge_graph(
             str(u), str(v),
             color={"color": edge_color_alpha, "highlight": "#FFD700", "hover": "#FFFFFF"},
             title=tooltip,
-            label=rel_type if len(seen_edges) < 200 else "",  # skip labels on dense graphs
+            label=rel_type if len(seen_edges) < 200 else "",
             font={"size": 7, "color": config.TEXT_SECONDARY, "align": "middle"},
         )
 
+    if total_edges > _MAX_KG_EDGES:
+        st.caption(
+            f"Showing {_MAX_KG_EDGES:,} of {total_edges:,} edges (highest confidence). "
+            "Use filters to narrow the graph."
+        )
+
     extra_css = _GAP_NODE_CSS if has_gap_nodes else ""
-    _render_html(net, height=height, extra_css=extra_css)
+    cache_key = f"kg_{G_sub.number_of_nodes()}_{min(total_edges, _MAX_KG_EDGES)}_{search_lower}_{min_evidence}"
+    _render_html(net, height=height, extra_css=extra_css, cache_key=cache_key)
 
 
 def render_entity_legend():
