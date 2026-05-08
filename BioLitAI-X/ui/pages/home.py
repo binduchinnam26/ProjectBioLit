@@ -74,6 +74,27 @@ _PIPELINE_STEPS = [
 ]
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_pubmed_count(query: str, year_start: int, year_end: int) -> Optional[int]:
+    """
+    Query PubMed with retmax=0 to retrieve the total hit count without
+    fetching any records. Returns None on failure. Cached for 5 minutes.
+    """
+    try:
+        from Bio import Entrez
+        Entrez.email = config.ENTREZ_EMAIL
+        if config.ENTREZ_API_KEY:
+            Entrez.api_key = config.ENTREZ_API_KEY
+        date_filter = f" AND {year_start}:{year_end}[dp]" if year_start and year_end else ""
+        handle = Entrez.esearch(db="pubmed", term=query + date_filter, retmax=0, usehistory="n")
+        record = Entrez.read(handle)
+        handle.close()
+        return int(record.get("Count", 0))
+    except Exception as exc:
+        logger.debug("PubMed count preview failed: %s", exc)
+        return None
+
+
 def render():
     """Render the Home / search page."""
     # ── Hero ──────────────────────────────────────────────────────────────────
@@ -133,6 +154,47 @@ def render():
                 use_container_width=True,
                 help="Ignore cached results and re-fetch from PubMed",
             )
+
+    # ── PubMed count preview + cache status ──────────────────────────────────
+    if query and query.strip():
+        q_stripped = query.strip()
+        # Count preview (non-blocking — uses @st.cache_data with 5-min TTL)
+        pubmed_count = _get_pubmed_count(q_stripped, year_min, year_max)
+        if pubmed_count is not None:
+            capped = min(pubmed_count, max_results)
+            if pubmed_count > max_results:
+                st.caption(
+                    f"PubMed has **{pubmed_count:,}** papers matching this query "
+                    f"({year_min}–{year_max}). Pipeline will fetch the most recent **{capped:,}**."
+                )
+            else:
+                st.caption(
+                    f"PubMed has **{pubmed_count:,}** papers matching this query "
+                    f"({year_min}–{year_max}). All will be fetched."
+                )
+
+        # Cache status banner
+        qhash = query_hash(q_stripped)
+        _cache_path = Path(config.PROCESSED_DIR) / f"{qhash}.parquet"
+        if _cache_path.exists() and not force_rerun:
+            _age_days = (time.time() - _cache_path.stat().st_mtime) / 86400
+            try:
+                _cached_n = pd.read_parquet(_cache_path).shape[0]
+                _n_str = f"{_cached_n:,} papers"
+            except Exception:
+                _n_str = "unknown size"
+            if _age_days < 1:
+                _age_str = "today"
+            elif _age_days < 2:
+                _age_str = "yesterday"
+            else:
+                _age_str = f"{int(_age_days)} days ago"
+            st.info(
+                f"✅ **Cached results available** — {_n_str}, saved {_age_str}. "
+                f"Click **Search & Analyse** to use cache, or **Force Rerun** to re-fetch."
+            )
+        elif not _cache_path.exists():
+            st.caption("🔄 No cache found — full pipeline will run.")
 
     # ── Past sessions chips ───────────────────────────────────────────────────
     past = st.session_state.get("past_sessions", [])
@@ -224,16 +286,24 @@ def _run_pipeline(
     stats_container = st.empty()
     status_msg = st.empty()
     pipeline_start = time.monotonic()
+    # Persistent counter state — only updated when caller passes a non-None value
+    _live: dict = {"papers": 0, "ents": 0, "rels": 0}
 
     def _elapsed() -> str:
         secs = int(time.monotonic() - pipeline_start)
         return f"{secs // 60}m {secs % 60}s" if secs >= 60 else f"{secs}s"
 
-    def _update(step: int, msg: str, papers: int = 0, ents: int = 0, rels: int = 0):
+    def _update(step: int, msg: str, papers: int = None, ents: int = None, rels: int = None):
+        if papers is not None:
+            _live["papers"] = papers
+        if ents is not None:
+            _live["ents"] = ents
+        if rels is not None:
+            _live["rels"] = rels
         with step_container.container():
             pipeline_status_indicator(step, 6, msg)
         with stats_container.container():
-            live_stats_bar(papers, ents, rels)
+            live_stats_bar(_live["papers"], _live["ents"], _live["rels"])
         status_msg.markdown(
             f"<p style='font-size:12px;color:{config.TEXT_SECONDARY}'>"
             f"{msg} <span style='opacity:0.5'>({_elapsed()})</span></p>",
@@ -428,7 +498,7 @@ def _run_pipeline(
         try:
             from pipeline.topic_modeler import TopicModeler
             tm = TopicModeler()
-            tm.setup()
+            tm.setup(n_papers=len(papers_df))
             abstracts = papers_df["abstract"].fillna("").tolist()
             doc_topics, probs = tm.fit_transform(abstracts, embeddings_array)
             topic_labels = tm.get_topic_labels()

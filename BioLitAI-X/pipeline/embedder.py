@@ -51,7 +51,18 @@ class EmbeddingEngine:
 
     def setup(self):
         """Load sentence-transformer model and initialise FAISS index."""
+        import os
         import warnings
+        import torch
+
+        # Pin CPU threads before model load so they apply to all downstream compute
+        num_threads = os.cpu_count() or 4
+        torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(num_threads)
+        os.environ["OMP_NUM_THREADS"] = str(num_threads)
+        os.environ["MKL_NUM_THREADS"] = str(num_threads)
+        os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
+
         # Suppress HF Hub authentication advisory (noise, not an error)
         warnings.filterwarnings("ignore", message=".*unauthenticated requests.*", category=UserWarning)
         warnings.filterwarnings("ignore", message=".*HF_TOKEN.*")
@@ -61,7 +72,7 @@ class EmbeddingEngine:
         from sentence_transformers import SentenceTransformer
         import faiss
 
-        logger.info("Loading embedding model: %s", config.EMBEDDING_MODEL)
+        logger.info("Loading embedding model: %s (threads=%d)", config.EMBEDDING_MODEL, num_threads)
         self.model = SentenceTransformer(config.EMBEDDING_MODEL)
 
         self._init_index()
@@ -139,14 +150,16 @@ class EmbeddingEngine:
         self._current_query_hash = query_hash(query) if query else "default"
 
         try:
-            embeddings = self.model.encode(
-                texts,
-                batch_size=batch_size,
-                show_progress_bar=True,
-                normalize_embeddings=True,
-                convert_to_numpy=True,
-                device="cpu",
-            ).astype("float32")
+            import torch
+            with torch.inference_mode():
+                embeddings = self.model.encode(
+                    texts,
+                    batch_size=batch_size,
+                    show_progress_bar=True,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
+                    device="cpu",
+                ).astype("float32")
         except Exception as exc:
             logger.error("model.encode() failed: %s", exc)
             embeddings = np.zeros((total, config.EMBEDDING_DIMENSION), dtype="float32")
@@ -202,7 +215,14 @@ class EmbeddingEngine:
             return False
         try:
             self._check_ready()
-            self.index = faiss.read_index(str(faiss_path))
+            loaded = faiss.read_index(str(faiss_path))
+            if loaded.d != config.EMBEDDING_DIMENSION:
+                logger.warning(
+                    "Stale FAISS index (dim=%d) does not match current model (dim=%d) — ignoring cache",
+                    loaded.d, config.EMBEDDING_DIMENSION,
+                )
+                return False
+            self.index = loaded
             self._pmid_list = json.loads(map_path.read_text(encoding="utf-8"))
             self._current_query_hash = query_hash(query)
             logger.info(
@@ -220,6 +240,12 @@ class EmbeddingEngine:
             return None
         try:
             arr = np.load(str(emb_path))
+            if arr.ndim == 2 and arr.shape[1] != config.EMBEDDING_DIMENSION:
+                logger.warning(
+                    "Stale embeddings cache (dim=%d) does not match current model (dim=%d) — ignoring",
+                    arr.shape[1], config.EMBEDDING_DIMENSION,
+                )
+                return None
             logger.info("Loaded embeddings array (%d vectors) from %s", len(arr), emb_path)
             return arr
         except Exception as exc:
