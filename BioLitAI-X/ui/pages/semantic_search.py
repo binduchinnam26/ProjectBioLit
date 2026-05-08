@@ -75,11 +75,11 @@ def render():
         unsafe_allow_html=True,
     )
 
-    # ── Lazy embedding: build on first visit if not yet computed ─────────────
+    # ── Embeddings are built in the main pipeline. Recovery button if they failed.
     if embedder is None and papers_df is not None and not papers_df.empty:
-        st.info(
-            "Semantic embeddings not yet built for this corpus. "
-            "Click below to compute them (takes 1-3 minutes on CPU)."
+        st.warning(
+            "Semantic embeddings are not ready (they may have failed during pipeline, "
+            "e.g. model download required on first run). Click below to build them now."
         )
         if st.button("Build Embeddings", type="primary", key="build_emb_btn"):
             _build_embeddings_lazy(papers_df)
