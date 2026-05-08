@@ -438,69 +438,96 @@ def _run_pipeline(
                 except Exception as exc:
                     logger.warning("Parquet cache save failed: %s", exc)
 
-            # DB writes (only on fresh data)
-            if not no_disk:
-                _update(3, f"Storing {len(papers_df):,} papers to database...",
-                        papers=len(papers_df))
+            # ── Step 4-6a: NLP + Embeddings + Networks run in parallel ───────
+            # All three only need papers_df, which is ready now.
+            # Running concurrently saves max(NLP, embed, nets) instead of their sum.
+            import concurrent.futures as _fut
+            import threading as _thread
+
+            _par_results: dict = {}
+            _n_papers = len(papers_df)
+
+            def _nlp_worker():
                 try:
-                    db.insert_papers_batch(papers_df.to_dict("records"))
-                    db.insert_paper_metadata_batch(papers_df.to_dict("records"))
+                    from pipeline.nlp_processor import NLPProcessor
+                    # db_manager=None skips entity/relationship DB writes (saved in
+                    # derived_cache pickle instead — avoids thousands of SQL SELECTs).
+                    nlp_p = NLPProcessor(db_manager=None)
+                    nlp_p.setup()
+                    ents, rels = nlp_p.process_corpus(papers_df)
+                    _par_results["entities_df"] = ents
+                    _par_results["relationships_df"] = rels
                 except Exception as exc:
-                    logger.warning("DB batch insert failed: %s", exc)
+                    logger.warning("NLP worker failed: %s", exc)
+                    _par_results["entities_df"] = pd.DataFrame()
+                    _par_results["relationships_df"] = pd.DataFrame()
 
-            # Step 4: NLP
-            _update(4, "Running NLP entity extraction...")
-            entities_df = pd.DataFrame()
-            relationships_df = pd.DataFrame()
-            try:
-                from pipeline.nlp_processor import NLPProcessor
-                nlp = NLPProcessor(db_manager=db)
-                nlp.setup()
-                entities_df, relationships_df = nlp.process_corpus(
-                    papers_df,
-                    progress_callback=lambda ents, rels, m: _update(
-                        4, m, papers=len(papers_df), ents=ents, rels=rels),
-                )
-            except Exception as exc:
-                logger.warning("NLP skipped: %s", exc)
-                st.warning(f"NLP skipped: {exc}. Knowledge graph will be limited.")
-            _update(4, f"NLP done: {len(entities_df):,} entities.",
-                    papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
+            def _emb_worker():
+                try:
+                    from pipeline.embedder import EmbeddingEngine
+                    emb = EmbeddingEngine(persist_index=not low_disk)
+                    emb.setup()
+                    if not force_rerun and emb.index_exists(query):
+                        emb.load_index(query)
+                        arr = emb.load_embeddings(query)
+                        if arr is None:
+                            arr = emb.embed_corpus(papers_df, query=query)
+                    else:
+                        arr = emb.embed_corpus(papers_df, query=query)
+                    _par_results["embedder"] = emb
+                    _par_results["embeddings_array"] = arr
+                except Exception as exc:
+                    logger.warning("Embedding worker failed: %s", exc)
+                    _par_results["embedder"] = None
+                    _par_results["embeddings_array"] = None
 
-            # Step 5: Embeddings
-            _update(5, "Building semantic embeddings...")
-            embeddings_array = None
-            embedder = None
-            try:
-                from pipeline.embedder import EmbeddingEngine
-                embedder = EmbeddingEngine(persist_index=not low_disk)
-                embedder.setup()
-                if not force_rerun and embedder.index_exists(query):
-                    embedder.load_index(query)
-                    embeddings_array = embedder.load_embeddings(query)
-                    _update(5, f"Embeddings loaded from cache ({len(embeddings_array):,} vectors).",
-                            papers=len(papers_df), ents=len(entities_df))
-                if embeddings_array is None:
-                    embeddings_array = embedder.embed_corpus(
-                        papers_df, query=query,
-                        progress_callback=lambda d, t, m: _update(
-                            5, m, papers=len(papers_df), ents=len(entities_df)),
-                    )
-            except Exception as exc:
-                logger.warning("Embedding skipped: %s", exc)
-                st.warning(f"Embedding skipped: {exc}. Semantic search unavailable.")
+            def _net_worker():
+                try:
+                    cog_full = nb_inst.build_coauthorship_network(papers_df)
+                    kwd_full = nb_inst.build_keyword_cooccurrence_network(papers_df)
+                    _par_results["coauth_stats"]  = nb_inst.calculate_network_statistics(cog_full)
+                    _par_results["keyword_stats"] = nb_inst.calculate_network_statistics(kwd_full)
+                    _par_results["coauth_graph"]  = nb_inst.prepare_graph_for_display(cog_full)
+                    _par_results["keyword_graph"] = nb_inst.prepare_graph_for_display(kwd_full)
+                except Exception as exc:
+                    logger.warning("Network worker failed: %s", exc)
+                    _par_results["coauth_stats"] = {}
+                    _par_results["keyword_stats"] = {}
+                    _par_results["coauth_graph"] = None
+                    _par_results["keyword_graph"] = None
 
-            # Step 6: Graphs + topics
-            _update(6, "Building bibliometric networks...")
-            nb = NetworkBuilder()
-            coauth_graph_full  = nb.build_coauthorship_network(papers_df)
-            keyword_graph_full = nb.build_keyword_cooccurrence_network(papers_df)
-            coauth_stats  = nb.calculate_network_statistics(coauth_graph_full)
-            keyword_stats = nb.calculate_network_statistics(keyword_graph_full)
-            coauth_graph  = nb.prepare_graph_for_display(coauth_graph_full)
-            keyword_graph = nb.prepare_graph_for_display(keyword_graph_full)
-            del coauth_graph_full, keyword_graph_full
+            nb_inst = NetworkBuilder()
+
+            _update(4, f"Running NLP, embeddings, and network analysis in parallel "
+                       f"on {_n_papers:,} papers...", papers=_n_papers)
+
+            with _fut.ThreadPoolExecutor(max_workers=3) as _pool:
+                _f_nlp = _pool.submit(_nlp_worker)
+                _f_emb = _pool.submit(_emb_worker)
+                _f_net = _pool.submit(_net_worker)
+                for _f in (_f_nlp, _f_emb, _f_net):
+                    try:
+                        _f.result()
+                    except Exception as _exc:
+                        logger.warning("Parallel step exception: %s", _exc)
+
+            entities_df      = _par_results.get("entities_df",      pd.DataFrame())
+            relationships_df = _par_results.get("relationships_df", pd.DataFrame())
+            embedder         = _par_results.get("embedder")
+            embeddings_array = _par_results.get("embeddings_array")
+            coauth_graph     = _par_results.get("coauth_graph")
+            keyword_graph    = _par_results.get("keyword_graph")
+            coauth_stats     = _par_results.get("coauth_stats",  {})
+            keyword_stats    = _par_results.get("keyword_stats", {})
             gc.collect()
+
+            _update(4, f"NLP + embeddings + networks done: "
+                       f"{len(entities_df):,} entities, {len(relationships_df):,} rels.",
+                    papers=_n_papers, ents=len(entities_df), rels=len(relationships_df))
+
+            # ── Step 6b: Knowledge graph + topic modeling ─────────────────────
+            _update(5, "Building knowledge graph and topic model...",
+                    papers=_n_papers, ents=len(entities_df), rels=len(relationships_df))
 
             kg = KnowledgeGraph()
             kg_graph = kg.build_from_entities(entities_df, relationships_df)
@@ -518,7 +545,7 @@ def _run_pipeline(
                 topic_labels     = tm.get_topic_labels()
                 topics_over_time = tm.get_topic_over_time(papers_df)
                 doc_topics_df    = tm.get_document_topics(papers_df)
-                topic_graph      = nb.build_topic_network(
+                topic_graph      = nb_inst.build_topic_network(
                     {"doc_topics": doc_topics, "topic_labels": topic_labels}
                 )
             except Exception as exc:
@@ -527,7 +554,7 @@ def _run_pipeline(
             # ── Save derived cache so next run is instant ──────────────────
             if not no_disk and not low_disk:
                 _update(6, "Saving results to cache for instant future loads...",
-                        papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
+                        papers=_n_papers, ents=len(entities_df), rels=len(relationships_df))
                 try:
                     _derived = {
                         "entities_df":      entities_df,
@@ -547,6 +574,17 @@ def _run_pipeline(
                     logger.info("Derived cache saved: %s", derived_cache)
                 except Exception as exc:
                     logger.warning("Derived cache save failed: %s", exc)
+
+            # ── DB paper writes deferred to background thread ──────────────
+            # These are only needed for session history; they don't block results.
+            if not no_disk:
+                def _bg_db_write(_df=papers_df, _db=db):
+                    try:
+                        _db.insert_papers_batch(_df.to_dict("records"))
+                        _db.insert_paper_metadata_batch(_df.to_dict("records"))
+                    except Exception as _e:
+                        logger.warning("Background DB write failed: %s", _e)
+                _thread.Thread(target=_bg_db_write, daemon=True).start()
 
             db.update_query_session(session_id, papers_fetched=len(papers_df),
                                     pipeline_status="complete")

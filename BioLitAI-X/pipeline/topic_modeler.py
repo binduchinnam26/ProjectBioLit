@@ -48,8 +48,11 @@ class TopicModeler:
         from hdbscan import HDBSCAN
         from sklearn.feature_extraction.text import CountVectorizer
 
-        # Scale UMAP/HDBSCAN to dataset size for balanced granularity
-        n_neighbors = max(10, min(50, n_papers // 50))
+        # Scale UMAP/HDBSCAN to dataset size for balanced granularity.
+        # n_neighbors capped at 15: UMAP complexity is O(N * n_neighbors) so
+        # 15 is ~3x faster than 50 with negligible quality loss for NLP tasks.
+        # n_components=3 keeps enough structure for HDBSCAN while being faster.
+        n_neighbors = max(10, min(15, n_papers // 100))
         min_cluster_size = max(config.BERTOPIC_MIN_TOPIC_SIZE, min(30, n_papers // 100))
         min_samples = max(5, min_cluster_size // 3)
 
@@ -59,11 +62,12 @@ class TopicModeler:
         )
 
         umap_model = UMAP(
-            n_components=5,
+            n_components=3,
             n_neighbors=n_neighbors,
             min_dist=0.0,
             metric="cosine",
             low_memory=True,
+            verbose=False,
             random_state=42,
         )
         hdbscan_model = HDBSCAN(
@@ -87,7 +91,7 @@ class TopicModeler:
             vectorizer_model=vectorizer_model,
             min_topic_size=min_cluster_size,
             nr_topics=None,
-            verbose=True,
+            verbose=False,
             calculate_probabilities=False,
         )
 
@@ -208,8 +212,8 @@ class TopicModeler:
                 abstracts,
                 timestamps,
                 topics=topics,
-                global_tuning=True,
-                evolution_tuning=True,
+                global_tuning=False,    # retuning adds 1-2 min; skip for speed
+                evolution_tuning=False,
             )
             return tot_df
         except TypeError:

@@ -55,8 +55,8 @@ EMBEDDING_MODEL = os.getenv(
 # MiniLM=384, PubMedBERT/scibert=768. Override via .env if changing model.
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))
 
-NLP_BATCH_SIZE = 64          # abstracts per nlp.pipe() call
-EMBEDDING_BATCH_SIZE = 64    # MiniLM handles 64 comfortably; adjust up if RAM allows
+NLP_BATCH_SIZE = 128         # abstracts per nlp.pipe() call; larger = fewer overhead calls
+EMBEDDING_BATCH_SIZE = 256   # MiniLM is small (384-dim); 256 fills CPU cache efficiently
 
 # Set to True to enable UMLS entity linking (downloads ~724 MB index on first run).
 # When False, NER still runs but entities keep the generic "ENTITY" label.
