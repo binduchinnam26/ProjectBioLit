@@ -129,8 +129,8 @@ def render():
                 max_value=config.MAX_RESULTS_MAX,
                 value=config.MAX_RESULTS_DEFAULT,
                 step=100,
-                help="Number of papers to retrieve from PubMed (100–3,000). "
-                     "2,000 is recommended for best speed and stability.",
+                help="Papers to fetch from PubMed. "
+                     "1,000 = ~60-90s pipeline. 2,000 = ~90-120s. 3,000 = ~2-3 min.",
             )
         with col2:
             _cur_year = datetime.now().year
@@ -441,20 +441,70 @@ def _run_pipeline(
             import threading as _thread
             _n_papers = len(papers_df)
 
-            # ── Step 4: NLP deferred ─────────────────────────────────────────
-            # Entity extraction (NER) and relationship extraction are deferred to
-            # lazy loading on their respective pages:
-            #   • Entity extraction → first visit to Knowledge Graph → Entity KG tab
-            #   • Relationships     → button on Entity KG tab (dep-parse, slower)
-            #   • Embeddings        → first visit to Semantic Search
-            #   • Topics            → Analysis → Topic Evolution tab
-            # Skipping NER here saves 1-5 minutes per run.
-            _update(4, "Skipping NLP (deferred — click Extract Entities on KG page)...",
-                    papers=_n_papers)
-            entities_df      = pd.DataFrame()
-            relationships_df = pd.DataFrame()
-            _update(4, "NLP deferred. Building networks...",
-                    papers=_n_papers, ents=0, rels=0)
+            # ── Steps 4+5: NLP/NER and Embeddings in PARALLEL ────────────────
+            # Both spaCy (Cython/PyTorch tok2vec) and sentence-transformers
+            # (PyTorch) release the GIL during their heavy compute, so two threads
+            # can run on separate CPU cores simultaneously.
+            # Running them in parallel saves max(t_nlp, t_embed) instead of
+            # t_nlp + t_embed — typically 20-50s savings for 1000 papers.
+            import concurrent.futures as _cf
+
+            _update(4, f"Running entity extraction + embeddings in parallel "
+                       f"for {_n_papers:,} papers…", papers=_n_papers)
+
+            _nlp_res: dict = {}
+            _emb_res: dict = {}
+
+            def _do_nlp(_df=papers_df):
+                try:
+                    from pipeline.nlp_processor import NLPProcessor
+                    _p = NLPProcessor(db_manager=None)
+                    _p.setup()
+                    # No progress_callback — Streamlit is NOT thread-safe from
+                    # background threads; update only after both futures complete.
+                    _ents, _rels = _p.process_corpus(_df)
+                    _nlp_res["ents"] = _ents
+                    _nlp_res["rels"] = _rels
+                except Exception as _exc:
+                    logger.error("NLP thread failed: %s", _exc)
+                    _nlp_res["error"] = _exc
+
+            def _do_embed(_df=papers_df, _q=query):
+                try:
+                    from pipeline.embedder import EmbeddingEngine
+                    _emb = EmbeddingEngine(persist_index=not low_disk)
+                    _emb.setup()
+                    if _emb.index_exists(_q):
+                        _emb.load_index(_q)
+                        _arr = _emb.load_embeddings(_q)
+                        if _arr is None:
+                            _arr = _emb.embed_corpus(_df, query=_q)
+                    else:
+                        _arr = _emb.embed_corpus(_df, query=_q)
+                    _emb_res["embedder"] = _emb
+                    _emb_res["arr"] = _arr
+                except Exception as _exc:
+                    logger.error("Embedding thread failed: %s", _exc)
+                    _emb_res["error"] = _exc
+
+            with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
+                _f_nlp = _ex.submit(_do_nlp)
+                _f_emb = _ex.submit(_do_embed)
+                _f_nlp.result()   # blocks main thread until NLP done
+                _f_emb.result()   # blocks main thread until embeddings done
+
+            entities_df      = _nlp_res.get("ents", pd.DataFrame())
+            relationships_df = _nlp_res.get("rels", pd.DataFrame())
+            embedder         = _emb_res.get("embedder")
+            embeddings_array = _emb_res.get("arr")
+
+            if "error" in _nlp_res:
+                st.warning(f"Entity extraction issue: {_nlp_res['error']}")
+            if "error" in _emb_res:
+                st.warning(f"Embeddings issue: {_emb_res['error']}")
+
+            _update(4, f"Entities + Embeddings ready: {len(entities_df):,} entities.",
+                    papers=_n_papers, ents=len(entities_df), rels=0)
 
             # ── Step 5: Bibliometric networks + basic Knowledge Graph ─────────
             _update(5, "Building networks and knowledge graph...",
@@ -475,12 +525,9 @@ def _run_pipeline(
             kg = KnowledgeGraph()
             kg_graph = kg.build_from_entities(entities_df, relationships_df)
 
-            # Embeddings, topic modelling, and relationship extraction are deferred:
-            # • Embeddings  → built on first visit to Semantic Search
-            # • Topics      → built on first visit to Analysis → Topic Evolution
-            # • Relationships → extracted on first visit to Knowledge Graph → Entity KG
-            embedder         = None
-            embeddings_array = None
+            # Topics and relationship dep-parse are still deferred (too slow for main pipeline):
+            # • Topics        → Analysis page → Topic Evolution tab
+            # • Relationships → Knowledge Graph page → Entity KG tab
             topic_graph      = None
             topic_labels     = {}
             topics_over_time = pd.DataFrame()
@@ -527,9 +574,10 @@ def _run_pipeline(
             _update(6, f"Pipeline complete! ({total_elapsed})",
                     papers=_n_papers, ents=len(entities_df), rels=0)
             st.success(
-                f"✅ Pipeline complete in {total_elapsed}! {_n_papers:,} papers fetched. "
-                f"**Entities, embeddings & topics load on first page visit** (deferred for speed). "
-                f"Next run for this query loads from cache instantly."
+                f"✅ Pipeline complete in {total_elapsed}! "
+                f"{_n_papers:,} papers · {len(entities_df):,} entities · embeddings ready. "
+                f"Topics & relationships available on their pages. "
+                f"Next run loads from cache instantly."
             )
 
         # ── Save all results to session state (both paths) ────────────────────

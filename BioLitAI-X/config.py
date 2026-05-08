@@ -32,14 +32,14 @@ if not ENTREZ_EMAIL:
 # Rate limits (requests per second)
 RATE_LIMIT_WITHOUT_KEY = 3
 RATE_LIMIT_WITH_KEY = 10
-FETCH_BATCH_SIZE = 300       # records per efetch call; 300 is safe and right-sized for 2-3k
+FETCH_BATCH_SIZE = 500       # records per efetch call; 500 halves round-trips vs 300
 FETCH_RETRIES = 3
 FETCH_RETRY_DELAY = 2        # seconds, doubles on each retry
 
 # ── Query / result sizing ─────────────────────────────────────────────────────
-MAX_RESULTS_DEFAULT = 3000
+MAX_RESULTS_DEFAULT = 1000   # 1000 papers completes in ~60-90s; raise slider for deeper searches
 MAX_RESULTS_MIN = 100
-MAX_RESULTS_MAX = 3000       # hard cap — optimised for reliable 2k–3k processing
+MAX_RESULTS_MAX = 3000       # hard cap; >2000 may exceed 2-min target on slow hardware
 
 # ── NLP / Embeddings ──────────────────────────────────────────────────────────
 SCISPACY_MODEL = "en_core_sci_lg"

@@ -422,22 +422,23 @@ def render():
         )
         _has_rels = rels_df is not None and not rels_df.empty
 
-        # ── Step 1: lazy entity extraction (NER-only, fast) ──────────────────
+        # Entities are extracted in the main pipeline (NLP runs in parallel with
+        # embeddings). Show recovery button only if NLP failed for some reason.
         if not _has_entities and papers_df_local is not None and not papers_df_local.empty:
-            st.info(
-                "Entity extraction not yet run (deferred from main pipeline for speed). "
-                "Click below to extract biomedical entities using NER (~30-90 sec)."
+            st.warning(
+                "Entity extraction did not complete during the main pipeline "
+                "(this can happen if the spaCy model is not installed). "
+                "Click below to re-run it now (~30-90 sec)."
             )
             if st.button("Extract Entities", type="primary", key="extract_ents_btn"):
                 _extract_entities_lazy(papers_df_local)
                 st.rerun()
 
-        # ── Step 2: lazy relationship extraction (dep-parse, slower) ─────────
+        # Relationship dep-parse is deferred (2-5 min); offer it on demand.
         elif _has_entities and not _has_rels:
             st.info(
-                "Entities are ready. Click below to also extract relationships via "
-                "dependency parsing (~2-5 min). Relationships are optional — the "
-                "entity graph is already interactive above."
+                "Relationship edges (dependency-parse) not yet extracted — optional, ~2-5 min. "
+                "The entity graph above is fully interactive without them."
             )
             if st.button("Extract Relationships", type="primary", key="extract_rels_btn"):
                 _extract_relationships_lazy(papers_df_local, entities_df_local)
@@ -445,11 +446,9 @@ def render():
 
         if kg_graph is None or kg_graph.number_of_nodes() == 0:
             if not _has_entities:
-                pass  # already showing the Extract Entities button above
+                pass  # recovery button already shown above
             else:
-                st.info(
-                    "Entity knowledge graph is building — refresh after extraction completes."
-                )
+                st.info("Entity knowledge graph is empty — no entities were found for this corpus.")
         else:
             from visualization.graph_viz import (
                 render_knowledge_graph,
