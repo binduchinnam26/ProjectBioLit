@@ -37,17 +37,26 @@ FETCH_RETRIES = 3
 FETCH_RETRY_DELAY = 2        # seconds, doubles on each retry
 
 # ── Query / result sizing ─────────────────────────────────────────────────────
-MAX_RESULTS_DEFAULT = 1000
+MAX_RESULTS_DEFAULT = 3000
 MAX_RESULTS_MIN = 100
 MAX_RESULTS_MAX = 3000       # hard cap — optimised for reliable 2k–3k processing
 
 # ── NLP / Embeddings ──────────────────────────────────────────────────────────
 SCISPACY_MODEL = "en_core_sci_lg"
-EMBEDDING_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
-EMBEDDING_DIMENSION = 768    # output size of the model above
+
+# Primary model: all-MiniLM-L6-v2 — 5x faster than PubMedBERT on CPU,
+# 384-dim vectors, excellent quality for scientific text.
+# Override via .env: EMBEDDING_MODEL=pritamdeka/S-PubMedBert-MS-MARCO
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "sentence-transformers/all-MiniLM-L6-v2",
+)
+# Dimension must match the model output size.
+# MiniLM=384, PubMedBERT/scibert=768. Override via .env if changing model.
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))
 
 NLP_BATCH_SIZE = 64          # abstracts per nlp.pipe() call
-EMBEDDING_BATCH_SIZE = 128   # abstracts per model.encode() batch; 128 is the CPU sweet spot
+EMBEDDING_BATCH_SIZE = 64    # MiniLM handles 64 comfortably; adjust up if RAM allows
 
 # Set to True to enable UMLS entity linking (downloads ~724 MB index on first run).
 # When False, NER still runs but entities keep the generic "ENTITY" label.

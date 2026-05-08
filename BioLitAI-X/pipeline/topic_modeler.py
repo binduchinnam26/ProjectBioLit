@@ -31,9 +31,9 @@ class TopicModeler:
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
-    def setup(self):
+    def setup(self, n_papers: int = 1000):
         """
-        Initialise BERTopic with custom UMAP/HDBSCAN for performance.
+        Initialise BERTopic with UMAP/HDBSCAN parameters scaled to *n_papers*.
         embedding_model=None because pre-computed embeddings are passed in
         fit_transform(); this avoids a second full-corpus encoding pass.
         calculate_probabilities=False cuts memory and time significantly.
@@ -48,20 +48,29 @@ class TopicModeler:
         from hdbscan import HDBSCAN
         from sklearn.feature_extraction.text import CountVectorizer
 
-        logger.info("Initialising BERTopic (min_topic_size=%d)", config.BERTOPIC_MIN_TOPIC_SIZE)
+        # Scale UMAP/HDBSCAN to dataset size for balanced granularity
+        n_neighbors = max(10, min(50, n_papers // 50))
+        min_cluster_size = max(config.BERTOPIC_MIN_TOPIC_SIZE, min(30, n_papers // 100))
+        min_samples = max(5, min_cluster_size // 3)
+
+        logger.info(
+            "Initialising BERTopic (n_papers=%d, n_neighbors=%d, min_cluster_size=%d)",
+            n_papers, n_neighbors, min_cluster_size,
+        )
 
         umap_model = UMAP(
             n_components=5,
-            n_neighbors=15,
+            n_neighbors=n_neighbors,
             min_dist=0.0,
             metric="cosine",
             low_memory=True,
             random_state=42,
         )
         hdbscan_model = HDBSCAN(
-            min_cluster_size=config.BERTOPIC_MIN_TOPIC_SIZE,
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
             metric="euclidean",
-            cluster_selection_method="eom",
+            cluster_selection_method="leaf",
             prediction_data=True,
             core_dist_n_jobs=-1,
         )
@@ -76,14 +85,14 @@ class TopicModeler:
             umap_model=umap_model,
             hdbscan_model=hdbscan_model,
             vectorizer_model=vectorizer_model,
-            min_topic_size=config.BERTOPIC_MIN_TOPIC_SIZE,
-            nr_topics="auto",
+            min_topic_size=min_cluster_size,
+            nr_topics=None,
             verbose=True,
             calculate_probabilities=False,
         )
 
         self._ready = True
-        logger.info("TopicModeler ready")
+        logger.info("TopicModeler ready (n_papers=%d)", n_papers)
 
     def _check_ready(self):
         if not self._ready or self.model is None:
