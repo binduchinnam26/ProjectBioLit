@@ -1,9 +1,63 @@
 """Analysis page — KPI metrics, publication trend, and three VOSviewer network sections."""
 
+import logging
+
 import streamlit as st
 import config
 from ui.components.cards import empty_state, section_header
 from ui.components.metrics import kpi_row
+
+logger = logging.getLogger(__name__)
+
+
+def _build_topics_lazy(papers_df, embedder):
+    """Run BERTopic on demand and persist results into session state + derived cache."""
+    import sys, os, pickle
+    import pandas as pd
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    from pipeline.topic_modeler import TopicModeler
+    from pipeline.network_builder import NetworkBuilder
+    from pathlib import Path
+    from utils.helpers import query_hash
+
+    query = st.session_state.get("current_query", "")
+    embeddings_array = st.session_state.get("embeddings_array")
+
+    with st.spinner("Running topic modelling (UMAP + HDBSCAN)… this may take 1-3 minutes."):
+        try:
+            tm = TopicModeler()
+            tm.setup(n_papers=len(papers_df))
+            abstracts = papers_df["abstract"].fillna("").tolist()
+            doc_topics, _ = tm.fit_transform(abstracts, embeddings_array)
+            topic_labels     = tm.get_topic_labels()
+            topics_over_time = tm.get_topic_over_time(papers_df)
+            doc_topics_df    = tm.get_document_topics(papers_df)
+            nb = NetworkBuilder()
+            topic_graph = nb.build_topic_network(
+                {"doc_topics": doc_topics, "topic_labels": topic_labels}
+            )
+            st.session_state.update({
+                "topic_labels":     topic_labels,
+                "topics_over_time": topics_over_time,
+                "doc_topics_df":    doc_topics_df,
+                "topic_graph":      topic_graph,
+            })
+            # Patch derived cache so next FAST PATH load includes topics
+            qh = query_hash(query) if query else "default"
+            derived_cache = Path(config.PROCESSED_DIR) / f"{qh}_derived.pkl"
+            if derived_cache.exists():
+                with open(derived_cache, "rb") as _f:
+                    _d = pickle.load(_f)
+                _d.update({
+                    "topic_labels": topic_labels, "topics_over_time": topics_over_time,
+                    "doc_topics_df": doc_topics_df, "topic_graph": topic_graph,
+                })
+                with open(derived_cache, "wb") as _f:
+                    pickle.dump(_d, _f, protocol=pickle.HIGHEST_PROTOCOL)
+            st.success(f"Topic model complete: {len(topic_labels)} topics discovered.")
+        except Exception as exc:
+            logger.error("Lazy topic build failed: %s", exc)
+            st.error(f"Topic modelling failed: {exc}")
 
 
 def render():
@@ -71,7 +125,20 @@ def render():
         if topics_over_time is not None and not topics_over_time.empty:
             st.plotly_chart(render_topic_evolution(topics_over_time), use_container_width=True)
         else:
-            st.info("Topic evolution data not available. NLP and topic modeling must complete first.")
+            st.info(
+                "Topic evolution not yet computed — embeddings and topic modelling are "
+                "deferred for faster initial pipeline runs."
+            )
+            embedder = st.session_state.get("embedder")
+            if embedder is None:
+                st.caption(
+                    "Build embeddings first: go to **Semantic Search** and click "
+                    "**Build Embeddings**, then return here."
+                )
+            else:
+                if st.button("Compute Topic Model", type="primary", key="build_topics_btn"):
+                    _build_topics_lazy(papers_df, embedder)
+                    st.rerun()
 
     # ══════════════════════════════════════════════════════════════════════════
     # SECTION 01 — Author Collaboration Network

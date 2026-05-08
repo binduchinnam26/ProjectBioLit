@@ -10,9 +10,63 @@ Three visualization modes (matching VOSviewer):
 Four network types: Co-authorship · Keyword Co-occurrence · Topic · Entity KG.
 """
 
+import logging
+import pickle
+
 import streamlit as st
 import config
 from ui.components.cards import empty_state
+
+logger = logging.getLogger(__name__)
+
+
+def _extract_relationships_lazy(papers_df, entities_df):
+    """
+    Run dep-parse relationship extraction on demand (first visit to Entity KG tab).
+    Updates session_state and patches the derived cache.
+    """
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    from pipeline.nlp_processor import NLPProcessor
+    from pipeline.knowledge_graph import KnowledgeGraph
+    from pathlib import Path
+    from utils.helpers import query_hash
+
+    query = st.session_state.get("current_query", "")
+
+    with st.spinner(
+        f"Extracting relationships from {len(papers_df):,} papers "
+        f"(dep parser — may take 3-6 min)…"
+    ):
+        try:
+            nlp_p = NLPProcessor(db_manager=None)
+            nlp_p.setup()
+            rels_df = nlp_p.extract_relationships_corpus(papers_df, entities_df)
+
+            # Rebuild KG with relationships
+            kg = KnowledgeGraph()
+            kg_graph = kg.build_from_entities(entities_df, rels_df)
+
+            st.session_state["relationships_df"] = rels_df
+            st.session_state["kg_graph"] = kg_graph
+            st.session_state["knowledge_graph"] = kg
+
+            # Patch derived cache
+            qh = query_hash(query) if query else "default"
+            derived_cache = Path(config.PROCESSED_DIR) / f"{qh}_derived.pkl"
+            if derived_cache.exists():
+                with open(derived_cache, "rb") as _f:
+                    _d = pickle.load(_f)
+                _d.update({"relationships_df": rels_df, "kg_graph": kg_graph})
+                with open(derived_cache, "wb") as _f:
+                    pickle.dump(_d, _f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            st.success(
+                f"Relationships extracted: {len(rels_df):,} edges added to knowledge graph."
+            )
+        except Exception as exc:
+            logger.error("Lazy relationship extraction failed: %s", exc)
+            st.error(f"Relationship extraction failed: {exc}")
 
 
 # ── Mode selector widget ──────────────────────────────────────────────────────
@@ -310,6 +364,21 @@ def render():
     # TAB 4 — Entity Knowledge Graph (NLP-derived)
     # ══════════════════════════════════════════════════════════════════════════
     with tab_entity:
+        # Lazy relationship extraction: runs dep-parse on demand the first time
+        # the user opens the Entity KG tab (relationships_df was deferred for speed).
+        if (rels_df is None or rels_df.empty) and st.session_state.get("pipeline_complete"):
+            papers_df_local = st.session_state.get("papers_df")
+            entities_df_local = st.session_state.get("entities_df")
+            if papers_df_local is not None and not papers_df_local.empty \
+                    and entities_df_local is not None and not entities_df_local.empty:
+                st.info(
+                    "Relationship edges not yet extracted (deferred from main pipeline for speed). "
+                    "Click below to run dependency-parse extraction now (~2-5 min)."
+                )
+                if st.button("Extract Relationships", type="primary", key="extract_rels_btn"):
+                    _extract_relationships_lazy(papers_df_local, entities_df_local)
+                    st.rerun()
+
         if kg_graph is None or kg_graph.number_of_nodes() == 0:
             st.info(
                 "Entity knowledge graph is empty. "

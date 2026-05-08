@@ -60,9 +60,11 @@ _UMLS_SEMTYPE_MAP: Dict[str, str] = {
 
 _NLP_BATCH_SIZE = config.NLP_BATCH_SIZE   # abstracts per nlp.pipe() batch
 
-# Components not needed for NER + dependency-based relationship extraction.
-# Disabling them shaves 30-50% off per-doc latency.
-_DISABLE_PIPES = ["tagger", "attribute_ruler", "lemmatizer"]
+# Components disabled for the fast NER-only pass.
+# parser is the slowest component (dep-parse is O(n) but with high constant);
+# disabling it drops per-doc time by 5-10x while keeping full entity extraction.
+# Relationship extraction (which needs dep arcs) is performed lazily on demand.
+_DISABLE_PIPES = ["tagger", "attribute_ruler", "lemmatizer", "parser"]
 
 
 class NLPProcessor:
@@ -270,19 +272,81 @@ class NLPProcessor:
 
     # ── Corpus processing (batch via nlp.pipe) ────────────────────────────────
 
+    def extract_relationships_corpus(
+        self,
+        papers_df: pd.DataFrame,
+        entities_df: pd.DataFrame,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> pd.DataFrame:
+        """
+        Lazy relationship extraction — runs the full pipeline WITH the dep parser.
+        Call only after process_corpus() has already extracted entities.
+        Returns relationships_df.
+        """
+        self._check_ready()
+        if papers_df.empty or entities_df.empty:
+            return pd.DataFrame(
+                columns=["pmid", "subject_entity", "relationship_verb",
+                         "object_entity", "sentence_context"]
+            )
+
+        pmids = papers_df["pmid"].tolist()
+        texts = [
+            _safe_text(row.get("abstract")) or _safe_text(row.get("title")) or ""
+            for _, row in papers_df.iterrows()
+        ]
+        # Build per-pmid entity lookup
+        ent_by_pmid: dict = {}
+        for _, row in entities_df.iterrows():
+            ent_by_pmid.setdefault(row["pmid"], []).append(
+                (row["entity_text"], row["entity_type"], row.get("umls_id"), row.get("sentence_context", ""))
+            )
+
+        all_rels: List[dict] = []
+        t0 = time.monotonic()
+        # Run WITH parser (don't disable it here)
+        for i, (pmid, doc) in enumerate(
+            zip(pmids, self.nlp.pipe(texts, batch_size=_NLP_BATCH_SIZE, n_process=1))
+        ):
+            entities = ent_by_pmid.get(pmid, [])
+            try:
+                rels = self._extract_relationships_from_doc(doc, entities)
+            except Exception:
+                rels = []
+            for subj, verb, obj, ctx in rels:
+                all_rels.append({
+                    "pmid": pmid, "subject_entity": subj,
+                    "relationship_verb": verb, "object_entity": obj,
+                    "sentence_context": ctx,
+                })
+            if progress_callback and (i + 1) % 200 == 0:
+                progress_callback(len(all_rels), i + 1,
+                    f"Relationships: {i + 1}/{len(pmids)} papers | {len(all_rels):,} rels "
+                    f"({time.monotonic() - t0:.0f}s)")
+            if (i + 1) % 500 == 0:
+                gc.collect()
+
+        gc.collect()
+        return pd.DataFrame(all_rels) if all_rels else pd.DataFrame(
+            columns=["pmid", "subject_entity", "relationship_verb",
+                     "object_entity", "sentence_context"]
+        )
+
     def process_corpus(
         self,
         papers_df: pd.DataFrame,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Apply entity and relationship extraction to all paper abstracts using
-        nlp.pipe() for batch throughput (~4x faster than per-abstract calls).
+        Fast entity extraction using nlp.pipe() with dep parser DISABLED.
+        The parser is the slowest spaCy component (5-10x overhead); disabling
+        it cuts per-doc time dramatically while keeping full NER accuracy.
 
-        Papers with missing abstracts use the title as fallback; papers with
-        neither are skipped for NLP but NOT removed from the database.
+        Relationship extraction is done separately via extract_relationships_corpus()
+        which re-enables the parser and runs lazily on demand.
 
-        Returns (entities_df, relationships_df).
+        Papers with missing abstracts use the title as fallback.
+        Returns (entities_df, relationships_df) where relationships_df is always empty.
         """
         self._check_ready()
 
@@ -302,10 +366,9 @@ class NLPProcessor:
 
         total = len(texts)
         all_entities: List[Dict[str, Any]] = []
-        all_relationships: List[Dict[str, Any]] = []
 
-        # Disable pipeline components not needed for NER + dependency parsing.
-        # tagger/attribute_ruler/lemmatizer add 30-50% overhead with no benefit.
+        # Disable parser + other unused components for NER-only pass.
+        # The dep parser is the slowest spaCy component and not needed here.
         disable = [p for p in _DISABLE_PIPES if p in self.nlp.pipe_names]
 
         t0 = time.monotonic()
@@ -326,12 +389,6 @@ class NLPProcessor:
                     logger.error("Entity extraction failed PMID %s: %s", pmid, exc)
                     entities = []
 
-                try:
-                    rels = self._extract_relationships_from_doc(doc, entities)
-                except Exception as exc:
-                    logger.error("Rel extraction failed PMID %s: %s", pmid, exc)
-                    rels = []
-
                 for ent_text, ent_type, umls_id, sent_ctx in entities:
                     all_entities.append({
                         "pmid": pmid,
@@ -341,24 +398,12 @@ class NLPProcessor:
                         "sentence_context": sent_ctx,
                     })
 
-                for subj, verb, obj, sent_ctx in rels:
-                    all_relationships.append({
-                        "pmid": pmid,
-                        "subject_entity": subj,
-                        "relationship_verb": verb,
-                        "object_entity": obj,
-                        "sentence_context": sent_ctx,
-                    })
-
-                # Progress every 200 docs; gc every 500 to cap RAM
                 if (i + 1) % 200 == 0:
                     elapsed = time.monotonic() - t0
                     _cb(
-                        len(all_entities),
-                        len(all_relationships),
-                        f"NLP: {i + 1}/{total} papers | "
-                        f"{len(all_entities):,} entities | {len(all_relationships):,} rels "
-                        f"({elapsed:.0f}s)",
+                        len(all_entities), 0,
+                        f"NLP (entities): {i + 1}/{total} papers | "
+                        f"{len(all_entities):,} entities ({elapsed:.0f}s)",
                     )
                 if (i + 1) % 500 == 0:
                     gc.collect()
@@ -367,19 +412,12 @@ class NLPProcessor:
             logger.error("nlp.pipe() failed: %s — falling back to single-doc mode", exc)
             for pmid, text in zip(pmids, texts):
                 try:
-                    doc = self.nlp(_safe_text(text)[:100_000])
-                    entities = self._extract_from_doc(doc)
-                    rels = self._extract_relationships_from_doc(doc, entities)
-                    for ent_text, ent_type, umls_id, sent_ctx in entities:
+                    with self.nlp.select_pipes(disable=disable):
+                        doc = self.nlp(_safe_text(text)[:100_000])
+                    for ent_text, ent_type, umls_id, sent_ctx in self._extract_from_doc(doc):
                         all_entities.append({
                             "pmid": pmid, "entity_text": ent_text,
                             "entity_type": ent_type, "umls_id": umls_id,
-                            "sentence_context": sent_ctx,
-                        })
-                    for subj, verb, obj, sent_ctx in rels:
-                        all_relationships.append({
-                            "pmid": pmid, "subject_entity": subj,
-                            "relationship_verb": verb, "object_entity": obj,
                             "sentence_context": sent_ctx,
                         })
                 except Exception:
@@ -387,35 +425,21 @@ class NLPProcessor:
 
         gc.collect()
 
-        # Batch-persist to database (single transaction — much faster)
-        entity_id_map: Dict = {}
-        if self.db and all_entities:
-            try:
-                entity_id_map = self.db.insert_entities_batch(all_entities)
-            except Exception as exc:
-                logger.error("Batch entity insert failed: %s", exc)
-
-        if self.db and all_relationships and entity_id_map:
-            try:
-                self.db.insert_relationships_batch(all_relationships, entity_id_map)
-            except Exception as exc:
-                logger.error("Batch relationship insert failed: %s", exc)
-
         _cb(
-            len(all_entities),
-            len(all_relationships),
-            f"NLP complete: {len(all_entities):,} entities, {len(all_relationships):,} relationships",
+            len(all_entities), 0,
+            f"NLP complete: {len(all_entities):,} entities extracted "
+            f"(relationships extracted lazily on demand)",
         )
         logger.info(
-            "process_corpus done: %d entities, %d relationships across %d papers",
-            len(all_entities), len(all_relationships), total,
+            "process_corpus done: %d entities across %d papers (dep-parse deferred)",
+            len(all_entities), total,
         )
 
         entities_df = pd.DataFrame(all_entities) if all_entities else pd.DataFrame(
             columns=["pmid", "entity_text", "entity_type", "umls_id", "sentence_context"]
         )
-        relationships_df = pd.DataFrame(all_relationships) if all_relationships else pd.DataFrame(
+        # Relationships are always empty here — use extract_relationships_corpus() lazily
+        relationships_df = pd.DataFrame(
             columns=["pmid", "subject_entity", "relationship_verb", "object_entity", "sentence_context"]
         )
-
         return entities_df, relationships_df
