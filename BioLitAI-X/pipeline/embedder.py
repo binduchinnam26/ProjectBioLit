@@ -51,6 +51,13 @@ class EmbeddingEngine:
 
     def setup(self):
         """Load sentence-transformer model and initialise FAISS index."""
+        import warnings
+        # Suppress HF Hub authentication advisory (noise, not an error)
+        warnings.filterwarnings("ignore", message=".*unauthenticated requests.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=".*HF_TOKEN.*")
+        # Suppress transformers internal path warning
+        warnings.filterwarnings("ignore", message=".*Accessing.*__path__.*", category=UserWarning)
+
         from sentence_transformers import SentenceTransformer
         import faiss
 
@@ -149,9 +156,9 @@ class EmbeddingEngine:
         self._pmid_list.extend(pmids)
 
         if self._persist_index:
-            self._save_index(query)
+            self._save_index(query, embeddings)
         else:
-            logger.info("embed_corpus: skipping FAISS index save (low disk mode)")
+            logger.info("embed_corpus: skipping index/embedding save (low disk mode)")
         _cb(total, total, f"Embeddings complete: {total} vectors stored.")
         logger.info("embed_corpus done: %d vectors", total)
         return embeddings
@@ -164,13 +171,21 @@ class EmbeddingEngine:
         base = Path(config.EMBEDDINGS_DIR) / qh
         return base.with_suffix(".faiss"), base.with_suffix(".json")
 
-    def _save_index(self, query: str):
+    def _embeddings_path(self, query: str) -> Path:
+        """Return path for the numpy embeddings cache file."""
+        qh = query_hash(query) if query else "default"
+        return Path(config.EMBEDDINGS_DIR) / f"{qh}.npy"
+
+    def _save_index(self, query: str, embeddings: np.ndarray):
+        """Save FAISS index, PMID map, and raw embeddings array to disk."""
         import faiss
         faiss_path, map_path = self._index_paths(query)
+        emb_path = self._embeddings_path(query)
         try:
             faiss.write_index(self.index, str(faiss_path))
             map_path.write_text(json.dumps(self._pmid_list), encoding="utf-8")
-            logger.info("FAISS index saved to %s", faiss_path)
+            np.save(str(emb_path), embeddings)
+            logger.info("FAISS index + embeddings saved to %s", faiss_path)
         except OSError as exc:
             logger.error("Failed to save FAISS index (disk full?): %s", exc)
         except Exception as exc:
@@ -198,9 +213,24 @@ class EmbeddingEngine:
             logger.error("Failed to load FAISS index: %s", exc)
             return False
 
+    def load_embeddings(self, query: str) -> Optional[np.ndarray]:
+        """Load the cached numpy embeddings array for *query*. Returns None on miss."""
+        emb_path = self._embeddings_path(query)
+        if not emb_path.exists():
+            return None
+        try:
+            arr = np.load(str(emb_path))
+            logger.info("Loaded embeddings array (%d vectors) from %s", len(arr), emb_path)
+            return arr
+        except Exception as exc:
+            logger.error("Failed to load embeddings array: %s", exc)
+            return None
+
     def index_exists(self, query: str) -> bool:
+        """True only if FAISS index, PMID map, AND numpy array are all present."""
         faiss_path, map_path = self._index_paths(query)
-        return faiss_path.exists() and map_path.exists()
+        emb_path = self._embeddings_path(query)
+        return faiss_path.exists() and map_path.exists() and emb_path.exists()
 
     # ── Semantic search ───────────────────────────────────────────────────────
 

@@ -79,7 +79,12 @@ class NLPProcessor:
 
     def setup(self):
         """Load SciSpaCy model and UMLS entity linker."""
+        import warnings
         import spacy
+        # spaCy 3.x emits a FutureWarning about tokenizer set union during model load;
+        # it's an upstream issue in spaCy, not actionable from user code.
+        warnings.filterwarnings("ignore", category=FutureWarning, module="spacy")
+        warnings.filterwarnings("ignore", message=".*Possible set union.*", category=FutureWarning)
 
         logger.info("Loading SciSpaCy model: %s", config.SCISPACY_MODEL)
         try:
