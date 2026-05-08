@@ -33,13 +33,13 @@ def _free_mb() -> int:
 
 def _auto_cleanup_disk() -> int:
     """
-    Delete old parquet caches, FAISS indexes, and compact the SQLite WAL file
-    to reclaim disk space.  Returns MB freed (approximate).
+    Delete old parquet caches, FAISS indexes, derived pickles and compact
+    the SQLite WAL file to reclaim disk space. Returns MB freed (approximate).
     Safe to call at any time — only removes re-generatable cache files.
     """
     import sqlite3 as _sqlite3
     freed = 0
-    for pattern in ("*.parquet",):
+    for pattern in ("*.parquet", "*_derived.pkl"):
         for p in Path(config.PROCESSED_DIR).glob(pattern):
             try:
                 freed += p.stat().st_size
@@ -236,6 +236,32 @@ def render():
 
 # ── Pipeline orchestrator ─────────────────────────────────────────────────────
 
+def _load_papers_parquet(cache_path: Path) -> pd.DataFrame:
+    """Load papers from parquet cache and restore list columns."""
+    import json as _json
+    df = pd.read_parquet(cache_path)
+    for col in ("authors", "author_keywords", "mesh_terms",
+                "chemicals", "publication_types", "grants"):
+        if col in df.columns:
+            df[col] = df[col].apply(
+                lambda v: _json.loads(v) if isinstance(v, str) else (v if isinstance(v, list) else [])
+            )
+    return df
+
+
+def _save_papers_parquet(papers_df: pd.DataFrame, cache_path: Path):
+    """Save papers_df to parquet, serialising list columns as JSON strings."""
+    import json as _json
+    cache_df = papers_df.copy()
+    for col in ("authors", "author_keywords", "mesh_terms",
+                "chemicals", "publication_types", "grants"):
+        if col in cache_df.columns:
+            cache_df[col] = cache_df[col].apply(
+                lambda v: _json.dumps(v) if not isinstance(v, str) else v
+            )
+    cache_df.to_parquet(cache_path, index=False)
+
+
 def _run_pipeline(
     query: str,
     max_results: int,
@@ -243,40 +269,38 @@ def _run_pipeline(
     year_max: int,
     force_rerun: bool = False,
 ):
-    """Execute the full 6-step pipeline with live progress and parquet caching."""
+    """
+    Execute the full pipeline with two modes:
+
+    FAST PATH  — all caches present and force_rerun=False:
+        Loads papers (parquet) + derived results (pickle) + embeddings (npy/faiss).
+        Skips all heavy compute. Typically completes in 10–30 seconds.
+
+    SLOW PATH  — first run or force_rerun=True:
+        Runs full pipeline (fetch → NLP → embed → topics → graphs).
+        Saves all results to cache at the end so next run is instant.
+    """
+    import pickle
     import sys, os
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
     from database.db_manager import DatabaseManager
-    from pipeline.retrieval import PubMedRetriever
-    from pipeline.parser import XMLParser
-    from pipeline.cleaner import DataCleaner
     from pipeline.network_builder import NetworkBuilder
     from pipeline.knowledge_graph import KnowledgeGraph
 
-    # ── Disk space pre-check + auto-cleanup ──────────────────────────────────
+    # ── Disk space pre-check ──────────────────────────────────────────────────
     free_mb = _free_mb()
     if free_mb < _DISK_WARN_MB:
         freed_mb = _auto_cleanup_disk()
-        free_mb  = _free_mb()   # re-measure after cleanup
+        free_mb  = _free_mb()
         if freed_mb > 0:
             st.info(f"🧹 Auto-cleaned {freed_mb} MB of old cache files. {free_mb} MB now free.")
-
     low_disk = free_mb < _DISK_WARN_MB
     no_disk  = free_mb < _DISK_MIN_MB
-
     if no_disk:
-        st.error(
-            f"❌ Critical: only {free_mb} MB free on disk after cleanup. "
-            "The pipeline will run in memory-only mode — results will NOT be saved. "
-            "Please free at least 500 MB on your drive before running again."
-        )
+        st.error(f"❌ Critical: only {free_mb} MB free. Pipeline runs in memory-only mode.")
     elif low_disk:
-        st.warning(
-            f"⚠️ Low disk space: {free_mb} MB free. "
-            "Parquet cache and FAISS index will be skipped. "
-            "Free more drive space for full persistence between sessions."
-        )
+        st.warning(f"⚠️ Low disk: {free_mb} MB. Cache writes skipped.")
 
     db = DatabaseManager(config.DB_PATH)
     session_id = db.save_query_session(query, max_results)
@@ -284,22 +308,18 @@ def _run_pipeline(
 
     step_container = st.empty()
     stats_container = st.empty()
-    status_msg = st.empty()
-    pipeline_start = time.monotonic()
-    # Persistent counter state — only updated when caller passes a non-None value
-    _live: dict = {"papers": 0, "ents": 0, "rels": 0}
+    status_msg      = st.empty()
+    pipeline_start  = time.monotonic()
+    _live: dict     = {"papers": 0, "ents": 0, "rels": 0}
 
     def _elapsed() -> str:
         secs = int(time.monotonic() - pipeline_start)
         return f"{secs // 60}m {secs % 60}s" if secs >= 60 else f"{secs}s"
 
     def _update(step: int, msg: str, papers: int = None, ents: int = None, rels: int = None):
-        if papers is not None:
-            _live["papers"] = papers
-        if ents is not None:
-            _live["ents"] = ents
-        if rels is not None:
-            _live["rels"] = rels
+        if papers is not None: _live["papers"] = papers
+        if ents   is not None: _live["ents"]   = ents
+        if rels   is not None: _live["rels"]   = rels
         with step_container.container():
             pipeline_status_indicator(step, 6, msg)
         with stats_container.container():
@@ -310,22 +330,78 @@ def _run_pipeline(
             unsafe_allow_html=True,
         )
 
-    # ── Parquet cache ─────────────────────────────────────────────────────────
-    qhash = query_hash(query)
-    cache_path = Path(config.PROCESSED_DIR) / f"{qhash}.parquet"
-    papers_df = pd.DataFrame()
-
-    if cache_path.exists() and not force_rerun:
-        try:
-            papers_df = pd.read_parquet(cache_path)
-            _update(3, f"Loaded {len(papers_df):,} papers from cache.", papers=len(papers_df))
-            logger.info("Loaded %d papers from parquet cache: %s", len(papers_df), cache_path)
-        except Exception as exc:
-            logger.warning("Cache load failed (%s); re-running pipeline.", exc)
-            papers_df = pd.DataFrame()
+    qhash           = query_hash(query)
+    papers_cache    = Path(config.PROCESSED_DIR) / f"{qhash}.parquet"
+    derived_cache   = Path(config.PROCESSED_DIR) / f"{qhash}_derived.pkl"
+    use_full_cache  = (
+        papers_cache.exists() and derived_cache.exists() and not force_rerun
+    )
 
     try:
-        if papers_df.empty:
+        # ══════════════════════════════════════════════════════════════════════
+        # FAST PATH — load everything from disk, skip all heavy compute
+        # ══════════════════════════════════════════════════════════════════════
+        if use_full_cache:
+            _update(1, "Loading papers from cache...")
+            papers_df = _load_papers_parquet(papers_cache)
+            _update(2, f"Loading derived results for {len(papers_df):,} papers...",
+                    papers=len(papers_df))
+
+            with open(derived_cache, "rb") as _f:
+                _d = pickle.load(_f)
+
+            entities_df      = _d.get("entities_df",      pd.DataFrame())
+            relationships_df = _d.get("relationships_df", pd.DataFrame())
+            coauth_graph     = _d.get("coauth_graph")
+            keyword_graph    = _d.get("keyword_graph")
+            kg_graph         = _d.get("kg_graph")
+            topic_graph      = _d.get("topic_graph")
+            coauth_stats     = _d.get("coauth_stats",     {})
+            keyword_stats    = _d.get("keyword_stats",    {})
+            doc_topics_df    = _d.get("doc_topics_df",    pd.DataFrame())
+            topic_labels     = _d.get("topic_labels",     {})
+            topics_over_time = _d.get("topics_over_time", pd.DataFrame())
+            del _d
+
+            _update(3, "Loading embeddings from cache...",
+                    papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
+
+            embedder = None
+            embeddings_array = None
+            try:
+                from pipeline.embedder import EmbeddingEngine
+                embedder = EmbeddingEngine(persist_index=not low_disk)
+                embedder.setup()
+                if embedder.index_exists(query):
+                    embedder.load_index(query)
+                    embeddings_array = embedder.load_embeddings(query)
+            except Exception as exc:
+                logger.warning("Embedding load skipped: %s", exc)
+
+            # Rebuild KnowledgeGraph wrapper around the cached NetworkX graph
+            kg = KnowledgeGraph()
+            if kg_graph is not None:
+                kg.graph = kg_graph
+
+            db.update_query_session(session_id, papers_fetched=len(papers_df),
+                                    pipeline_status="complete")
+            total_elapsed = _elapsed()
+            _update(6, f"Loaded from cache in {total_elapsed}!",
+                    papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
+            st.success(
+                f"⚡ Loaded from cache in {total_elapsed}! "
+                f"{len(papers_df):,} papers, {len(entities_df):,} entities. "
+                f"Use the sidebar to explore results."
+            )
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SLOW PATH — full pipeline; caches saved at end for instant future loads
+        # ══════════════════════════════════════════════════════════════════════
+        else:
+            from pipeline.retrieval import PubMedRetriever
+            from pipeline.parser import XMLParser
+            from pipeline.cleaner import DataCleaner
+
             # Step 1: Fetch
             _update(1, "Fetching papers from PubMed...")
             retriever = PubMedRetriever()
@@ -340,184 +416,150 @@ def _run_pipeline(
             raw_papers = []
             for xml_batch in xml_batches:
                 raw_papers.extend(parser.parse_batch(xml_batch, query_used=query))
-            del xml_batches  # free XML strings — no longer needed
+            del xml_batches
             _update(2, f"Parsed {len(raw_papers):,} records.", papers=len(raw_papers))
 
-            # Step 3: Clean
-            n_raw = len(raw_papers)
-            _update(3, f"Cleaning and normalising {n_raw:,} papers — please wait...")
+            # Step 3: Clean + year filter
+            _update(3, f"Cleaning {len(raw_papers):,} papers...")
             cleaner = DataCleaner()
             papers_df = cleaner.run_full_pipeline(raw_papers)
-            del raw_papers   # free raw dicts — DataFrame is the working copy now
-
-            # Apply year filter
+            del raw_papers
             if "pub_year" in papers_df.columns:
-                before = len(papers_df)
                 papers_df = papers_df[
                     papers_df["pub_year"].fillna(0).astype(int).between(year_min, year_max)
                     | papers_df["pub_year"].isna()
                 ].reset_index(drop=True)
-                filtered_out = before - len(papers_df)
-                if filtered_out:
-                    logger.info(
-                        "Year filter removed %d papers outside %d–%d",
-                        filtered_out, year_min, year_max,
-                    )
+            _update(3, f"Cleaning complete: {len(papers_df):,} papers.", papers=len(papers_df))
 
-            # Persist to parquet cache (skipped when disk is low)
+            # Save papers to parquet
             if not low_disk:
                 try:
-                    import json as _json
-                    cache_df = papers_df.copy()
-                    for col in ("authors", "author_keywords", "mesh_terms",
-                                "chemicals", "publication_types", "grants"):
-                        if col in cache_df.columns:
-                            cache_df[col] = cache_df[col].apply(
-                                lambda v: _json.dumps(v) if not isinstance(v, str) else v
-                            )
-                    cache_df.to_parquet(cache_path, index=False)
-                    logger.info("Parquet cache saved: %s", cache_path)
-                except OSError as exc:
-                    logger.warning("Parquet cache save failed (disk full?): %s", exc)
-                    st.warning(f"Cache not saved: {exc}")
+                    _save_papers_parquet(papers_df, papers_cache)
                 except Exception as exc:
                     logger.warning("Parquet cache save failed: %s", exc)
 
-            _update(3, f"Cleaning complete. {len(papers_df):,} papers retained.",
-                    papers=len(papers_df))
-        else:
-            # Restore list columns serialised as JSON strings in the cache
-            import json as _json
-            for col in ("authors", "author_keywords", "mesh_terms",
-                        "chemicals", "publication_types", "grants"):
-                if col in papers_df.columns:
-                    def _try_parse(v):
-                        if isinstance(v, str):
-                            try:
-                                return _json.loads(v)
-                            except Exception:
-                                return []
-                        return v if isinstance(v, list) else []
-                    papers_df[col] = papers_df[col].apply(_try_parse)
+            # DB writes (only on fresh data)
+            if not no_disk:
+                _update(3, f"Storing {len(papers_df):,} papers to database...",
+                        papers=len(papers_df))
+                try:
+                    db.insert_papers_batch(papers_df.to_dict("records"))
+                    db.insert_paper_metadata_batch(papers_df.to_dict("records"))
+                except Exception as exc:
+                    logger.warning("DB batch insert failed: %s", exc)
 
-        # Store papers + all relational metadata to database (single transaction each)
-        if no_disk:
-            st.warning("Disk full — skipping database writes. Results are in memory only.")
-        else:
-            _update(3, f"Storing {len(papers_df):,} papers to database...", papers=len(papers_df))
+            # Step 4: NLP
+            _update(4, "Running NLP entity extraction...")
+            entities_df = pd.DataFrame()
+            relationships_df = pd.DataFrame()
             try:
-                db.insert_papers_batch(papers_df.to_dict("records"))
-            except OSError as exc:
-                logger.error("Paper batch insert failed (disk full): %s", exc)
-                st.error(f"Database write failed — disk is full ({_free_mb()} MB free). Free space and retry.")
-            except Exception as exc:
-                logger.warning("Batch paper insert failed: %s", exc)
-
-            _update(3, "Indexing authors, keywords, MeSH terms...", papers=len(papers_df))
-            try:
-                db.insert_paper_metadata_batch(papers_df.to_dict("records"))
-            except OSError as exc:
-                logger.error("Metadata batch insert failed (disk full): %s", exc)
-                st.error(f"Metadata write failed — disk is full ({_free_mb()} MB free).")
-            except Exception as exc:
-                logger.warning("Batch metadata insert failed: %s", exc)
-
-        # Step 4: NLP (optional — skip if scispacy not installed)
-        _update(4, "Running NLP entity extraction...")
-        entities_df = pd.DataFrame()
-        relationships_df = pd.DataFrame()
-        try:
-            from pipeline.nlp_processor import NLPProcessor
-            nlp = NLPProcessor(db_manager=db)
-            nlp.setup()
-            entities_df, relationships_df = nlp.process_corpus(
-                papers_df,
-                progress_callback=lambda ents, rels, m: _update(4, m, papers=len(papers_df),
-                                                               ents=ents, rels=rels),
-            )
-        except Exception as exc:
-            logger.warning("NLP step skipped (%s). Knowledge graph will be limited.", exc)
-            st.warning(f"NLP processing skipped: {exc}. Knowledge graph will have limited data.")
-
-        _update(4, f"NLP done: {len(entities_df):,} entities, {len(relationships_df):,} relationships.",
-                papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
-
-        # Step 5: Embeddings (optional)
-        # On re-runs of the same query the encoded numpy array is loaded from
-        # disk — this avoids the ~8-minute re-encode and brings re-run time to
-        # under 30 seconds for the embedding step.
-        _update(5, "Building semantic embeddings...")
-        embeddings_array = None
-        embedder = None
-        try:
-            from pipeline.embedder import EmbeddingEngine
-            embedder = EmbeddingEngine(persist_index=not low_disk)
-            embedder.setup()
-
-            if not force_rerun and embedder.index_exists(query):
-                # Cache hit: load FAISS index + numpy array from disk
-                if embedder.load_index(query):
-                    embeddings_array = embedder.load_embeddings(query)
-                    _update(5,
-                            f"Loaded {len(embeddings_array) if embeddings_array is not None else 0:,} "
-                            f"cached embeddings from disk (skipped re-encode).",
-                            papers=len(papers_df), ents=len(entities_df))
-                    logger.info("Embedding cache hit for query %r", query)
-
-            if embeddings_array is None:
-                # Cache miss or force rerun: encode the full corpus
-                embeddings_array = embedder.embed_corpus(
-                    papers_df, query=query,
-                    progress_callback=lambda d, t, m: _update(5, m, papers=len(papers_df),
-                                                               ents=len(entities_df)),
+                from pipeline.nlp_processor import NLPProcessor
+                nlp = NLPProcessor(db_manager=db)
+                nlp.setup()
+                entities_df, relationships_df = nlp.process_corpus(
+                    papers_df,
+                    progress_callback=lambda ents, rels, m: _update(
+                        4, m, papers=len(papers_df), ents=ents, rels=rels),
                 )
-        except Exception as exc:
-            logger.warning("Embedding step skipped: %s", exc)
-            st.warning(f"Embedding step skipped: {exc}. Semantic search will be unavailable.")
+            except Exception as exc:
+                logger.warning("NLP skipped: %s", exc)
+                st.warning(f"NLP skipped: {exc}. Knowledge graph will be limited.")
+            _update(4, f"NLP done: {len(entities_df):,} entities.",
+                    papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
 
-        # Step 6: Networks and knowledge graph
-        _update(6, "Building bibliometric networks and knowledge graph...")
-        nb = NetworkBuilder()
-        coauth_graph_full  = nb.build_coauthorship_network(papers_df)
-        keyword_graph_full = nb.build_keyword_cooccurrence_network(papers_df)
-        coauth_stats  = nb.calculate_network_statistics(coauth_graph_full)
-        keyword_stats = nb.calculate_network_statistics(keyword_graph_full)
-        # Thin graphs to render limit before handing to browser
-        coauth_graph  = nb.prepare_graph_for_display(coauth_graph_full)
-        keyword_graph = nb.prepare_graph_for_display(keyword_graph_full)
-        del coauth_graph_full, keyword_graph_full
-        gc.collect()
+            # Step 5: Embeddings
+            _update(5, "Building semantic embeddings...")
+            embeddings_array = None
+            embedder = None
+            try:
+                from pipeline.embedder import EmbeddingEngine
+                embedder = EmbeddingEngine(persist_index=not low_disk)
+                embedder.setup()
+                if not force_rerun and embedder.index_exists(query):
+                    embedder.load_index(query)
+                    embeddings_array = embedder.load_embeddings(query)
+                    _update(5, f"Embeddings loaded from cache ({len(embeddings_array):,} vectors).",
+                            papers=len(papers_df), ents=len(entities_df))
+                if embeddings_array is None:
+                    embeddings_array = embedder.embed_corpus(
+                        papers_df, query=query,
+                        progress_callback=lambda d, t, m: _update(
+                            5, m, papers=len(papers_df), ents=len(entities_df)),
+                    )
+            except Exception as exc:
+                logger.warning("Embedding skipped: %s", exc)
+                st.warning(f"Embedding skipped: {exc}. Semantic search unavailable.")
 
-        kg = KnowledgeGraph()
-        kg_graph = kg.build_from_entities(entities_df, relationships_df)
+            # Step 6: Graphs + topics
+            _update(6, "Building bibliometric networks...")
+            nb = NetworkBuilder()
+            coauth_graph_full  = nb.build_coauthorship_network(papers_df)
+            keyword_graph_full = nb.build_keyword_cooccurrence_network(papers_df)
+            coauth_stats  = nb.calculate_network_statistics(coauth_graph_full)
+            keyword_stats = nb.calculate_network_statistics(keyword_graph_full)
+            coauth_graph  = nb.prepare_graph_for_display(coauth_graph_full)
+            keyword_graph = nb.prepare_graph_for_display(keyword_graph_full)
+            del coauth_graph_full, keyword_graph_full
+            gc.collect()
 
-        topic_graph = None
-        topic_labels = {}
-        topics_over_time = pd.DataFrame()
-        doc_topics_df = pd.DataFrame()
-        try:
-            from pipeline.topic_modeler import TopicModeler
-            tm = TopicModeler()
-            tm.setup(n_papers=len(papers_df))
-            abstracts = papers_df["abstract"].fillna("").tolist()
-            doc_topics, probs = tm.fit_transform(abstracts, embeddings_array)
-            topic_labels = tm.get_topic_labels()
-            topics_over_time = tm.get_topic_over_time(papers_df)
-            doc_topics_df = tm.get_document_topics(papers_df)
-            topic_graph = nb.build_topic_network({
-                "doc_topics": doc_topics,
-                "topic_labels": topic_labels,
-            })
-        except Exception as exc:
-            logger.warning("Topic modeling skipped: %s", exc)
+            kg = KnowledgeGraph()
+            kg_graph = kg.build_from_entities(entities_df, relationships_df)
 
-        db.update_query_session(
-            session_id,
-            papers_fetched=len(papers_df),
-            pipeline_status="complete",
-        )
+            topic_graph      = None
+            topic_labels     = {}
+            topics_over_time = pd.DataFrame()
+            doc_topics_df    = pd.DataFrame()
+            try:
+                from pipeline.topic_modeler import TopicModeler
+                tm = TopicModeler()
+                tm.setup(n_papers=len(papers_df))
+                abstracts = papers_df["abstract"].fillna("").tolist()
+                doc_topics, _ = tm.fit_transform(abstracts, embeddings_array)
+                topic_labels     = tm.get_topic_labels()
+                topics_over_time = tm.get_topic_over_time(papers_df)
+                doc_topics_df    = tm.get_document_topics(papers_df)
+                topic_graph      = nb.build_topic_network(
+                    {"doc_topics": doc_topics, "topic_labels": topic_labels}
+                )
+            except Exception as exc:
+                logger.warning("Topic modeling skipped: %s", exc)
 
-        # ── Save all results to session state ─────────────────────────────
+            # ── Save derived cache so next run is instant ──────────────────
+            if not no_disk and not low_disk:
+                _update(6, "Saving results to cache for instant future loads...",
+                        papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
+                try:
+                    _derived = {
+                        "entities_df":      entities_df,
+                        "relationships_df": relationships_df,
+                        "coauth_graph":     coauth_graph,
+                        "keyword_graph":    keyword_graph,
+                        "kg_graph":         kg_graph,
+                        "topic_graph":      topic_graph,
+                        "coauth_stats":     coauth_stats,
+                        "keyword_stats":    keyword_stats,
+                        "doc_topics_df":    doc_topics_df,
+                        "topic_labels":     topic_labels,
+                        "topics_over_time": topics_over_time,
+                    }
+                    with open(derived_cache, "wb") as _f:
+                        pickle.dump(_derived, _f, protocol=pickle.HIGHEST_PROTOCOL)
+                    logger.info("Derived cache saved: %s", derived_cache)
+                except Exception as exc:
+                    logger.warning("Derived cache save failed: %s", exc)
+
+            db.update_query_session(session_id, papers_fetched=len(papers_df),
+                                    pipeline_status="complete")
+            total_elapsed = _elapsed()
+            _update(7, f"Pipeline complete! ({total_elapsed})",
+                    papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
+            st.success(
+                f"✅ Pipeline complete in {total_elapsed}! {len(papers_df):,} papers analysed. "
+                f"Next run for this query will load from cache instantly. "
+                f"Use the sidebar to explore results."
+            )
+
+        # ── Save all results to session state (both paths) ────────────────────
         st.session_state.update({
             "pipeline_complete":   True,
             "current_query":       query,
@@ -539,24 +581,12 @@ def _run_pipeline(
             "embeddings_array":    embeddings_array,
             "db":                  db,
         })
-
-        # Track session in past_sessions list
         past = st.session_state.get("past_sessions", [])
         past.append({
-            "id": session_id,
-            "query_text": query,
-            "pipeline_status": "complete",
-            "papers_fetched": len(papers_df),
+            "id": session_id, "query_text": query,
+            "pipeline_status": "complete", "papers_fetched": len(papers_df),
         })
         st.session_state["past_sessions"] = past
-
-        total_elapsed = _elapsed()
-        _update(7, f"Pipeline complete! ({total_elapsed})", papers=len(papers_df),
-                ents=len(entities_df), rels=len(relationships_df))
-        st.success(
-            f"✅ Pipeline complete in {total_elapsed}! {len(papers_df):,} papers analysed. "
-            f"Use the sidebar to explore results."
-        )
 
     except Exception as exc:
         db.update_query_session(session_id, pipeline_status="error")
