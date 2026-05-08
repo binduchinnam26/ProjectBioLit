@@ -62,6 +62,18 @@ EMBEDDING_BATCH_SIZE = 256   # MiniLM is small (384-dim); 256 fills CPU cache ef
 # When False, NER still runs but entities keep the generic "ENTITY" label.
 USE_UMLS_LINKER = os.getenv("USE_UMLS_LINKER", "false").lower() == "true"
 
+# Number of abstracts passed to nlp.pipe() in one batch.
+# 256 is the sweet spot: large enough to amortise Python↔C overhead,
+# small enough to keep memory predictable.
+NLP_BATCH_SIZE = int(os.getenv("NLP_BATCH_SIZE", "256"))
+
+# Worker processes for nlp.pipe().
+# KEEP AT 1 ON WINDOWS — spaCy uses 'spawn' on Windows, which requires
+# pickling the model; the UMLS linker is not picklable and will raise errors.
+# On Linux / macOS (fork semantics) you can set this to -1 (all cores) or
+# a specific integer via the NLP_N_PROCESS env var.
+NLP_N_PROCESS = int(os.getenv("NLP_N_PROCESS", "1"))
+
 # Entity types extracted by SciSpaCy — covers all biomedical domains.
 # "ENTITY" is the generic label used by en_core_sci_lg; the NLP processor
 # reclassifies it using UMLS semantic types where available.

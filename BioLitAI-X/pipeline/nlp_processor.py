@@ -2,14 +2,25 @@
 NLPProcessor — SciSpaCy NER, UMLS entity linking, and dependency-based
 relationship extraction for any biomedical domain.
 
-Uses nlp.pipe() for batch processing (3-8x faster than per-abstract calls).
+Performance design
+──────────────────
+process_corpus() feeds all abstracts through nlp.pipe() in one batched call
+with the dep parser DISABLED (_DISABLE_PIPES) for a fast NER-only pass.
+This cuts per-doc time 5-10x; relationship extraction is deferred and runs
+lazily via extract_relationships_corpus() which re-enables the parser.
+
 All text fields are sanitized via _safe_text() before being passed to spaCy
-to prevent 'float object has no attribute strip' crashes on NaN abstracts.
+to prevent 'float has no attribute strip' crashes on NaN abstracts.
+
+Config knobs (config.py / .env):
+  NLP_BATCH_SIZE  — abstracts per pipe batch (default 256)
+  NLP_N_PROCESS   — worker processes (default 1; keep 1 on Windows)
 """
 
 import gc
 import logging
 import time
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -72,20 +83,21 @@ class NLPProcessor:
     Extracts biomedical entities and verb-based relationships from paper abstracts
     using SciSpaCy. Covers all biomedical domains universally.
 
-    process_corpus() uses nlp.pipe() for ~4x throughput vs per-abstract calls.
+    process_corpus() uses nlp.pipe() with the dep parser disabled for ~4x
+    throughput vs per-abstract calls. Relationship extraction runs lazily via
+    extract_relationships_corpus().
     """
 
     def __init__(self, db_manager: Optional[DatabaseManager] = None):
-        self.nlp = None
-        self.db = db_manager
+        self.nlp     = None
+        self.db      = db_manager
         self._linker = None
-        self._ready = False
+        self._ready  = False
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
     def setup(self):
-        """Load SciSpaCy model and UMLS entity linker."""
-        import warnings
+        """Load SciSpaCy model and optionally the UMLS entity linker."""
         import spacy
         # spaCy 3.x emits a FutureWarning about tokenizer set union during model load;
         # it's an upstream issue in spaCy, not actionable from user code.
@@ -112,7 +124,7 @@ class NLPProcessor:
         if config.USE_UMLS_LINKER:
             logger.info("Adding UMLS entity linker (USE_UMLS_LINKER=true)")
             try:
-                from scispacy.linking import EntityLinker  # noqa: F401 — registers the factory
+                from scispacy.linking import EntityLinker  # noqa: F401
                 self.nlp.add_pipe(
                     "scispacy_linker",
                     config={
@@ -125,7 +137,8 @@ class NLPProcessor:
                 )
             except Exception as exc:
                 logger.warning(
-                    "UMLS linker could not be loaded (%s). Proceeding without UMLS linking.", exc
+                    "UMLS linker could not be loaded (%s). "
+                    "Entity extraction will proceed without UMLS CUI linking.", exc,
                 )
             try:
                 self._linker = self.nlp.get_pipe("scispacy_linker")
@@ -138,13 +151,16 @@ class NLPProcessor:
             )
 
         self._ready = True
-        logger.info("NLPProcessor ready. Pipes: %s", self.nlp.pipe_names)
+        logger.info(
+            "NLPProcessor ready — pipes=%s  batch_size=%d  n_process=%d",
+            self.nlp.pipe_names, config.NLP_BATCH_SIZE, config.NLP_N_PROCESS,
+        )
 
     def _check_ready(self):
         if not self._ready or self.nlp is None:
             raise RuntimeError("NLPProcessor.setup() must be called before extraction.")
 
-    # ── Doc-level extraction (work on pre-computed spaCy Doc) ─────────────────
+    # ── Doc-level extraction (operate on an already-processed Doc) ────────────
 
     def _extract_from_doc(
         self, doc
@@ -194,6 +210,7 @@ class NLPProcessor:
     ) -> List[Tuple[str, str, str, str]]:
         """
         Extract verb-based relationships from a pre-computed spaCy Doc.
+        Requires the dep parser to be enabled (not used in the fast NER pass).
         Returns list of (subject_entity, relationship_verb, object_entity,
         sentence_context).
         """
@@ -209,27 +226,24 @@ class NLPProcessor:
                 if token.pos_ not in ("VERB", "AUX"):
                     continue
 
-                subj_toks = [
-                    c for c in token.children
-                    if c.dep_ in ("nsubj", "nsubjpass", "csubj")
-                ]
-                obj_toks = [
-                    c for c in token.children
-                    if c.dep_ in ("dobj", "pobj", "attr", "iobj", "nmod")
-                ]
+                subj_toks = [c for c in token.children
+                             if c.dep_ in ("nsubj", "nsubjpass", "csubj")]
+                obj_toks  = [c for c in token.children
+                             if c.dep_ in ("dobj", "pobj", "attr", "iobj", "nmod")]
 
                 for subj in subj_toks:
                     for obj in obj_toks:
                         subj_text = subj.text.strip()
-                        obj_text = obj.text.strip()
+                        obj_text  = obj.text.strip()
+
+                        subj_lower = subj_text.lower()
+                        obj_lower  = obj_text.lower()
 
                         subj_is_ent = any(
-                            subj_text.lower() in e.lower() or e.lower() in subj_text.lower()
-                            for e in entity_texts
+                            subj_lower in e or e in subj_lower for e in entity_texts
                         )
                         obj_is_ent = any(
-                            obj_text.lower() in e.lower() or e.lower() in obj_text.lower()
-                            for e in entity_texts
+                            obj_lower in e or e in obj_lower for e in entity_texts
                         )
 
                         if not (subj_is_ent and obj_is_ent):
@@ -349,11 +363,13 @@ class NLPProcessor:
         The parser is the slowest spaCy component (5-10x overhead); disabling
         it cuts per-doc time dramatically while keeping full NER accuracy.
 
-        Relationship extraction is done separately via extract_relationships_corpus()
-        which re-enables the parser and runs lazily on demand.
+        Supports NLP_N_PROCESS workers (config.py / .env). On Windows or when
+        the UMLS linker is loaded, n_process > 1 may fail; the fallback
+        automatically retries with n_process=1.
 
         Papers with missing abstracts use the title as fallback.
-        Returns (entities_df, relationships_df) where relationships_df is always empty.
+        Returns (entities_df, relationships_df) where relationships_df is always
+        empty — call extract_relationships_corpus() lazily for dep-parse rels.
         """
         self._check_ready()
 
@@ -366,71 +382,101 @@ class NLPProcessor:
 
         pmids = papers_df["pmid"].tolist()
         # Abstract with title fallback — vectorized pandas is 10-50x faster than iterrows
-        texts = (
-            papers_df["abstract"].fillna("").str.strip()
-            .where(papers_df["abstract"].fillna("").str.strip() != "",
-                   papers_df.get("title", pd.Series("", index=papers_df.index)).fillna("").str.strip())
-            .tolist()
-        )
+        abs_series = papers_df["abstract"].fillna("").str.strip()
+        title_series = papers_df.get(
+            "title", pd.Series("", index=papers_df.index)
+        ).fillna("").str.strip()
+        texts = abs_series.where(abs_series != "", title_series).tolist()
 
         total = len(texts)
         all_entities: List[Dict[str, Any]] = []
 
         # Disable parser + other unused components for NER-only pass.
-        # The dep parser is the slowest spaCy component and not needed here.
         disable = [p for p in _DISABLE_PIPES if p in self.nlp.pipe_names]
 
+        _cb(0, total,
+            f"Starting NLP pipeline on {total} abstracts "
+            f"(batch={config.NLP_BATCH_SIZE}, workers={config.NLP_N_PROCESS})…")
+
         t0 = time.monotonic()
-        try:
+
+        def _run_pipe(n_proc: int):
+            """Run nlp.pipe() and collect entities; returns list of entity dicts."""
+            collected: List[Dict[str, Any]] = []
             pipe_iter = self.nlp.pipe(
-                texts,
+                (t[:100_000] for t in texts),
                 batch_size=_NLP_BATCH_SIZE,
-                n_process=1,
+                n_process=n_proc,
                 disable=disable,
             )
             for i, (pmid, doc) in enumerate(zip(pmids, pipe_iter)):
                 if not doc.text.strip():
                     continue
-
                 try:
                     entities = self._extract_from_doc(doc)
                 except Exception as exc:
                     logger.error("Entity extraction failed PMID %s: %s", pmid, exc)
                     entities = []
-
                 for ent_text, ent_type, umls_id, sent_ctx in entities:
-                    all_entities.append({
+                    collected.append({
                         "pmid": pmid,
                         "entity_text": ent_text,
                         "entity_type": ent_type,
                         "umls_id": umls_id,
                         "sentence_context": sent_ctx,
                     })
-
                 if (i + 1) % 100 == 0 or (i + 1) == total:
                     elapsed = time.monotonic() - t0
                     rate = (i + 1) / elapsed if elapsed > 0 else 0
                     _cb(
-                        len(all_entities), 0,
+                        len(collected), 0,
                         f"NLP: {i + 1}/{total} papers | "
-                        f"{len(all_entities):,} entities | "
+                        f"{len(collected):,} entities | "
                         f"{rate:.0f} papers/s ({elapsed:.0f}s elapsed)",
                     )
+                if (i + 1) % 500 == 0:
+                    gc.collect()
+            return collected
 
+        try:
+            all_entities = _run_pipe(config.NLP_N_PROCESS)
         except Exception as exc:
-            logger.error("nlp.pipe() failed: %s — falling back to single-doc mode", exc)
-            for pmid, text in zip(pmids, texts):
+            # n_process > 1 fails on Windows / with UMLS linker (not picklable).
+            if config.NLP_N_PROCESS != 1:
+                logger.warning(
+                    "nlp.pipe() with n_process=%d failed (%s). Retrying with n_process=1.",
+                    config.NLP_N_PROCESS, exc,
+                )
                 try:
-                    with self.nlp.select_pipes(disable=disable):
-                        doc = self.nlp(_safe_text(text)[:100_000])
-                    for ent_text, ent_type, umls_id, sent_ctx in self._extract_from_doc(doc):
-                        all_entities.append({
-                            "pmid": pmid, "entity_text": ent_text,
-                            "entity_type": ent_type, "umls_id": umls_id,
-                            "sentence_context": sent_ctx,
-                        })
-                except Exception:
-                    pass
+                    all_entities = _run_pipe(1)
+                except Exception as exc2:
+                    logger.error("nlp.pipe() fallback also failed: %s — using single-doc mode", exc2)
+                    for pmid, text in zip(pmids, texts):
+                        try:
+                            with self.nlp.select_pipes(disable=disable):
+                                doc = self.nlp(_safe_text(text)[:100_000])
+                            for ent_text, ent_type, umls_id, sent_ctx in self._extract_from_doc(doc):
+                                all_entities.append({
+                                    "pmid": pmid, "entity_text": ent_text,
+                                    "entity_type": ent_type, "umls_id": umls_id,
+                                    "sentence_context": sent_ctx,
+                                })
+                        except Exception:
+                            pass
+            else:
+                logger.error("nlp.pipe() failed: %s — using single-doc fallback", exc)
+                for pmid, text in zip(pmids, texts):
+                    try:
+                        with self.nlp.select_pipes(disable=disable):
+                            doc = self.nlp(_safe_text(text)[:100_000])
+                        for ent_text, ent_type, umls_id, sent_ctx in self._extract_from_doc(doc):
+                            all_entities.append({
+                                "pmid": pmid, "entity_text": ent_text,
+                                "entity_type": ent_type, "umls_id": umls_id,
+                                "sentence_context": sent_ctx,
+                            })
+                    except Exception:
+                        pass
 
         gc.collect()
 
@@ -444,11 +490,57 @@ class NLPProcessor:
             len(all_entities), total,
         )
 
-        entities_df = pd.DataFrame(all_entities) if all_entities else pd.DataFrame(
-            columns=["pmid", "entity_text", "entity_type", "umls_id", "sentence_context"]
+        entities_df = (
+            pd.DataFrame(all_entities) if all_entities
+            else pd.DataFrame(columns=[
+                "pmid", "entity_text", "entity_type", "umls_id", "sentence_context"
+            ])
         )
         # Relationships are always empty here — use extract_relationships_corpus() lazily
         relationships_df = pd.DataFrame(
-            columns=["pmid", "subject_entity", "relationship_verb", "object_entity", "sentence_context"]
+            columns=["pmid", "subject_entity", "relationship_verb",
+                     "object_entity", "sentence_context"]
         )
         return entities_df, relationships_df
+
+    # ── Database persistence ──────────────────────────────────────────────────
+
+    def _persist_paper_results(
+        self,
+        pmid: str,
+        entities:      List[Tuple[str, str, Optional[str], str]],
+        relationships: List[Tuple[str, str, str, str]],
+    ):
+        """Write entities and relationships for one paper to the database."""
+        entity_id_cache: Dict[Tuple[str, str], int] = {}
+
+        for ent_text, ent_type, umls_id, sent_ctx in entities:
+            try:
+                key = (ent_text, ent_type)
+                if key not in entity_id_cache:
+                    eid = self.db.insert_entity(ent_text, ent_type, umls_id)
+                    entity_id_cache[key] = eid
+                self.db.link_paper_entity(pmid, entity_id_cache[key], sent_ctx)
+            except Exception as exc:
+                logger.error("DB persist entity failed (PMID %s): %s", pmid, exc)
+
+        for subj, verb, obj, sent_ctx in relationships:
+            try:
+                src_id = entity_id_cache.get((subj, None))
+                tgt_id = entity_id_cache.get((obj, None))
+                if src_id is None:
+                    for (txt, _), eid in entity_id_cache.items():
+                        if txt.lower() == subj.lower():
+                            src_id = eid
+                            break
+                if tgt_id is None:
+                    for (txt, _), eid in entity_id_cache.items():
+                        if txt.lower() == obj.lower():
+                            tgt_id = eid
+                            break
+                if src_id and tgt_id:
+                    self.db.insert_relationship(
+                        src_id, tgt_id, verb, pmid, confidence_score=0.5
+                    )
+            except Exception as exc:
+                logger.error("DB persist relationship failed (PMID %s): %s", pmid, exc)
