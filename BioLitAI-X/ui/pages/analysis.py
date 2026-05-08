@@ -1,10 +1,10 @@
-"""Analysis page — KPI metrics, publication trend, and three VOSviewer network sections."""
+"""Analysis page — KPI metrics, publication trend, and topic charts."""
 
 import logging
 
 import streamlit as st
 import config
-from ui.components.cards import empty_state, section_header
+from ui.components.cards import empty_state
 from ui.components.metrics import kpi_row
 
 logger = logging.getLogger(__name__)
@@ -66,14 +66,8 @@ def render():
                     "Run a search on the Home page to populate the analysis dashboard.")
         return
 
-    papers_df    = st.session_state.get("papers_df")
-    coauth_graph = st.session_state.get("coauth_graph")
-    keyword_graph = st.session_state.get("keyword_graph")
-    topic_graph  = st.session_state.get("topic_graph")
-    coauth_stats = st.session_state.get("coauth_stats", {})
-    keyword_stats = st.session_state.get("keyword_stats", {})
+    papers_df        = st.session_state.get("papers_df")
     topics_over_time = st.session_state.get("topics_over_time")
-    topic_labels = st.session_state.get("topic_labels", {})
 
     query = st.session_state.get("current_query", "")
     db_stats = {}
@@ -140,155 +134,21 @@ def render():
                     _build_topics_lazy(papers_df, embedder)
                     st.rerun()
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # SECTION 01 — Author Collaboration Network
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Network Explorer callout ──────────────────────────────────────────────
     st.markdown(
-        f"<hr style='border:2px solid {config.BORDER_COLOR};margin:2rem 0'>",
+        f"<hr style='border-color:{config.BORDER_COLOR};margin:1.5rem 0'>",
         unsafe_allow_html=True,
     )
-    section_header(
-        "01",
-        "Author Collaboration Network",
-        "Node size = publication count · Color = research cluster · "
-        "Edge thickness = collaboration strength",
-    )
-
-    if coauth_graph and coauth_graph.number_of_nodes() > 0:
-        from visualization.network_viz import (
-            render_coauthorship_network,
-            render_network_stats,
-            _build_controls_panel,
-        )
-        graph_col, stats_col = st.columns([4, 1])
-        with graph_col:
-            controls = _build_controls_panel("coauth")
-            render_coauthorship_network(coauth_graph, controls=controls, height=700)
-        with stats_col:
-            render_network_stats(coauth_stats, "Collaboration Stats")
-    else:
-        st.info("Co-authorship network not available. Run the pipeline first.")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # SECTION 02 — Keyword Co-occurrence Map
-    # ══════════════════════════════════════════════════════════════════════════
     st.markdown(
-        f"<hr style='border:2px solid {config.BORDER_COLOR};margin:2rem 0'>",
-        unsafe_allow_html=True,
-    )
-    section_header(
-        "02",
-        "Keyword Co-occurrence Map",
-        "Node size = frequency · Color = thematic cluster · "
-        "Shape = keyword type (●=author  ■=MeSH  ◆=chemical)",
-    )
-
-    # Keyword type shape legend
-    _kw_legend()
-
-    if keyword_graph and keyword_graph.number_of_nodes() > 0:
-        from visualization.network_viz import (
-            render_keyword_network,
-            render_network_stats,
-            _build_controls_panel,
-        )
-
-        # Extra keyword type filter
-        kw_types = list({
-            d.get("keyword_type", "author")
-            for _, d in keyword_graph.nodes(data=True)
-        })
-        selected_types = st.multiselect(
-            "Filter by keyword type",
-            options=kw_types,
-            default=kw_types,
-            key="kw_type_filter",
-        )
-
-        import networkx as nx
-        kw_filtered = keyword_graph.copy()
-        if selected_types:
-            remove = [
-                n for n, d in kw_filtered.nodes(data=True)
-                if d.get("keyword_type") not in selected_types
-            ]
-            kw_filtered.remove_nodes_from(remove)
-
-        graph_col2, stats_col2 = st.columns([4, 1])
-        with graph_col2:
-            controls2 = _build_controls_panel("keyword")
-            render_keyword_network(kw_filtered, controls=controls2, height=700)
-        with stats_col2:
-            render_network_stats(keyword_stats, "Keyword Stats")
-    else:
-        st.info("Keyword co-occurrence network not available.")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # SECTION 03 — Research Topic Landscape
-    # ══════════════════════════════════════════════════════════════════════════
-    st.markdown(
-        f"<hr style='border:2px solid {config.BORDER_COLOR};margin:2rem 0'>",
-        unsafe_allow_html=True,
-    )
-    section_header(
-        "03",
-        "Research Topic Landscape",
-        "Node size = paper count · Edge = shared papers between topics",
-    )
-
-    if topic_graph and topic_graph.number_of_nodes() > 0:
-        from visualization.network_viz import render_topic_network, _build_controls_panel
-
-        if papers_df is not None and "pub_year" in papers_df.columns:
-            years = sorted(papers_df["pub_year"].dropna().astype(int).unique())
-            if len(years) >= 2:
-                yr_min, yr_max = st.slider(
-                    "Filter by year",
-                    min_value=int(min(years)),
-                    max_value=int(max(years)),
-                    value=(int(min(years)), int(max(years))),
-                    key="topic_year_slider",
-                )
-            else:
-                yr_min, yr_max = None, None
-        else:
-            yr_min, yr_max = None, None
-
-        controls3 = _build_controls_panel("topic")
-        render_topic_network(topic_graph, controls=controls3, height=700,
-                             year_range=(yr_min, yr_max))
-
-        # Topic summary chips
-        if topic_labels:
-            st.markdown(
-                f"<div style='font-size:12px;color:{config.TEXT_SECONDARY};"
-                f"font-weight:600;margin-top:10px'>Topics discovered:</div>",
-                unsafe_allow_html=True,
-            )
-            chips = " ".join(
-                f"<span style='display:inline-block;background:{config.COMMUNITY_COLORS[i%10]}22;"
-                f"border:1px solid {config.COMMUNITY_COLORS[i%10]}55;"
-                f"color:{config.COMMUNITY_COLORS[i%10]};border-radius:20px;padding:2px 10px;"
-                f"font-size:11px;margin:2px'>{v['label']} ({v['count']})</span>"
-                for i, (tid, v) in enumerate(sorted(topic_labels.items(), key=lambda x: x[1]['count'], reverse=True)[:12])
-            )
-            st.markdown(chips, unsafe_allow_html=True)
-    else:
-        st.info(
-            "Topic landscape not available. Topic modeling requires NLP and embedding steps to complete."
-        )
-
-
-def _kw_legend():
-    st.markdown(
-        f"""
-        <div style='display:flex;gap:16px;font-size:12px;color:{config.TEXT_SECONDARY};
-                    margin-bottom:8px;flex-wrap:wrap'>
-          <span>● Author keyword</span>
-          <span>■ MeSH Descriptor</span>
-          <span>◆ Chemical term</span>
-          <span>▲ MeSH Qualifier</span>
-        </div>
-        """,
+        f"<div style='background:{config.PRIMARY_ACCENT}10;border:1px solid "
+        f"{config.PRIMARY_ACCENT}30;border-radius:8px;padding:14px 18px;"
+        f"margin-bottom:0.5rem'>"
+        f"<span style='font-size:14px;font-weight:600;color:{config.PRIMARY_ACCENT}'>"
+        f"🕸️ Bibliometric Network Explorer</span><br>"
+        f"<span style='font-size:13px;color:{config.TEXT_SECONDARY}'>"
+        f"Interactive co-authorship, keyword, topic, and entity networks "
+        f"with Network · Overlay · Density visualization modes are available "
+        f"on the <b>Knowledge Graph</b> page.</span>"
+        f"</div>",
         unsafe_allow_html=True,
     )
