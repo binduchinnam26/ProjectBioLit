@@ -450,8 +450,9 @@ def _overlay_year_per_node(
 ) -> Dict[str, float]:
     """
     Compute average publication year for each node.
-    Co-authorship → year averaged over each author's papers.
-    Keyword      → year averaged over papers containing the keyword.
+    coauth  → year averaged over each author's papers.
+    keyword → year averaged over papers containing the keyword.
+    topic   → year averaged over papers assigned to each topic (via doc_topics_df).
     """
     if papers_df is None or papers_df.empty:
         return {}
@@ -469,6 +470,24 @@ def _overlay_year_per_node(
         except Exception:
             return None
 
+    if network_type == "topic":
+        # Build pmid→year mapping first, then join through doc_topics_df
+        pmid_year: Dict[str, int] = {}
+        for _, row in papers_df.iterrows():
+            yr = _year(row)
+            if yr:
+                pmid_year[str(row.get("pmid", ""))] = yr
+        doc_topics_df = st.session_state.get("doc_topics_df")
+        if doc_topics_df is not None and not doc_topics_df.empty:
+            for _, tr in doc_topics_df.iterrows():
+                tid = str(int(tr.get("topic_id", -1)))
+                if tid not in node_years:
+                    continue
+                yr2 = pmid_year.get(str(tr.get("pmid", "")))
+                if yr2:
+                    node_years[tid].append(yr2)
+        return {ns: sum(yrs) / len(yrs) for ns, yrs in node_years.items() if yrs}
+
     for _, row in papers_df.iterrows():
         yr = _year(row)
         if not yr:
@@ -479,7 +498,7 @@ def _overlay_year_per_node(
                 name = author["name"] if isinstance(author, dict) else str(author)
                 if name in node_years:
                     node_years[name].append(yr)
-        else:
+        else:  # keyword
             for kw in (row.get("author_keywords") or []):
                 if kw and kw in node_years:
                     node_years[kw].append(yr)
@@ -784,7 +803,8 @@ def render_overlay_visualization(
     if controls is None:
         controls = _build_controls_panel(f"ov_{network_type}")
 
-    weight_attr = "paper_count" if network_type == "coauth" else "frequency"
+    # "keyword" nodes use "frequency"; coauth and topic nodes use "paper_count"
+    weight_attr = "frequency" if network_type == "keyword" else "paper_count"
     G2 = _apply_filters(G, controls.get("min_node", 1), controls.get("min_edge", 1), weight_attr)
 
     if G2.number_of_nodes() == 0:
@@ -912,7 +932,8 @@ def render_density_visualization(
     if controls is None:
         controls = _build_controls_panel(f"dn_{network_type}", show_bandwidth=True)
 
-    weight_attr = "paper_count" if network_type == "coauth" else "frequency"
+    # "keyword" nodes use "frequency"; coauth and topic nodes use "paper_count"
+    weight_attr = "frequency" if network_type == "keyword" else "paper_count"
     G2 = _apply_filters(G, controls.get("min_node", 1), controls.get("min_edge", 1), weight_attr)
 
     if G2.number_of_nodes() == 0:
@@ -982,7 +1003,7 @@ def render_density_visualization(
 
     # ── Node overlay — white circles (VOSviewer style) ────────────────────────
     node_sizes_plt = [max(8, 38 * (G2.nodes[n].get(weight_attr, 1) / w_max) ** 0.5) for n in G2.nodes()]
-    label_attr     = "Publications" if network_type == "coauth" else "Occurrences"
+    label_attr     = "Occurrences" if network_type == "keyword" else "Publications"
 
     node_overlay = go.Scatter(
         x=xs.tolist(), y=ys.tolist(),
