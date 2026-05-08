@@ -1,17 +1,14 @@
 """
-PubMedRetriever — fetch PMIDs and raw XML records from PubMed via Biopython Entrez.
+PubMedRetriever — fetch PMIDs and XML records from PubMed via Biopython Entrez.
 
-For large result sets (up to 10,000 papers) the retriever uses PubMed's server-side
-history (WebEnv / query_key) so efetch never passes thousands of PMIDs as URL
-parameters.  Batches of 500 are fetched in parallel (ThreadPoolExecutor, 10 workers)
-while a threading.Lock serialises rate-limit accounting.  Results are re-ordered to
-match the original PMID list so the rest of the pipeline sees a stable order.
+Uses PubMed server-side history (WebEnv / query_key) so efetch never embeds
+thousands of PMIDs in a URL.  Batches are fetched sequentially with exponential-
+backoff retry.  For the 2 000–3 000 paper target (<=10 batches of 300) sequential
+fetching is reliable, avoids thread race conditions, and stays within NCBI quota.
 """
 
 import logging
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, List, Optional, Tuple
 
 from Bio import Entrez
@@ -39,16 +36,14 @@ class PubMedRetriever:
         )
         self._min_interval = 1.0 / self._rate_limit
         self._last_call_time: float = 0.0
-        self._rate_lock = threading.Lock()
 
-    # ── Rate limiting (thread-safe) ───────────────────────────────────────────
+    # ── Rate limiting ─────────────────────────────────────────────────────────
 
     def _wait(self):
-        with self._rate_lock:
-            elapsed = time.monotonic() - self._last_call_time
-            if elapsed < self._min_interval:
-                time.sleep(self._min_interval - elapsed)
-            self._last_call_time = time.monotonic()
+        elapsed = time.monotonic() - self._last_call_time
+        if elapsed < self._min_interval:
+            time.sleep(self._min_interval - elapsed)
+        self._last_call_time = time.monotonic()
 
     # ── Retry wrapper ─────────────────────────────────────────────────────────
 
@@ -73,9 +68,6 @@ class PubMedRetriever:
     def search(self, query: str, max_results: int) -> Tuple[List[str], str, str]:
         """
         Search PubMed and return (pmids, WebEnv, query_key).
-
-        WebEnv / query_key are server-side history tokens used by fetch_batch_via_history()
-        so efetch never needs to embed thousands of PMIDs in the request URL.
         max_results is clamped to [MAX_RESULTS_MIN, MAX_RESULTS_MAX].
         """
         if not query or not query.strip():
@@ -121,11 +113,7 @@ class PubMedRetriever:
     def fetch_batch_via_history(
         self, web_env: str, query_key: str, ret_start: int, ret_max: int
     ) -> str:
-        """
-        Fetch one batch of XML using PubMed server-side history.
-        Uses retstart/retmax instead of passing PMIDs in the URL — essential
-        for large result sets where URL-embedded PMID lists become unwieldy.
-        """
+        """Fetch one batch of XML using PubMed server-side history (no PMID list in URL)."""
         handle = self._call_with_retry(
             Entrez.efetch,
             db="pubmed",
@@ -162,12 +150,11 @@ class PubMedRetriever:
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> Tuple[List[str], List[str]]:
         """
-        Search PubMed and fetch all XML records using server-side history for
-        efficiency.  Up to 10 batches fetched in parallel; thread-safe rate
-        limiter ensures NCBI quota compliance.
+        Search PubMed and fetch all XML records using server-side history.
+        Batches are fetched sequentially — simple, stable, and quota-safe
+        for the 2 000–3 000 paper target (<=10 batches of 300 records each).
 
-        Returns (pmids, xml_batches) in stable order matching pmids.
-        Each xml_batch contains FETCH_BATCH_SIZE (≤500) records.
+        Returns (pmids, xml_batches) where each xml_batch is one efetch XML string.
         """
         def _cb(done: int, total: int, msg: str):
             if progress_callback:
@@ -176,60 +163,31 @@ class PubMedRetriever:
         _cb(0, 1, "Searching PubMed...")
         pmids, web_env, query_key = self.search(query, max_results)
         total = len(pmids)
-        _cb(0, total, f"Found {total} papers. Fetching full records...")
+        _cb(0, total, f"Found {total:,} papers. Fetching records...")
 
         batch_size = config.FETCH_BATCH_SIZE
-        # Build list of (batch_index, ret_start) for every batch
-        batch_offsets = [
-            (i, ret_start)
-            for i, ret_start in enumerate(range(0, total, batch_size))
-        ]
-        n_batches = len(batch_offsets)
-        xml_batches_map: dict = {}
-        fetched_lock = threading.Lock()
-        fetched_count = [0]
+        xml_batches: List[str] = []
+        fetched = 0
+        n_batches = (total + batch_size - 1) // batch_size
 
-        def _fetch(idx_offset):
-            idx, ret_start = idx_offset
+        for batch_num, ret_start in enumerate(range(0, total, batch_size), start=1):
             actual_ret_max = min(batch_size, total - ret_start)
-            if web_env and query_key:
-                xml = self.fetch_batch_via_history(
-                    web_env, query_key, ret_start, actual_ret_max
-                )
-            else:
-                # Fallback: use explicit PMIDs for this slice
-                batch_pmids = pmids[ret_start: ret_start + actual_ret_max]
-                xml = self.fetch_records(batch_pmids)
-            return idx, xml, actual_ret_max
+            try:
+                if web_env and query_key:
+                    xml = self.fetch_batch_via_history(web_env, query_key, ret_start, actual_ret_max)
+                else:
+                    xml = self.fetch_records(pmids[ret_start: ret_start + actual_ret_max])
+                xml_batches.append(xml)
+                fetched += actual_ret_max
+                _cb(fetched, total,
+                    f"Fetched batch {batch_num}/{n_batches} ({fetched:,}/{total:,} records)...")
+            except Exception as exc:
+                logger.error("Fetch batch %d failed: %s", batch_num, exc)
+                _cb(fetched, total, f"Warning: batch {batch_num} failed — continuing...")
 
-        max_workers = min(10, n_batches)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_fetch, offset): offset[0]
-                for offset in batch_offsets
-            }
-            for future in as_completed(futures):
-                try:
-                    idx, xml, n = future.result()
-                    xml_batches_map[idx] = xml
-                    with fetched_lock:
-                        fetched_count[0] += n
-                        done = fetched_count[0]
-                    _cb(done, total, f"Fetched {done:,}/{total:,} records...")
-                except Exception as exc:
-                    batch_idx = futures[future]
-                    logger.error("fetch batch %d failed: %s", batch_idx, exc)
-                    _cb(fetched_count[0], total,
-                        f"Warning: batch {batch_idx} failed — continuing...")
-
-        # Reconstruct in original order, skipping failed batches
-        xml_batches = [
-            xml_batches_map[i]
-            for i in range(n_batches)
-            if i in xml_batches_map
-        ]
-
-        retrieved = fetched_count[0]
-        _cb(total, total, f"Fetch complete: {retrieved:,}/{total:,} records retrieved.")
-        logger.info("fetch_with_progress done: %d/%d records in %d batches", retrieved, total, n_batches)
+        _cb(total, total, f"Fetch complete: {fetched:,}/{total:,} records retrieved.")
+        logger.info(
+            "fetch_with_progress done: %d/%d records in %d batches",
+            fetched, total, len(xml_batches),
+        )
         return pmids, xml_batches

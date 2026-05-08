@@ -94,10 +94,13 @@ class NetworkBuilder:
         if G.number_of_nodes() == 0:
             return G
 
-        # Centrality metrics
+        # Centrality metrics — betweenness is O(n³), skip it for large graphs
         try:
             deg_cent = nx.degree_centrality(G)
-            bet_cent = nx.betweenness_centrality(G, normalized=True)
+            if G.number_of_nodes() <= 500:
+                bet_cent = nx.betweenness_centrality(G, normalized=True)
+            else:
+                bet_cent = nx.betweenness_centrality(G, normalized=True, k=min(100, G.number_of_nodes()))
             clu_coef = nx.clustering(G, weight="weight")
         except Exception:
             deg_cent = bet_cent = clu_coef = {n: 0.0 for n in G.nodes()}
@@ -431,7 +434,8 @@ class NetworkBuilder:
             if descriptors:
                 pmid_mesh[pmid] = descriptors
 
-        pmids = list(pmid_mesh.keys())
+        # Cap to 500 papers for the O(n²) loop — beyond that it becomes too slow
+        pmids = list(pmid_mesh.keys())[:500]
         for i in range(len(pmids)):
             for j in range(i + 1, len(pmids)):
                 shared = len(pmid_mesh[pmids[i]] & pmid_mesh[pmids[j]])
@@ -443,22 +447,22 @@ class NetworkBuilder:
     # ── Display thinning ──────────────────────────────────────────────────────
 
     def prepare_graph_for_display(
-        self, full_graph: nx.Graph, max_display_nodes: int = 2000
+        self, full_graph: nx.Graph, max_display_nodes: int = None
     ) -> nx.Graph:
         """
-        Return a subgraph suitable for interactive rendering.
+        Return a subgraph suitable for interactive browser rendering.
 
-        If the graph has more than *max_display_nodes* nodes, keep only the
-        top-N by degree centrality (the most connected, most informative nodes).
+        Keeps only the top-N most-connected nodes. Default cap comes from
+        config.GRAPH_MAX_DISPLAY_NODES (500) which is safe for browser canvas.
         The full graph is unchanged and still available for analysis.
         """
+        if max_display_nodes is None:
+            max_display_nodes = config.GRAPH_MAX_DISPLAY_NODES
+
         if full_graph.number_of_nodes() <= max_display_nodes:
             return full_graph
-        try:
-            deg_cent = nx.degree_centrality(full_graph)
-        except Exception:
-            deg_cent = {n: full_graph.degree(n) for n in full_graph.nodes()}
-        top_nodes = sorted(deg_cent, key=deg_cent.get, reverse=True)[:max_display_nodes]
+        # Use raw degree (fast, O(n)) instead of degree_centrality (same ranking for subgraph)
+        top_nodes = sorted(full_graph.nodes(), key=lambda n: full_graph.degree(n), reverse=True)[:max_display_nodes]
         sub = full_graph.subgraph(top_nodes).copy()
         logger.info(
             "prepare_graph_for_display: thinned %d → %d nodes for rendering",
@@ -488,14 +492,17 @@ class NetworkBuilder:
         except Exception:
             avg_clustering = 0.0
 
-        # Centrality (on largest connected component to avoid failures)
+        # Centrality on largest connected component.
+        # Betweenness and closeness are O(n³) — use approximation for large graphs.
         try:
             lcc = undirected.subgraph(
                 max(nx.connected_components(undirected), key=len)
             ).copy()
             deg_cent = nx.degree_centrality(lcc)
-            bet_cent = nx.betweenness_centrality(lcc, normalized=True)
-            clo_cent = nx.closeness_centrality(lcc)
+            n = lcc.number_of_nodes()
+            k = min(100, n) if n > 300 else None
+            bet_cent = nx.betweenness_centrality(lcc, normalized=True, k=k)
+            clo_cent = nx.closeness_centrality(lcc) if n <= 500 else {}
         except Exception:
             deg_cent = bet_cent = clo_cent = {}
 

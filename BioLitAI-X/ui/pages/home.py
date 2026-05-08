@@ -1,5 +1,6 @@
 """Home page — search, pipeline execution, session management."""
 
+import gc
 import logging
 import shutil
 import time
@@ -105,8 +106,9 @@ def render():
                 min_value=config.MAX_RESULTS_MIN,
                 max_value=config.MAX_RESULTS_MAX,
                 value=config.MAX_RESULTS_DEFAULT,
-                step=500,
-                help="Number of papers to retrieve from PubMed (up to 10,000)",
+                step=100,
+                help="Number of papers to retrieve from PubMed (100–3,000). "
+                     "2,000 is recommended for best speed and stability.",
             )
         with col2:
             _cur_year = datetime.now().year
@@ -267,13 +269,15 @@ def _run_pipeline(
             raw_papers = []
             for xml_batch in xml_batches:
                 raw_papers.extend(parser.parse_batch(xml_batch, query_used=query))
-            _update(2, f"Parsed {len(raw_papers)} records.", papers=len(raw_papers))
+            del xml_batches  # free XML strings — no longer needed
+            _update(2, f"Parsed {len(raw_papers):,} records.", papers=len(raw_papers))
 
             # Step 3: Clean
             n_raw = len(raw_papers)
             _update(3, f"Cleaning and normalising {n_raw:,} papers — please wait...")
             cleaner = DataCleaner()
             papers_df = cleaner.run_full_pipeline(raw_papers)
+            del raw_papers   # free raw dicts — DataFrame is the working copy now
 
             # Apply year filter
             if "pub_year" in papers_df.columns:
@@ -387,10 +391,15 @@ def _run_pipeline(
         # Step 6: Networks and knowledge graph
         _update(6, "Building bibliometric networks and knowledge graph...")
         nb = NetworkBuilder()
-        coauth_graph  = nb.build_coauthorship_network(papers_df)
-        keyword_graph = nb.build_keyword_cooccurrence_network(papers_df)
-        coauth_stats  = nb.calculate_network_statistics(coauth_graph)
-        keyword_stats = nb.calculate_network_statistics(keyword_graph)
+        coauth_graph_full  = nb.build_coauthorship_network(papers_df)
+        keyword_graph_full = nb.build_keyword_cooccurrence_network(papers_df)
+        coauth_stats  = nb.calculate_network_statistics(coauth_graph_full)
+        keyword_stats = nb.calculate_network_statistics(keyword_graph_full)
+        # Thin graphs to render limit before handing to browser
+        coauth_graph  = nb.prepare_graph_for_display(coauth_graph_full)
+        keyword_graph = nb.prepare_graph_for_display(keyword_graph_full)
+        del coauth_graph_full, keyword_graph_full
+        gc.collect()
 
         kg = KnowledgeGraph()
         kg_graph = kg.build_from_entities(entities_df, relationships_df)

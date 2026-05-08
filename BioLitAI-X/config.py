@@ -32,19 +32,22 @@ if not ENTREZ_EMAIL:
 # Rate limits (requests per second)
 RATE_LIMIT_WITHOUT_KEY = 3
 RATE_LIMIT_WITH_KEY = 10
-FETCH_BATCH_SIZE = 500       # PMIDs per efetch call (NCBI allows up to 10k; 500 is safe)
+FETCH_BATCH_SIZE = 300       # records per efetch call; 300 is safe and right-sized for 2-3k
 FETCH_RETRIES = 3
 FETCH_RETRY_DELAY = 2        # seconds, doubles on each retry
 
 # ── Query / result sizing ─────────────────────────────────────────────────────
 MAX_RESULTS_DEFAULT = 1000
 MAX_RESULTS_MIN = 100
-MAX_RESULTS_MAX = 10000
+MAX_RESULTS_MAX = 3000       # hard cap — optimised for reliable 2k–3k processing
 
 # ── NLP / Embeddings ──────────────────────────────────────────────────────────
 SCISPACY_MODEL = "en_core_sci_lg"
 EMBEDDING_MODEL = "pritamdeka/S-PubMedBert-MS-MARCO"
 EMBEDDING_DIMENSION = 768    # output size of the model above
+
+NLP_BATCH_SIZE = 32          # abstracts per nlp.pipe() call; lower = less RAM spike
+EMBEDDING_BATCH_SIZE = 64    # abstracts per model.encode() batch; lower = less RAM spike
 
 # Set to True to enable UMLS entity linking (downloads ~724 MB index on first run).
 # When False, NER still runs but entities keep the generic "ENTITY" label.
@@ -70,6 +73,7 @@ BERTOPIC_MIN_TOPIC_SIZE = 10
 # ── Network / Graph ───────────────────────────────────────────────────────────
 KEYWORD_MIN_FREQUENCY = 3    # minimum papers a keyword must appear in
 SEMANTIC_SIMILARITY_THRESHOLD = 0.85
+GRAPH_MAX_DISPLAY_NODES = 500    # max nodes sent to browser for interactive rendering
 
 # ── Gap Detection ─────────────────────────────────────────────────────────────
 GAP_SHARED_NEIGHBORS_MIN = 3
