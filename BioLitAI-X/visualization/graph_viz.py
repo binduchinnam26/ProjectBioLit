@@ -84,7 +84,8 @@ def _color_opacity(hex_color: str, opacity: float) -> str:
     return f"rgba({r},{g},{b},{opacity})"
 
 
-_MAX_KG_EDGES = 1500  # hard cap for entity KG edges — beyond this vis.js freezes
+_MAX_KG_NODES = 150   # cap entity KG nodes sent to vis.js
+_MAX_KG_EDGES = 500   # cap entity KG edges sent to vis.js
 
 _KG_PHYSICS = {
     "barnesHut": {
@@ -202,6 +203,33 @@ def render_knowledge_graph(
 
     if G_sub.number_of_nodes() == 0:
         st.warning("No nodes match the current filters.")
+        return
+
+    # ── Node cap: keep top-N by paper_count to prevent vis.js freeze ─────────
+    total_kg_nodes = G_sub.number_of_nodes()
+    if total_kg_nodes > _MAX_KG_NODES:
+        top_nodes = sorted(
+            G_sub.nodes(data=True),
+            key=lambda nd: nd[1].get("paper_count", 0),
+            reverse=True,
+        )[:_MAX_KG_NODES]
+        G_sub = G_sub.subgraph({nd[0] for nd in top_nodes}).copy()
+        st.info(
+            f"Showing top {_MAX_KG_NODES} entities of {total_kg_nodes:,} by evidence strength. "
+            "Increase Min evidence or filter by entity type to change the selection."
+        )
+
+    # ── Lazy-load: only build vis.js HTML when user clicks Render ─────────────
+    render_key = f"kg_render_{total_kg_nodes}_{G_sub.number_of_edges()}_{min_evidence}_{search_term}"
+    if not st.session_state.get(render_key):
+        st.info(
+            f"Entity graph ready: {G_sub.number_of_nodes()} nodes, "
+            f"{min(G_sub.number_of_edges(), _MAX_KG_EDGES):,} edges. "
+            "Click **Render Graph** to visualize."
+        )
+        if st.button("🔬 Render Graph", key=f"btn_{render_key}"):
+            st.session_state[render_key] = True
+            st.rerun()
         return
 
     net = _get_pyvis_net(height=f"{height}px")

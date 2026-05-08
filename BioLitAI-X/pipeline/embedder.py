@@ -66,8 +66,11 @@ class EmbeddingEngine:
         # Suppress HF Hub authentication advisory (noise, not an error)
         warnings.filterwarnings("ignore", message=".*unauthenticated requests.*", category=UserWarning)
         warnings.filterwarnings("ignore", message=".*HF_TOKEN.*")
-        # Suppress transformers internal path warning
         warnings.filterwarnings("ignore", message=".*Accessing.*__path__.*", category=UserWarning)
+        # Silence transformers library's own logger (__path__ access messages)
+        import logging as _logging
+        _logging.getLogger("transformers").setLevel(_logging.ERROR)
+        _logging.getLogger("transformers.modeling_utils").setLevel(_logging.ERROR)
 
         from sentence_transformers import SentenceTransformer
         import faiss

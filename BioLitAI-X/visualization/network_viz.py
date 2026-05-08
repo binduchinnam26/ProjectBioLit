@@ -511,9 +511,94 @@ def _plotly_layout(height: int) -> "plotly.graph_objects.Layout":
                    scaleanchor="x", scaleratio=1),
         margin=dict(l=10, r=110, t=10, b=10),
         height=height, hovermode="closest",
-        legend=dict(x=0.01, y=0.01, bgcolor="rgba(255,255,255,0.85)",
+        legend=dict(x=1.01, y=1, bgcolor="rgba(255,255,255,0.85)",
                     bordercolor="#E5E7EB", borderwidth=1, font=dict(size=10)),
     )
+
+
+def _render_network_plotly(
+    G: nx.Graph,
+    pos: Dict[str, Tuple[float, float]],
+    weight_attr: str,
+    controls: Dict[str, Any],
+    height: int,
+) -> None:
+    """
+    Render the Network view using Plotly instead of vis.js/PyVis.
+    One Scatter trace per community → cluster legend; edge trace underneath.
+    Plotly renders via Canvas so it never freezes regardless of node/edge count.
+    """
+    import plotly.graph_objects as go
+
+    search_lower = controls.get("search", "").lower().strip()
+    labels_all   = controls.get("labels_all", True)
+
+    # Capped edge trace (top-weight edges only)
+    edge_trace = _plotly_edge_trace(G, pos)
+
+    # Median weight threshold — only nodes above median get a label when labels_all=False
+    all_weights = [d.get(weight_attr, d.get("frequency", 1)) for _, d in G.nodes(data=True)]
+    median_w = sorted(all_weights)[len(all_weights) // 2] if all_weights else 1
+
+    communities = sorted({d.get("community", 0) for _, d in G.nodes(data=True)})
+    node_traces = []
+
+    for cid in communities:
+        comm_nodes = [(n, d) for n, d in G.nodes(data=True) if d.get("community", 0) == cid]
+        if not comm_nodes:
+            continue
+
+        color = config.COMMUNITY_COLORS[cid % len(config.COMMUNITY_COLORS)]
+        xs, ys, labels, sizes, hovers, borders_c, borders_w = [], [], [], [], [], [], []
+
+        for n, d in comm_nodes:
+            ns = str(n)
+            x, y = pos.get(ns, (0.0, 0.0))
+            w    = d.get(weight_attr, d.get("frequency", 1))
+            size = float(d.get("size", config.NODE_SIZE_MIN))
+            is_match = bool(search_lower and search_lower in ns.lower())
+
+            xs.append(x); ys.append(y); sizes.append(size)
+            labels.append(ns[:22] if (labels_all or is_match or w >= median_w) else "")
+            borders_c.append("#FFD700" if is_match else _darken(color, 0.78))
+            borders_w.append(3 if is_match else 1)
+
+            neighbors = sorted(
+                [(str(nb), G[n][nb].get("weight", 1)) for nb in G.neighbors(n)],
+                key=lambda e: e[1], reverse=True,
+            )[:5]
+            nb_html = "<br>".join(f"  • {nb} ({w2})" for nb, w2 in neighbors)
+            hovers.append(
+                f"<b>{ns}</b><br>Papers:&nbsp;{w}<br>Cluster:&nbsp;{cid + 1}"
+                f"<br>Top connections:<br>{nb_html or '—'}"
+            )
+
+        node_traces.append(go.Scatter(
+            x=xs, y=ys,
+            mode="markers+text",
+            marker=dict(
+                size=sizes, color=color, opacity=0.88,
+                line=dict(width=borders_w, color=borders_c),
+            ),
+            text=labels,
+            textposition="bottom center",
+            textfont=dict(size=9, color=_VOS_FONT, family="Open Sans"),
+            hovertext=hovers,
+            hoverinfo="text",
+            name=f"Cluster {cid + 1}",
+        ))
+
+    layout = _plotly_layout(height)
+    layout.update(
+        showlegend=len(communities) <= 20,
+        legend=dict(
+            x=1.01, y=1, bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="#E5E7EB", borderwidth=1,
+            font=dict(size=9), itemsizing="constant",
+        ),
+    )
+    fig = go.Figure(data=[edge_trace] + node_traces, layout=layout)
+    st.plotly_chart(fig, use_container_width=True)
 
 
 # ── Public render functions ────────────────────────────────────────────────────
@@ -526,9 +611,8 @@ def render_coauthorship_network(
     height: int = 750,
 ):
     """
-    VOSviewer Network Visualization — co-authorship.
-    Positions come from pre-computed kamada-kawai layout (shared with overlay/density).
-    HTML is cached in session_state and reused on page navigation.
+    Co-authorship Network view — rendered with Plotly (not vis.js).
+    Plotly uses Canvas rendering so it never freezes the browser.
     """
     if G is None or G.number_of_nodes() == 0:
         st.info("No co-authorship data available. Run the pipeline first.")
@@ -548,26 +632,19 @@ def render_coauthorship_network(
     G2, trimmed = _trim_for_render(G2, "paper_count")
     if trimmed:
         st.info(
-            f"Showing top {_MAX_RENDER_NODES} authors of {total_nodes:,} "
-            f"(raise Min node weight to focus the graph)."
+            f"Showing top {_MAX_RENDER_NODES} authors of {total_nodes:,}. "
+            "Raise Min node weight to focus on more-published authors."
         )
 
     clusters = len({d.get("community", 0) for _, d in G2.nodes(data=True)})
     s1, s2, s3, s4 = st.columns(4)
     s1.metric("Items", G2.number_of_nodes())
-    rendered_edges = min(total_edges, _MAX_RENDER_EDGES)
-    s2.metric("Links", f"{rendered_edges:,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
+    s2.metric("Links", f"{min(total_edges, _MAX_RENDER_EDGES):,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
     s3.metric("Clusters", clusters)
     s4.metric("Total link strength", sum(d.get("weight", 1) for _, _, d in G2.edges(data=True)))
-    if total_edges > _MAX_RENDER_EDGES:
-        st.caption(f"Showing {_MAX_RENDER_EDGES:,} strongest of {total_edges:,} links. Raise Min link strength to reduce further.")
 
-    html_key = f"coauth_{G2.number_of_nodes()}_{G2.number_of_edges()}_{controls.get('search','')}_{controls.get('labels_all')}_{controls.get('physics')}"
     pos = _compute_layout(G2, layout_key="coauth")
-    net = _get_vosviewer_net(height=f"{height}px", physics=controls.get("physics", False))
-    _add_coauth_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
-    _add_edges_to_net(net, G2)
-    _render_vosviewer_html(net, height=height, cache_key=html_key)
+    _render_network_plotly(G2, pos, "paper_count", controls, height)
 
 
 def render_keyword_network(
@@ -575,7 +652,10 @@ def render_keyword_network(
     controls: Optional[Dict] = None,
     height: int = 750,
 ):
-    """VOSviewer Network Visualization — keyword co-occurrence."""
+    """
+    Keyword co-occurrence Network view — rendered with Plotly (not vis.js).
+    Plotly uses Canvas rendering so it never freezes the browser.
+    """
     if G is None or G.number_of_nodes() == 0:
         st.info("No keyword co-occurrence data available. Run the pipeline first.")
         return
@@ -595,7 +675,7 @@ def render_keyword_network(
     if trimmed:
         st.info(
             f"Showing top {_MAX_RENDER_NODES} keywords of {total_nodes:,}. "
-            f"Raise Min node weight to narrow the graph."
+            "Raise Min node weight to narrow the graph."
         )
 
     clusters = len({d.get("community", 0) for _, d in G2.nodes(data=True)})
@@ -603,15 +683,9 @@ def render_keyword_network(
     s1.metric("Keywords", G2.number_of_nodes())
     s2.metric("Links", f"{min(total_edges, _MAX_RENDER_EDGES):,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
     s3.metric("Clusters", clusters)
-    if total_edges > _MAX_RENDER_EDGES:
-        st.caption(f"Showing {_MAX_RENDER_EDGES:,} strongest of {total_edges:,} links. Raise Min link strength to reduce further.")
 
-    html_key = f"keyword_{G2.number_of_nodes()}_{G2.number_of_edges()}_{controls.get('search','')}_{controls.get('labels_all')}_{controls.get('physics')}"
     pos = _compute_layout(G2, layout_key="keyword")
-    net = _get_vosviewer_net(height=f"{height}px", physics=controls.get("physics", False))
-    _add_keyword_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
-    _add_edges_to_net(net, G2)
-    _render_vosviewer_html(net, height=height, cache_key=html_key)
+    _render_network_plotly(G2, pos, "frequency", controls, height)
 
 
 def render_topic_network(

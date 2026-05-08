@@ -5,6 +5,11 @@ Configures page, loads CSS, initialises session state, routes pages.
 
 import sys
 import os
+import logging as _logging
+
+# Silence noisy third-party loggers before any imports that trigger them
+_logging.getLogger("transformers").setLevel(_logging.ERROR)
+_logging.getLogger("sentence_transformers").setLevel(_logging.WARNING)
 
 # Ensure the project root is on the path regardless of working directory
 _ROOT = os.path.dirname(os.path.abspath(__file__))
