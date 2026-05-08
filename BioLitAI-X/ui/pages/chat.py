@@ -59,7 +59,7 @@ def render():
             unsafe_allow_html=True,
         )
         for q in _STARTER_QUESTIONS:
-            if st.button(q, key=f"starter_{q[:20]}", use_container_width=True):
+            if st.button(q, key=f"starter_{q[:20]}", width="stretch"):
                 _send_message(q, papers_df, embedder)
                 st.rerun()
 
@@ -113,7 +113,7 @@ def render():
             key="chat_input",
         )
     with send_col:
-        send = st.button("Send", type="primary", use_container_width=True, key="chat_send")
+        send = st.button("Send", type="primary", width="stretch", key="chat_send")
 
     if send and user_msg.strip():
         _send_message(user_msg.strip(), papers_df, embedder)

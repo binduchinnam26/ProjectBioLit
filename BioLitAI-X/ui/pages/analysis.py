@@ -114,16 +114,16 @@ def render():
 
     st.markdown("### Publication Trend", unsafe_allow_html=False)
     fig_trend = render_publication_trend(papers_df)
-    st.plotly_chart(fig_trend, use_container_width=True)
+    st.plotly_chart(fig_trend, width="stretch")
 
     tab1, tab2, tab3 = st.tabs(["Top Keywords", "Author Productivity", "Topic Evolution"])
     with tab1:
-        st.plotly_chart(render_top_keywords(papers_df), use_container_width=True)
+        st.plotly_chart(render_top_keywords(papers_df), width="stretch")
     with tab2:
-        st.plotly_chart(render_author_productivity(papers_df), use_container_width=True)
+        st.plotly_chart(render_author_productivity(papers_df), width="stretch")
     with tab3:
         if topics_over_time is not None and not topics_over_time.empty:
-            st.plotly_chart(render_topic_evolution(topics_over_time), use_container_width=True)
+            st.plotly_chart(render_topic_evolution(topics_over_time), width="stretch")
         else:
             st.info(
                 "Topic evolution not yet computed — embeddings and topic modelling are "

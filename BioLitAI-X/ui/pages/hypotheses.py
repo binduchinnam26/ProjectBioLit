@@ -34,7 +34,7 @@ def render():
         if st.button(
             "⚡ Generate New Hypotheses",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="gen_hyp_btn",
         ):
             _generate_hypotheses(papers_df, entities_df, embedder, db, query, gap_report)

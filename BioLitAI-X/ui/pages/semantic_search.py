@@ -106,7 +106,7 @@ def render():
         )
     with c2:
         st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        run = st.button("Search", type="primary", use_container_width=True, key="sem_run")
+        run = st.button("Search", type="primary", width="stretch", key="sem_run")
 
     st.markdown(
         f"<hr style='border-color:{config.BORDER_COLOR};margin:1rem 0'>",
@@ -134,7 +134,7 @@ def render():
                 if st.button(
                     f"💬 {s}",
                     key=f"sug_{i}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     st.session_state["sem_prefill"] = s
                     st.rerun()

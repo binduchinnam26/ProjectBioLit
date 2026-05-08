@@ -144,14 +144,14 @@ def render():
             st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
             search_clicked = st.button(
                 "🔍  Search & Analyse",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
             )
         with col4:
             st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
             force_rerun = st.button(
                 "↺  Force Rerun",
-                use_container_width=True,
+                width="stretch",
                 help="Ignore cached results and re-fetch from PubMed",
             )
 
@@ -441,28 +441,20 @@ def _run_pipeline(
             import threading as _thread
             _n_papers = len(papers_df)
 
-            # ── Step 4: NLP — entity extraction ONLY (dep parser disabled) ───
-            # The dep parser is 5-10x slower than NER; disabling it cuts this step
-            # from ~5 min to ~15-30 sec. Relationships are extracted lazily when
-            # the user opens the Knowledge Graph page (see knowledge_graph.py).
-            _update(4, f"Extracting entities from {_n_papers:,} abstracts "
-                       f"(relationships deferred for speed)...", papers=_n_papers)
+            # ── Step 4: NLP deferred ─────────────────────────────────────────
+            # Entity extraction (NER) and relationship extraction are deferred to
+            # lazy loading on their respective pages:
+            #   • Entity extraction → first visit to Knowledge Graph → Entity KG tab
+            #   • Relationships     → button on Entity KG tab (dep-parse, slower)
+            #   • Embeddings        → first visit to Semantic Search
+            #   • Topics            → Analysis → Topic Evolution tab
+            # Skipping NER here saves 1-5 minutes per run.
+            _update(4, "Skipping NLP (deferred — click Extract Entities on KG page)...",
+                    papers=_n_papers)
             entities_df      = pd.DataFrame()
             relationships_df = pd.DataFrame()
-            try:
-                from pipeline.nlp_processor import NLPProcessor
-                nlp_p = NLPProcessor(db_manager=None)
-                nlp_p.setup()
-                entities_df, relationships_df = nlp_p.process_corpus(
-                    papers_df,
-                    progress_callback=lambda ents, rels, m: _update(
-                        4, m, papers=_n_papers, ents=ents, rels=rels),
-                )
-            except Exception as exc:
-                logger.warning("NLP skipped: %s", exc)
-                st.warning(f"NLP skipped: {exc}.")
-            _update(4, f"Entities extracted: {len(entities_df):,}.",
-                    papers=_n_papers, ents=len(entities_df), rels=0)
+            _update(4, "NLP deferred. Building networks...",
+                    papers=_n_papers, ents=0, rels=0)
 
             # ── Step 5: Bibliometric networks + basic Knowledge Graph ─────────
             _update(5, "Building networks and knowledge graph...",
@@ -535,9 +527,8 @@ def _run_pipeline(
             _update(6, f"Pipeline complete! ({total_elapsed})",
                     papers=_n_papers, ents=len(entities_df), rels=0)
             st.success(
-                f"✅ Pipeline complete in {total_elapsed}! {_n_papers:,} papers, "
-                f"{len(entities_df):,} entities. "
-                f"Semantic search & topic analysis compute on first page visit. "
+                f"✅ Pipeline complete in {total_elapsed}! {_n_papers:,} papers fetched. "
+                f"**Entities, embeddings & topics load on first page visit** (deferred for speed). "
                 f"Next run for this query loads from cache instantly."
             )
 
