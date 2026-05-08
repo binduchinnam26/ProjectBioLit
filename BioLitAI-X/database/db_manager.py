@@ -27,7 +27,10 @@ class DatabaseManager:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        # timeout=30: wait up to 30 s for the lock instead of the default 5 s.
+        # On Windows with WAL mode, Streamlit reruns can leave a connection
+        # holding the lock for a few seconds; 30 s gives ample headroom.
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -35,6 +38,9 @@ class DatabaseManager:
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute("PRAGMA mmap_size=268435456")
         conn.execute("PRAGMA foreign_keys=ON")
+        # busy_timeout (ms) is a belt-and-suspenders duplicate of the Python
+        # timeout above; it also covers lock waits inside multi-statement scripts.
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     @contextmanager
