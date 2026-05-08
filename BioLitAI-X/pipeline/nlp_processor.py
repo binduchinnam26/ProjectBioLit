@@ -407,15 +407,15 @@ class NLPProcessor:
                         "sentence_context": sent_ctx,
                     })
 
-                if (i + 1) % 200 == 0:
+                if (i + 1) % 100 == 0 or (i + 1) == total:
                     elapsed = time.monotonic() - t0
+                    rate = (i + 1) / elapsed if elapsed > 0 else 0
                     _cb(
                         len(all_entities), 0,
-                        f"NLP (entities): {i + 1}/{total} papers | "
-                        f"{len(all_entities):,} entities ({elapsed:.0f}s)",
+                        f"NLP: {i + 1}/{total} papers | "
+                        f"{len(all_entities):,} entities | "
+                        f"{rate:.0f} papers/s ({elapsed:.0f}s elapsed)",
                     )
-                if (i + 1) % 500 == 0:
-                    gc.collect()
 
         except Exception as exc:
             logger.error("nlp.pipe() failed: %s — falling back to single-doc mode", exc)
