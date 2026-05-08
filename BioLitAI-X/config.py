@@ -55,7 +55,7 @@ EMBEDDING_MODEL = os.getenv(
 # MiniLM=384, PubMedBERT/scibert=768. Override via .env if changing model.
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "384"))
 
-NLP_BATCH_SIZE = 128         # abstracts per nlp.pipe() call; larger = fewer overhead calls
+NLP_BATCH_SIZE = 256         # abstracts per nlp.pipe() call; larger batches amortize tok2vec overhead
 EMBEDDING_BATCH_SIZE = 256   # MiniLM is small (384-dim); 256 fills CPU cache efficiently
 
 # Set to True to enable UMLS entity linking (downloads ~724 MB index on first run).

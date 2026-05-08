@@ -68,9 +68,9 @@ _PIPELINE_STEPS = [
     "Fetching Papers",
     "Parsing XML",
     "Cleaning Data",
-    "NLP Processing",
+    "Entity Extraction",
     "Building Embeddings",
-    "Building Graph",
+    "Building Graphs",
 ]
 
 
@@ -438,76 +438,62 @@ def _run_pipeline(
                 except Exception as exc:
                     logger.warning("Parquet cache save failed: %s", exc)
 
-            import threading as _thread
-            _n_papers = len(papers_df)
-
-            # ── Steps 4+5: NLP/NER and Embeddings in PARALLEL ────────────────
-            # Both spaCy (Cython/PyTorch tok2vec) and sentence-transformers
-            # (PyTorch) release the GIL during their heavy compute, so two threads
-            # can run on separate CPU cores simultaneously.
-            # Running them in parallel saves max(t_nlp, t_embed) instead of
-            # t_nlp + t_embed — typically 20-50s savings for 1000 papers.
             import concurrent.futures as _cf
 
-            _update(4, f"Running entity extraction + embeddings in parallel "
-                       f"for {_n_papers:,} papers…", papers=_n_papers)
+            _n_papers = len(papers_df)
 
-            _nlp_res: dict = {}
-            _emb_res: dict = {}
-
-            def _do_nlp(_df=papers_df):
-                try:
-                    from pipeline.nlp_processor import NLPProcessor
-                    _p = NLPProcessor(db_manager=None)
-                    _p.setup()
-                    # No progress_callback — Streamlit is NOT thread-safe from
-                    # background threads; update only after both futures complete.
-                    _ents, _rels = _p.process_corpus(_df)
-                    _nlp_res["ents"] = _ents
-                    _nlp_res["rels"] = _rels
-                except Exception as _exc:
-                    logger.error("NLP thread failed: %s", _exc)
-                    _nlp_res["error"] = _exc
-
-            def _do_embed(_df=papers_df, _q=query):
-                try:
-                    from pipeline.embedder import EmbeddingEngine
-                    _emb = EmbeddingEngine(persist_index=not low_disk)
-                    _emb.setup()
-                    if _emb.index_exists(_q):
-                        _emb.load_index(_q)
-                        _arr = _emb.load_embeddings(_q)
-                        if _arr is None:
-                            _arr = _emb.embed_corpus(_df, query=_q)
-                    else:
-                        _arr = _emb.embed_corpus(_df, query=_q)
-                    _emb_res["embedder"] = _emb
-                    _emb_res["arr"] = _arr
-                except Exception as _exc:
-                    logger.error("Embedding thread failed: %s", _exc)
-                    _emb_res["error"] = _exc
-
-            with _cf.ThreadPoolExecutor(max_workers=2) as _ex:
-                _f_nlp = _ex.submit(_do_nlp)
-                _f_emb = _ex.submit(_do_embed)
-                _f_nlp.result()   # blocks main thread until NLP done
-                _f_emb.result()   # blocks main thread until embeddings done
-
-            entities_df      = _nlp_res.get("ents", pd.DataFrame())
-            relationships_df = _nlp_res.get("rels", pd.DataFrame())
-            embedder         = _emb_res.get("embedder")
-            embeddings_array = _emb_res.get("arr")
-
-            if "error" in _nlp_res:
-                st.warning(f"Entity extraction issue: {_nlp_res['error']}")
-            if "error" in _emb_res:
-                st.warning(f"Embeddings issue: {_emb_res['error']}")
-
-            _update(4, f"Entities + Embeddings ready: {len(entities_df):,} entities.",
+            # ── Step 4: Entity extraction (NER, dep parser disabled) ──────────
+            # Runs in the main thread so progress callbacks update the UI live.
+            # Running NLP and embeddings as threads caused PyTorch MKL/BLAS
+            # initialisation conflicts (both use PyTorch internally) which made
+            # the step appear stuck with no progress shown.
+            _update(4, f"Extracting entities from {_n_papers:,} abstracts…",
+                    papers=_n_papers)
+            entities_df      = pd.DataFrame()
+            relationships_df = pd.DataFrame()
+            try:
+                from pipeline.nlp_processor import NLPProcessor
+                _nlp_p = NLPProcessor(db_manager=None)
+                _nlp_p.setup()
+                entities_df, relationships_df = _nlp_p.process_corpus(
+                    papers_df,
+                    progress_callback=lambda e, r, m: _update(
+                        4, m, papers=_n_papers, ents=e, rels=r),
+                )
+                del _nlp_p
+                gc.collect()
+            except Exception as exc:
+                logger.warning("NLP skipped: %s", exc)
+                st.warning(f"Entity extraction issue: {exc}")
+            _update(4, f"Entities done: {len(entities_df):,} extracted.",
                     papers=_n_papers, ents=len(entities_df), rels=0)
 
-            # ── Step 5: Bibliometric networks + basic Knowledge Graph ─────────
-            _update(5, "Building networks and knowledge graph...",
+            # ── Step 5: Embeddings (runs after NLP to avoid PyTorch conflicts) ─
+            _update(5, f"Building semantic embeddings for {_n_papers:,} papers…",
+                    papers=_n_papers, ents=len(entities_df), rels=0)
+            embedder         = None
+            embeddings_array = None
+            try:
+                from pipeline.embedder import EmbeddingEngine
+                _emb = EmbeddingEngine(persist_index=not low_disk)
+                _emb.setup()
+                if _emb.index_exists(query):
+                    _emb.load_index(query)
+                    embeddings_array = _emb.load_embeddings(query)
+                    if embeddings_array is None:
+                        embeddings_array = _emb.embed_corpus(papers_df, query=query)
+                else:
+                    embeddings_array = _emb.embed_corpus(papers_df, query=query)
+                embedder = _emb
+            except Exception as exc:
+                logger.warning("Embeddings skipped: %s", exc)
+                st.warning(f"Embedding issue: {exc}")
+            _update(5, f"Embeddings ready ({len(embeddings_array):,} vectors)."
+                       if embeddings_array is not None else "Embeddings skipped.",
+                    papers=_n_papers, ents=len(entities_df), rels=0)
+
+            # ── Step 6: Bibliometric networks + basic Knowledge Graph ─────────
+            _update(6, "Building networks and knowledge graph...",
                     papers=_n_papers, ents=len(entities_df), rels=0)
             nb_inst = NetworkBuilder()
             try:
