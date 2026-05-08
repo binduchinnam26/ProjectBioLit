@@ -408,7 +408,7 @@ def render_relationship_evidence_table(relationships_df, papers_df=None):
 
     st.dataframe(
         page_df,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "pmid": st.column_config.LinkColumn(
                 "PMID",

@@ -68,7 +68,7 @@ class NetworkBuilder:
         author_papers: Dict[str, int] = defaultdict(int)
         pair_counts: Dict[Tuple[str, str], int] = defaultdict(int)
 
-        for _, row in papers_df.iterrows():
+        for row in papers_df.to_dict("records"):
             authors = row.get("authors", [])
             if not isinstance(authors, list):
                 continue
@@ -78,6 +78,8 @@ class NetworkBuilder:
                 if a
             ]
             names = [n for n in names if n]
+            # Cap authors per paper to avoid O(n²) explosion on papers with 50+ authors
+            names = names[:20]
             for name in names:
                 author_papers[name] += 1
             for a, b in combinations(sorted(set(names)), 2):
@@ -94,16 +96,12 @@ class NetworkBuilder:
         if G.number_of_nodes() == 0:
             return G
 
-        # Centrality metrics — betweenness is O(n³), skip it for large graphs
+        # Degree centrality only — betweenness is O(n²k) and takes 2-5 min on
+        # large co-authorship graphs; it is not shown in any display element.
         try:
             deg_cent = nx.degree_centrality(G)
-            if G.number_of_nodes() <= 500:
-                bet_cent = nx.betweenness_centrality(G, normalized=True)
-            else:
-                bet_cent = nx.betweenness_centrality(G, normalized=True, k=min(100, G.number_of_nodes()))
-            clu_coef = nx.clustering(G, weight="weight")
         except Exception:
-            deg_cent = bet_cent = clu_coef = {n: 0.0 for n in G.nodes()}
+            deg_cent = {n: 0.0 for n in G.nodes()}
 
         # Community detection
         partition = _louvain_communities(G)
@@ -119,8 +117,6 @@ class NetworkBuilder:
             G.nodes[node].update(
                 {
                     "degree_centrality": deg_cent.get(node, 0.0),
-                    "betweenness_centrality": bet_cent.get(node, 0.0),
-                    "clustering_coefficient": clu_coef.get(node, 0.0),
                     "community": comm,
                     "color": color_palette[comm % len(color_palette)],
                     "size": _scale_node_size(pc, w_min, w_max),
@@ -155,7 +151,7 @@ class NetworkBuilder:
         kw_type: Dict[str, str] = {}
         paper_kws: List[List[str]] = []
 
-        for _, row in papers_df.iterrows():
+        for row in papers_df.to_dict("records"):
             kws_this_paper: List[str] = []
 
             # Author keywords
@@ -488,23 +484,31 @@ class NetworkBuilder:
             density = 0.0
 
         try:
-            avg_clustering = nx.average_clustering(undirected, weight="weight")
+            # For large graphs, sample 500 nodes to estimate clustering quickly
+            n = undirected.number_of_nodes()
+            if n > 500:
+                import random
+                sample = random.sample(list(undirected.nodes()), 500)
+                avg_clustering = nx.average_clustering(
+                    undirected, nodes=sample, weight="weight"
+                )
+            else:
+                avg_clustering = nx.average_clustering(undirected, weight="weight")
         except Exception:
             avg_clustering = 0.0
 
-        # Centrality on largest connected component.
-        # Betweenness and closeness are O(n³) — use approximation for large graphs.
+        # Degree centrality on largest connected component only.
+        # Betweenness (O(n²k)) and closeness (O(n²)) are skipped — they take
+        # 2-10 min on graphs with thousands of authors and are not displayed.
         try:
             lcc = undirected.subgraph(
                 max(nx.connected_components(undirected), key=len)
             ).copy()
             deg_cent = nx.degree_centrality(lcc)
-            n = lcc.number_of_nodes()
-            k = min(100, n) if n > 300 else None
-            bet_cent = nx.betweenness_centrality(lcc, normalized=True, k=k)
-            clo_cent = nx.closeness_centrality(lcc) if n <= 500 else {}
         except Exception:
-            deg_cent = bet_cent = clo_cent = {}
+            deg_cent = {}
+        bet_cent: dict = {}
+        clo_cent: dict = {}
 
         def top10(cent_dict):
             return sorted(cent_dict.items(), key=lambda x: x[1], reverse=True)[:10]

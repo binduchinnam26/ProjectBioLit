@@ -598,7 +598,7 @@ def _render_network_plotly(
         ),
     )
     fig = go.Figure(data=[edge_trace] + node_traces, layout=layout)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 # ── Public render functions ────────────────────────────────────────────────────
@@ -855,7 +855,7 @@ def render_overlay_visualization(
         data=[edge_trace, gray_trace, color_trace],
         layout=_plotly_layout(height),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.markdown(
         "<div style='font-size:11px;color:#6B7280;text-align:center;margin-top:-8px'>"
@@ -994,7 +994,7 @@ def render_density_visualization(
     layout.yaxis.update(range=[y_min, y_max])
 
     fig = go.Figure(data=[heatmap, node_overlay], layout=layout)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.markdown(
         "<div style='font-size:11px;color:#6B7280;text-align:center;margin-top:-8px'>"

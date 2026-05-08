@@ -365,11 +365,13 @@ class NLPProcessor:
             return pd.DataFrame(), pd.DataFrame()
 
         pmids = papers_df["pmid"].tolist()
-        # Abstract with title fallback — ensures every paper gets text for NLP
-        texts = [
-            _safe_text(row.get("abstract")) or _safe_text(row.get("title")) or ""
-            for _, row in papers_df.iterrows()
-        ]
+        # Abstract with title fallback — vectorized pandas is 10-50x faster than iterrows
+        texts = (
+            papers_df["abstract"].fillna("").str.strip()
+            .where(papers_df["abstract"].fillna("").str.strip() != "",
+                   papers_df.get("title", pd.Series("", index=papers_df.index)).fillna("").str.strip())
+            .tolist()
+        )
 
         total = len(texts)
         all_entities: List[Dict[str, Any]] = []

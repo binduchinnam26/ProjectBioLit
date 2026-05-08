@@ -65,7 +65,7 @@ def render_sidebar() -> str:
             if st.button(
                 f"{icon}  {label}",
                 key=f"nav_{key}",
-                use_container_width=True,
+                width="stretch",
                 help=f"Go to {label}",
             ):
                 st.session_state.active_page = key
@@ -139,7 +139,7 @@ def render_sidebar() -> str:
                 if st.button(
                     f"● {q_text}",
                     key=f"sess_{sess.get('id')}",
-                    use_container_width=True,
+                    width="stretch",
                     help=f"Load: {sess.get('query_text', '')}",
                 ):
                     st.session_state["restore_session_id"] = sess.get("id")
