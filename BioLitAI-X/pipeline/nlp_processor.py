@@ -7,7 +7,9 @@ All text fields are sanitized via _safe_text() before being passed to spaCy
 to prevent 'float object has no attribute strip' crashes on NaN abstracts.
 """
 
+import gc
 import logging
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -56,7 +58,7 @@ _UMLS_SEMTYPE_MAP: Dict[str, str] = {
     "T061": "LABORATORY_PROCEDURE", "T063": "LABORATORY_PROCEDURE",
 }
 
-_NLP_BATCH_SIZE = 64   # abstracts per nlp.pipe() batch
+_NLP_BATCH_SIZE = config.NLP_BATCH_SIZE   # abstracts per nlp.pipe() batch (default 32)
 
 
 class NLPProcessor:
@@ -295,6 +297,7 @@ class NLPProcessor:
 
         # Process in batches via nlp.pipe() — much faster than nlp() per doc
         processed = 0
+        t0 = time.monotonic()
         for batch_start in range(0, total, _NLP_BATCH_SIZE):
             batch_end = min(batch_start + _NLP_BATCH_SIZE, total)
             batch_texts = texts[batch_start:batch_end]
@@ -315,7 +318,6 @@ class NLPProcessor:
 
             for pmid, doc in zip(batch_pmids, docs):
                 if not doc.text.strip():
-                    # No text — skip NLP but paper record is already in DB
                     continue
 
                 try:
@@ -348,12 +350,18 @@ class NLPProcessor:
                         "sentence_context": sent_ctx,
                     })
 
+            # Free spaCy doc objects immediately — each doc can be ~1–5 MB
+            del docs
+            gc.collect()
+
             processed = batch_end
+            elapsed = time.monotonic() - t0
             _cb(
                 len(all_entities),
                 len(all_relationships),
                 f"NLP: {processed}/{total} papers | "
-                f"{len(all_entities):,} entities | {len(all_relationships):,} rels",
+                f"{len(all_entities):,} entities | {len(all_relationships):,} rels "
+                f"({elapsed:.0f}s)",
             )
 
         # Batch-persist to database (single transaction — much faster)

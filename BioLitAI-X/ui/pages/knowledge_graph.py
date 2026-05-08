@@ -107,12 +107,16 @@ def render():
     query         = st.session_state.get("current_query", "")
 
     # ── Page header ───────────────────────────────────────────────────────────
+    n_papers = len(papers_df) if papers_df is not None else 0
+    coauth_n = coauth_graph.number_of_nodes() if coauth_graph else 0
+    kw_n = keyword_graph.number_of_nodes() if keyword_graph else 0
     st.markdown(
         f"<h2 style='margin-bottom:2px'>Bibliometric Network Explorer</h2>"
         f"<p style='color:{config.TEXT_SECONDARY};font-size:13px;margin-bottom:0.8rem'>"
         f"Query: <b>{query}</b> &nbsp;·&nbsp; "
-        f"Three visualization modes — Network / Overlay / Density — "
-        f"matching VOSviewer 1.6.x</p>",
+        f"{n_papers:,} papers &nbsp;·&nbsp; "
+        f"{coauth_n:,} authors &nbsp;·&nbsp; {kw_n:,} keywords &nbsp;·&nbsp; "
+        f"Network / Overlay / Density views</p>",
         unsafe_allow_html=True,
     )
 
@@ -194,18 +198,19 @@ def render():
             )
             import networkx as nx
 
-            # Keyword type filter (only relevant for network view, applied before all modes)
+            # Keyword type filter
             kw_types = sorted({d.get("keyword_type", "author")
                                for _, d in keyword_graph.nodes(data=True)})
             selected_types = st.multiselect(
                 "Keyword types", options=kw_types, default=kw_types, key="kg_kw_types",
             )
-            kw_g = keyword_graph.copy()
-            if selected_types:
-                kw_g.remove_nodes_from([
-                    n for n, d in kw_g.nodes(data=True)
-                    if d.get("keyword_type") not in selected_types
-                ])
+            # Filter nodes by type — work on a view (subgraph) not a full copy
+            if selected_types and len(selected_types) < len(kw_types):
+                keep = [n for n, d in keyword_graph.nodes(data=True)
+                        if d.get("keyword_type") in selected_types]
+                kw_g = keyword_graph.subgraph(keep)
+            else:
+                kw_g = keyword_graph
 
             st.markdown(
                 "<div style='font-size:12px;color:#6B7280;margin-bottom:4px'>"
@@ -318,13 +323,21 @@ def render():
             )
             from pipeline.gap_detector import GapDetector
 
+            kg_nodes = kg_graph.number_of_nodes() if kg_graph else 0
+            kg_edges = kg_graph.number_of_edges() if kg_graph else 0
             st.markdown(
-                "<p style='font-size:13px;color:#6B7280;margin-bottom:6px'>"
-                "Node&nbsp;size&nbsp;=&nbsp;evidence strength &nbsp;·&nbsp; "
-                "Color&nbsp;=&nbsp;entity type &nbsp;·&nbsp; "
-                "Arrows&nbsp;=&nbsp;relationship direction</p>",
+                f"<p style='font-size:13px;color:#6B7280;margin-bottom:6px'>"
+                f"Node&nbsp;size&nbsp;=&nbsp;evidence strength &nbsp;·&nbsp; "
+                f"Color&nbsp;=&nbsp;entity type &nbsp;·&nbsp; "
+                f"Arrows&nbsp;=&nbsp;relationship direction &nbsp;·&nbsp; "
+                f"{kg_nodes:,} nodes, {kg_edges:,} edges</p>",
                 unsafe_allow_html=True,
             )
+            if kg_nodes > config.GRAPH_MAX_DISPLAY_NODES:
+                st.info(
+                    f"Entity graph has {kg_nodes:,} nodes. "
+                    f"Use the filters on the left to focus on specific entity types or relationships."
+                )
 
             ctrl_col, graph_col = st.columns([1, 4])
 

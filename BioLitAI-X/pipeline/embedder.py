@@ -3,12 +3,13 @@ EmbeddingEngine — biomedical sentence embeddings using PubMedBERT +
 FAISS index for fast semantic search. Query-agnostic: works for any
 topic retrieved from PubMed.
 
-Uses model.encode() over the full corpus in one call (batch_size=256)
-for 3-5x throughput vs manual batching.  Abstract-missing papers use
-the title as fallback; if both are absent a minimal stub is used so
-every paper gets a valid embedding.
+Tuned for 2k–3k papers: batch_size=64 keeps RAM usage flat while
+still being much faster than encoding one abstract at a time.
+Abstract-missing papers use the title as fallback; if both are absent
+a minimal stub is used so every paper gets a valid embedding.
 """
 
+import gc
 import json
 import logging
 from pathlib import Path
@@ -91,7 +92,7 @@ class EmbeddingEngine:
         self,
         papers_df: pd.DataFrame,
         query: str = "",
-        batch_size: int = 256,
+        batch_size: int = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> np.ndarray:
         """
@@ -100,10 +101,13 @@ class EmbeddingEngine:
 
         Text priority per paper: abstract → title → stub.
         All papers receive an embedding; no data is dropped.
-        Encoding is done in one model.encode() call for maximum throughput.
+        batch_size defaults to config.EMBEDDING_BATCH_SIZE (64) to keep
+        RAM usage low for 2k-3k paper corpora.
 
         Returns the full embeddings array (shape: [n_papers, embedding_dim]).
         """
+        if batch_size is None:
+            batch_size = config.EMBEDDING_BATCH_SIZE
         self._check_ready()
 
         def _cb(done: int, total: int, msg: str):
@@ -141,6 +145,7 @@ class EmbeddingEngine:
             embeddings = np.zeros((total, config.EMBEDDING_DIMENSION), dtype="float32")
 
         self.index.add(embeddings)
+        gc.collect()
         self._pmid_list.extend(pmids)
 
         if self._persist_index:
