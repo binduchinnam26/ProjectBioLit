@@ -100,9 +100,14 @@ class HypothesisGenerator:
         logger.info("HypothesisGenerator ready (transport=REST, model=%s)", config.GEMINI_MODEL)
 
     def _check_ready(self):
-        if not self._ready or self._session is None:
+        if not self._ready:
             raise RuntimeError(
                 "HypothesisGenerator.setup() must be called before use."
+            )
+        # In online mode a session is required; offline mode has no session
+        if self.has_api_key and self._session is None:
+            raise RuntimeError(
+                "HypothesisGenerator session not initialised. Call setup() first."
             )
 
     # ── Gemini REST call ──────────────────────────────────────────────────────
@@ -379,7 +384,8 @@ class HypothesisGenerator:
             except Exception as exc:
                 logger.error("Hypothesis failed for %s ↔ %s: %s", ca, cb, exc)
 
-            if i < total - 1:
+            # Only sleep between API calls; skip delay entirely in offline mode
+            if i < total - 1 and self.has_api_key:
                 time.sleep(config.HYPOTHESIS_API_DELAY)
 
         hypotheses.sort(key=lambda h: h.get("confidence_score", 0), reverse=True)
