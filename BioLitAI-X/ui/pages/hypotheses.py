@@ -42,12 +42,11 @@ def _render_inner():
     )
 
     # ── API key status banner ────────────────────────────────────────────────
-    if not os.getenv("GEMINI_API_KEY"):
+    if not os.getenv("GEMINI_API_KEY", "").strip():
         st.info(
-            "ℹ️ **GEMINI_API_KEY not configured** — running in offline mode. "
-            "Hypotheses will be generated using template-based reasoning from "
-            "the knowledge graph gaps. For full AI-powered hypotheses, add "
-            "`GEMINI_API_KEY=your_key` to your `.env` file."
+            "ℹ️ **GEMINI_API_KEY not configured** — hypotheses will be generated "
+            "using template-based reasoning. Add `GEMINI_API_KEY=your_key` to "
+            "your `.env` file and click Generate again for AI-powered hypotheses."
         )
 
     # ── Generate button ───────────────────────────────────────────────────────
