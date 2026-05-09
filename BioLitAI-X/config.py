@@ -108,7 +108,7 @@ GEMINI_TOP_P = 0.85
 GEMINI_TOP_K = 40
 GEMINI_MAX_OUTPUT_TOKENS = 2048
 HYPOTHESIS_BATCH_SIZE = 10
-HYPOTHESIS_API_DELAY = 2     # seconds between Gemini calls
+HYPOTHESIS_API_DELAY = 5     # seconds between Gemini calls; free tier = 15 RPM → need ≥4s
 
 # ── Visualization ─────────────────────────────────────────────────────────────
 COMMUNITY_COLORS = [
