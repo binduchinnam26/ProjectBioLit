@@ -250,8 +250,14 @@ def _generate_hypotheses(papers_df, entities_df, embedder, db, query, gap_report
 
     try:
         from pipeline.hypothesis_generator import HypothesisGenerator
-        gen = HypothesisGenerator(db_manager=db, embedding_engine=embedder)
-        gen.setup()
+        gen = st.session_state.get("hyp_generator")
+        if gen is None:
+            gen = HypothesisGenerator(db_manager=db, embedding_engine=embedder)
+            gen.setup()
+            st.session_state["hyp_generator"] = gen
+        else:
+            gen.db = db
+            gen.embedder = embedder
 
         hypotheses = gen.generate_batch_hypotheses(
             gap_report=gap_report,

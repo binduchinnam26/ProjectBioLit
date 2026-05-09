@@ -127,6 +127,7 @@ class HypothesisGenerator:
             if test:
                 self._api_working = True
                 logger.info("Gemini REST API reachable (model=%s)", config.GEMINI_MODEL)
+                time.sleep(config.HYPOTHESIS_API_DELAY)  # avoid back-to-back call after smoke test
             else:
                 logger.warning(
                     "Gemini REST API smoke test returned no text — "
