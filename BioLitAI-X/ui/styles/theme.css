@@ -27,7 +27,7 @@ html, body, [class*="css"] {
 
 /* ── Page transition animation ──────────────────────────────────────────────── */
 @keyframes bx-fade-in {
-  from { opacity: 0; transform: translateY(6px); }
+  from { opacity: 0; transform: translateY(4px); }
   to   { opacity: 1; transform: translateY(0);   }
 }
 
@@ -36,7 +36,7 @@ html, body, [class*="css"] {
   background-color: var(--bg) !important;
   padding-top: 1.5rem !important;
   max-width: 100% !important;
-  animation: bx-fade-in 0.18s ease-out;
+  animation: bx-fade-in 0.08s ease-out both;
 }
 
 /* ── Sidebar ────────────────────────────────────────────────────────────── */
@@ -183,7 +183,7 @@ h1, h2, h3, h4, h5, h6 {
 }
 /* Tab panel content — fade in when switching tabs */
 .stTabs [data-baseweb="tab-panel"] {
-  animation: bx-fade-in 0.15s ease-out;
+  animation: bx-fade-in 0.06s ease-out both;
 }
 
 /* ── Divider ────────────────────────────────────────────────────────────── */
