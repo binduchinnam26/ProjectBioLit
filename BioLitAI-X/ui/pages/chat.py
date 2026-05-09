@@ -52,6 +52,7 @@ def _render_inner():
     with clr_col:
         if st.button("Clear chat", key="chat_clear"):
             st.session_state["chat_history"] = []
+            st.session_state.pop("chat_generator", None)
             st.rerun()
 
     st.markdown(
@@ -142,6 +143,20 @@ def _render_inner():
         st.rerun()
 
 
+def _get_generator(embedder) -> "HypothesisGenerator":
+    """Return a cached HypothesisGenerator, creating and setting it up only once per session."""
+    from pipeline.hypothesis_generator import HypothesisGenerator
+    gen = st.session_state.get("chat_generator")
+    if gen is None:
+        gen = HypothesisGenerator(embedding_engine=embedder)
+        gen.setup()
+        st.session_state["chat_generator"] = gen
+    else:
+        # Update embedder reference in case it changed
+        gen.embedder = embedder
+    return gen
+
+
 def _send_message(message: str, papers_df, embedder):
     """Send a message to Gemini and append to chat history."""
     history = st.session_state.get("chat_history", [])
@@ -151,9 +166,7 @@ def _send_message(message: str, papers_df, embedder):
 
     with st.spinner("Thinking..."):
         try:
-            from pipeline.hypothesis_generator import HypothesisGenerator
-            gen = HypothesisGenerator(embedding_engine=embedder)
-            gen.setup()
+            gen = _get_generator(embedder)
 
             response_text, source_pmids = gen.chat_about_literature(
                 user_message=message,
