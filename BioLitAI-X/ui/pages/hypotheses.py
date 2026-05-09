@@ -1,8 +1,11 @@
 """AI Hypotheses panel page."""
 
+import logging
 import os
 
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 import config
 from ui.components.cards import empty_state, hypothesis_card
 
@@ -78,36 +81,17 @@ def render():
         unsafe_allow_html=True,
     )
 
-    # ── If no gaps detected yet, run gap detection ────────────────────────────
-    if not gap_report:
+    # ── Gap status (shown once, never blocks page load) ───────────────────────
+    if gap_report:
+        st.caption(f"✅ {len(gap_report)} research gaps ready as hypothesis input.")
+    else:
         kg = st.session_state.get("knowledge_graph")
         if kg and kg.graph.number_of_nodes() > 0:
-            with st.spinner("Detecting research gaps..."):
-                try:
-                    from pipeline.gap_detector import GapDetector
-                    gd = GapDetector(kg)
-                    gd.find_structural_gaps()
-                    gd.find_cross_domain_gaps()
-                    gd.find_temporal_gaps(papers_df)
-                    gap_report = gd.compile_gap_report()
-                    st.session_state["gap_report"] = gap_report
-                except Exception as exc:
-                    st.warning(f"Gap detection failed: {exc}")
+            st.caption("Research gaps will be detected automatically when you generate hypotheses.")
         else:
-            # KG is empty (NLP skipped) — derive gaps from keyword co-occurrence
-            if papers_df is not None and not papers_df.empty:
-                gap_report = _keyword_gap_fallback(papers_df)
-                if gap_report:
-                    st.session_state["gap_report"] = gap_report
-                    st.info(
-                        f"NLP knowledge graph not available — derived {len(gap_report)} "
-                        "keyword-based research gaps from the paper corpus instead."
-                    )
-            else:
-                st.info(
-                    "Knowledge graph is empty. NLP processing must complete to detect gaps. "
-                    "You can still generate hypotheses once the graph is available."
-                )
+            st.caption(
+                "No NLP knowledge graph available — keyword-based gaps will be used automatically."
+            )
 
     # ── Display hypotheses ────────────────────────────────────────────────────
     if not hypotheses:
@@ -227,14 +211,29 @@ def _generate_hypotheses(papers_df, entities_df, embedder, db, query, gap_report
         return
 
     if not gap_report:
-        # Try keyword fallback before giving up
-        gap_report = _keyword_gap_fallback(papers_df) if papers_df is not None else []
-        if gap_report:
-            st.session_state["gap_report"] = gap_report
-            st.info(f"Using keyword-derived gaps ({len(gap_report)} pairs) as input.")
-        else:
-            st.error("No research gaps detected. Run the pipeline so entities can be extracted.")
-            return
+        # 1) Try KG-based gap detection first
+        kg = st.session_state.get("knowledge_graph")
+        if kg and kg.graph.number_of_nodes() > 0:
+            try:
+                from pipeline.gap_detector import GapDetector
+                with st.spinner("Detecting research gaps from knowledge graph..."):
+                    detector = GapDetector(knowledge_graph=kg)
+                    gap_report = detector.compile_gap_report()
+                if gap_report:
+                    st.session_state["gap_report"] = gap_report
+                    st.info(f"Detected {len(gap_report)} research gaps from knowledge graph.")
+            except Exception as exc:
+                logger.debug("KG gap detection failed: %s", exc)
+
+        # 2) Fall back to keyword co-occurrence if KG gave nothing
+        if not gap_report:
+            gap_report = _keyword_gap_fallback(papers_df) if papers_df is not None else []
+            if gap_report:
+                st.session_state["gap_report"] = gap_report
+                st.info(f"Using keyword-derived gaps ({len(gap_report)} pairs) as input.")
+            else:
+                st.error("No research gaps detected. Run the pipeline so entities can be extracted.")
+                return
 
     progress = st.progress(0.0)
     status = st.empty()
