@@ -294,7 +294,12 @@ class HypothesisGenerator:
 
         raw_response = self._call_gemini_with_retry(prompt)
         if raw_response is None:
-            return None
+            # API call failed — fall back to template-based offline generation
+            logger.warning(
+                "Gemini API call failed for %s ↔ %s; using offline fallback",
+                concept_a, concept_b,
+            )
+            return self._generate_hypothesis_offline(gap_pair, evidence_context, query_used)
 
         parsed = self._parse_structured_response(raw_response)
         confidence_score = _CONFIDENCE_MAP.get(
@@ -466,8 +471,11 @@ class HypothesisGenerator:
         if not self.has_api_key:
             return self._chat_offline(user_message, paper_context, source_pmids)
 
-        response_text = self._call_gemini_with_retry(prompt) or \
-            "Unable to generate a response. Please try again."
+        response_text = self._call_gemini_with_retry(prompt)
+        if response_text is None:
+            # API call failed — fall back to keyword-match offline response
+            logger.warning("Gemini API call failed for chat query; using offline fallback")
+            return self._chat_offline(user_message, paper_context, source_pmids)
 
         return response_text, source_pmids
 
@@ -563,31 +571,65 @@ class HypothesisGenerator:
         source_pmids: List[str],
     ) -> Tuple[str, List[str]]:
         """
-        Keyword-match based chat response when no Gemini API key is available.
-        Extracts the most relevant sentences from retrieved abstracts.
+        Keyword-match based chat response when Gemini API is unavailable.
+        Extracts relevant sentences and paper metadata from retrieved abstracts.
         """
-        sentences: List[str] = []
+        keywords = [w for w in user_message.lower().split() if len(w) > 3]
+
+        # Parse the paper_context into (header, body) pairs
+        blocks: List[Dict[str, str]] = []
+        current: Dict[str, str] = {}
         for line in paper_context.split("\n"):
             line = line.strip()
-            if not line or line.startswith("[PMID"):
+            if not line:
                 continue
-            keywords = [w for w in user_message.lower().split() if len(w) > 3]
-            if any(kw in line.lower() for kw in keywords):
-                sentences.append(line)
+            if line.startswith("[PMID"):
+                if current:
+                    blocks.append(current)
+                current = {"header": line, "text": ""}
+            elif current:
+                current["text"] += " " + line
 
-        if sentences:
-            summary = " ".join(sentences[:6])
+        if current:
+            blocks.append(current)
+
+        # Score each block by keyword matches in its text
+        scored: List[tuple] = []
+        for blk in blocks:
+            text_lower = blk["text"].lower()
+            score = sum(1 for kw in keywords if kw in text_lower)
+            if score > 0:
+                scored.append((score, blk))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_blocks = scored[:4]
+
+        if top_blocks:
+            bullets: List[str] = []
+            for _, blk in top_blocks:
+                header = blk["header"]
+                # Extract up to 2 matching sentences from the text
+                sentences = [s.strip() for s in re.split(r"[.!?]", blk["text"]) if len(s.strip()) > 30]
+                matching = [s for s in sentences if any(kw in s.lower() for kw in keywords)][:2]
+                snippet = ". ".join(matching) + "." if matching else sentences[0] + "." if sentences else ""
+                if snippet:
+                    bullets.append(f"**{header}**\n{snippet}")
+
+            bullet_text = "\n\n".join(bullets)
             response = (
-                f"Based on the retrieved papers, here are relevant findings:\n\n"
-                f"{summary}\n\n"
-                f"*(Note: AI-powered responses require a GEMINI_API_KEY in your .env file. "
-                f"Showing keyword-matched excerpts from {len(source_pmids)} papers instead.)*"
+                f"Based on {len(source_pmids)} retrieved papers, here are the most relevant findings "
+                f"for *\"{user_message}\"*:\n\n"
+                f"{bullet_text}\n\n"
+                f"---\n*Note: Full AI-powered analysis requires a valid GEMINI_API_KEY. "
+                f"Add `GEMINI_API_KEY=your_key` to your `.env` file and restart the app.*"
             )
         else:
             response = (
-                f"The loaded paper set mentions terms related to your question, but no "
-                f"directly relevant sentences were extracted. "
-                f"*(Add GEMINI_API_KEY to .env for full AI-powered chat.)*"
+                f"The {len(source_pmids)} retrieved papers were searched for terms related to "
+                f"*\"{user_message}\"*, but no directly matching excerpts were found in the "
+                f"top results. Try rephrasing your question using specific biomedical terms "
+                f"from the dataset.\n\n"
+                f"*For full AI-powered chat, add `GEMINI_API_KEY=your_key` to your `.env` file.*"
             )
         return response, source_pmids
 
