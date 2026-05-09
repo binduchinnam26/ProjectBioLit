@@ -1,5 +1,7 @@
 """AI Hypotheses panel page."""
 
+import os
+
 import streamlit as st
 import config
 from ui.components.cards import empty_state, hypothesis_card
@@ -26,6 +28,15 @@ def render():
         f"Generated from knowledge graph gaps, grounded in retrieved literature evidence.</p>",
         unsafe_allow_html=True,
     )
+
+    # ── API key status banner ────────────────────────────────────────────────
+    if not os.getenv("GEMINI_API_KEY"):
+        st.info(
+            "ℹ️ **GEMINI_API_KEY not configured** — running in offline mode. "
+            "Hypotheses will be generated using template-based reasoning from "
+            "the knowledge graph gaps. For full AI-powered hypotheses, add "
+            "`GEMINI_API_KEY=your_key` to your `.env` file."
+        )
 
     # ── Generate button ───────────────────────────────────────────────────────
     gen_col, filt_col = st.columns([2, 3])
@@ -83,10 +94,20 @@ def render():
                 except Exception as exc:
                     st.warning(f"Gap detection failed: {exc}")
         else:
-            st.info(
-                "Knowledge graph is empty. NLP processing must complete to detect gaps. "
-                "You can still generate hypotheses once the graph is available."
-            )
+            # KG is empty (NLP skipped) — derive gaps from keyword co-occurrence
+            if papers_df is not None and not papers_df.empty:
+                gap_report = _keyword_gap_fallback(papers_df)
+                if gap_report:
+                    st.session_state["gap_report"] = gap_report
+                    st.info(
+                        f"NLP knowledge graph not available — derived {len(gap_report)} "
+                        "keyword-based research gaps from the paper corpus instead."
+                    )
+            else:
+                st.info(
+                    "Knowledge graph is empty. NLP processing must complete to detect gaps. "
+                    "You can still generate hypotheses once the graph is available."
+                )
 
     # ── Display hypotheses ────────────────────────────────────────────────────
     if not hypotheses:
@@ -145,6 +166,60 @@ def render():
         st.info("No hypotheses match the current filters.")
 
 
+def _keyword_gap_fallback(papers_df) -> list:
+    """
+    Derive simple concept-pair gaps from top keyword co-occurrence when the
+    NLP knowledge graph was not built.  Returns a gap_report-compatible list.
+    """
+    from collections import Counter, defaultdict
+    from itertools import combinations
+
+    keyword_counts: Counter = Counter()
+    pair_counts: defaultdict = defaultdict(int)
+
+    for _, row in papers_df.iterrows():
+        kws = []
+        for kw in (row.get("author_keywords") or []):
+            if kw and len(kw) > 3:
+                kws.append(kw.lower().strip())
+        for mesh in (row.get("mesh_terms") or []):
+            if isinstance(mesh, dict):
+                desc = mesh.get("descriptor", "")
+                if desc and len(desc) > 3:
+                    kws.append(desc.lower().strip())
+        kws = list(set(kws))[:15]
+        for kw in kws:
+            keyword_counts[kw] += 1
+        for a, b in combinations(sorted(kws), 2):
+            pair_counts[(a, b)] += 1
+
+    # Keep only well-attested keywords
+    min_freq = max(2, len(papers_df) // 50)
+    top_kws = {kw for kw, c in keyword_counts.items() if c >= min_freq}
+
+    # Candidate pairs: co-occur rarely relative to their individual frequency
+    # → they represent a gap (both present but not often together)
+    gap_pairs = []
+    for (a, b), co_count in pair_counts.items():
+        if a not in top_kws or b not in top_kws:
+            continue
+        freq_a = keyword_counts[a]
+        freq_b = keyword_counts[b]
+        expected = (freq_a * freq_b) / max(len(papers_df), 1)
+        # Under-connected: co-occurrence far below expectation
+        if co_count < max(2, expected * 0.3):
+            gap_pairs.append({
+                "concept_a":        a,
+                "concept_b":        b,
+                "gap_type":         "structural",
+                "shared_neighbors": [],
+                "score":            1.0 / max(co_count, 1),
+            })
+
+    gap_pairs.sort(key=lambda g: g["score"], reverse=True)
+    return gap_pairs[:20]
+
+
 def _generate_hypotheses(papers_df, entities_df, embedder, db, query, gap_report):
     """Run batch hypothesis generation with progress tracking."""
     if papers_df is None or papers_df.empty:
@@ -152,8 +227,14 @@ def _generate_hypotheses(papers_df, entities_df, embedder, db, query, gap_report
         return
 
     if not gap_report:
-        st.error("No research gaps detected. Ensure NLP and knowledge graph steps completed.")
-        return
+        # Try keyword fallback before giving up
+        gap_report = _keyword_gap_fallback(papers_df) if papers_df is not None else []
+        if gap_report:
+            st.session_state["gap_report"] = gap_report
+            st.info(f"Using keyword-derived gaps ({len(gap_report)} pairs) as input.")
+        else:
+            st.error("No research gaps detected. Run the pipeline so entities can be extracted.")
+            return
 
     progress = st.progress(0.0)
     status = st.empty()

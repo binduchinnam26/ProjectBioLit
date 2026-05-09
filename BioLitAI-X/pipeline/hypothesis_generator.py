@@ -54,6 +54,10 @@ class HypothesisGenerator:
         self._session = None          # requests.Session
         self._ready = False
 
+    @property
+    def has_api_key(self) -> bool:
+        return bool(os.getenv("GEMINI_API_KEY"))
+
     # ── Setup ─────────────────────────────────────────────────────────────────
 
     def setup(self):
@@ -61,15 +65,17 @@ class HypothesisGenerator:
         Initialise a requests.Session pointed at the Gemini REST API.
         SSL verification is disabled to work in environments with a
         self-signed corporate proxy certificate in the chain.
-        Raises EnvironmentError if GEMINI_API_KEY is missing.
+        When GEMINI_API_KEY is absent the generator operates in offline
+        template-mode (no API calls, pattern-based hypotheses).
         """
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            raise EnvironmentError(
-                "GEMINI_API_KEY not found in .env file. Please add your "
-                "Google Gemini API key as GEMINI_API_KEY=your_key_here "
-                "in the .env file before running."
+            logger.warning(
+                "GEMINI_API_KEY not set — HypothesisGenerator running in offline "
+                "template mode. Add GEMINI_API_KEY to .env for AI-generated hypotheses."
             )
+            self._ready = True
+            return
 
         import requests
         import urllib3
@@ -277,6 +283,10 @@ class HypothesisGenerator:
             f"existing work"
         )
 
+        # Offline fallback when no API key is configured
+        if not self.has_api_key:
+            return self._generate_hypothesis_offline(gap_pair, evidence_context, query_used)
+
         raw_response = self._call_gemini_with_retry(prompt)
         if raw_response is None:
             return None
@@ -446,10 +456,134 @@ class HypothesisGenerator:
             + f"User question: {user_message}"
         )
 
+        # Offline fallback when no API key is configured
+        if not self.has_api_key:
+            return self._chat_offline(user_message, paper_context, source_pmids)
+
         response_text = self._call_gemini_with_retry(prompt) or \
             "Unable to generate a response. Please try again."
 
         return response_text, source_pmids
+
+    # ── Response parser ───────────────────────────────────────────────────────
+
+    # ── Offline / template-based hypothesis generation ────────────────────────
+
+    def _generate_hypothesis_offline(
+        self,
+        gap_pair: Dict[str, Any],
+        evidence_context: Dict[str, str],
+        query_used: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Template-based hypothesis builder that works without any API key.
+        Produces a structured hypothesis dict grounded in retrieved paper snippets.
+        """
+        concept_a = gap_pair.get("concept_a", "")
+        concept_b = gap_pair.get("concept_b", "") or ""
+        gap_type  = gap_pair.get("gap_type", "structural")
+
+        # Extract PMID citations from evidence text
+        all_evidence = (
+            evidence_context.get("evidence_a", "")
+            + evidence_context.get("evidence_b", "")
+            + evidence_context.get("connecting_evidence", "")
+        )
+        cited_pmids = list(set(re.findall(r"PMID[:\s]*(\d{6,9})", all_evidence)))[:5]
+
+        hyp_text = (
+            f"We hypothesize that {concept_a} and {concept_b} share a "
+            f"previously undescribed functional relationship. "
+            f"Investigating this connection may reveal novel therapeutic or "
+            f"mechanistic insights in the context of {query_used or 'biomedical research'}."
+        )
+        rationale = (
+            f"Both {concept_a} and {concept_b} appear in the retrieved literature "
+            f"but no direct co-occurrence edge exists between them in the current "
+            f"knowledge graph (gap type: {gap_type}). "
+            f"The connecting evidence suggests shared biological pathways or co-regulatory "
+            f"mechanisms that have not been explicitly tested."
+        )
+        experiment = (
+            f"Design a controlled in vitro assay measuring the effect of modulating "
+            f"{concept_a} activity on {concept_b}-associated endpoints, using the "
+            f"experimental models described in the supporting papers as reference controls."
+        )
+        supporting = (
+            f"Papers {', '.join(['PMID:' + p for p in cited_pmids]) or 'from the corpus'} "
+            f"provide indirect evidence supporting this connection."
+        )
+        novelty = (
+            f"No direct study linking {concept_a} and {concept_b} was identified "
+            f"in the current corpus, making this a structurally novel research gap."
+        )
+
+        hypothesis_obj = {
+            "concept_a":            concept_a,
+            "concept_b":            concept_b,
+            "hypothesis_text":      hyp_text,
+            "biological_rationale": rationale,
+            "supporting_evidence":  supporting,
+            "suggested_experiment": experiment,
+            "confidence_label":     "Medium",
+            "confidence_score":     2,
+            "novelty":              novelty,
+            "evidence_pmids":       cited_pmids,
+            "raw_response":         hyp_text,
+            "query_used":           query_used,
+            "gap_type":             gap_type,
+        }
+
+        if self.db:
+            try:
+                self.db.insert_hypothesis(
+                    concept_a=concept_a,
+                    concept_b=concept_b,
+                    hypothesis_text=hyp_text,
+                    evidence_pmids=cited_pmids,
+                    confidence_score=2,
+                    raw_response=hyp_text,
+                    query_used=query_used,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist offline hypothesis to DB: %s", exc)
+
+        return hypothesis_obj
+
+    def _chat_offline(
+        self,
+        user_message: str,
+        paper_context: str,
+        source_pmids: List[str],
+    ) -> Tuple[str, List[str]]:
+        """
+        Keyword-match based chat response when no Gemini API key is available.
+        Extracts the most relevant sentences from retrieved abstracts.
+        """
+        sentences: List[str] = []
+        for line in paper_context.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("[PMID"):
+                continue
+            keywords = [w for w in user_message.lower().split() if len(w) > 3]
+            if any(kw in line.lower() for kw in keywords):
+                sentences.append(line)
+
+        if sentences:
+            summary = " ".join(sentences[:6])
+            response = (
+                f"Based on the retrieved papers, here are relevant findings:\n\n"
+                f"{summary}\n\n"
+                f"*(Note: AI-powered responses require a GEMINI_API_KEY in your .env file. "
+                f"Showing keyword-matched excerpts from {len(source_pmids)} papers instead.)*"
+            )
+        else:
+            response = (
+                f"The loaded paper set mentions terms related to your question, but no "
+                f"directly relevant sentences were extracted. "
+                f"*(Add GEMINI_API_KEY to .env for full AI-powered chat.)*"
+            )
+        return response, source_pmids
 
     # ── Response parser ───────────────────────────────────────────────────────
 
