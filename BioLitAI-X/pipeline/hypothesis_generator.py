@@ -89,15 +89,35 @@ class HypothesisGenerator:
 
         import requests
         import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        import ssl
+        urllib3.disable_warnings()
 
         self._api_key = api_key
         self._session = requests.Session()
-        self._session.verify = False   # bypass self-signed cert chain
-        # Send key both as header and as query-param fallback
+        self._session.verify = False
+
+        # Mount a custom adapter that disables SSL at the socket level —
+        # needed on Windows where the system cert store may intercept TLS
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.ssl_ import create_urllib3_context
+
+            class _NoVerifyAdapter(HTTPAdapter):
+                def init_poolmanager(self, *args, **kwargs):
+                    ctx = create_urllib3_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    kwargs["ssl_context"] = ctx
+                    super().init_poolmanager(*args, **kwargs)
+
+            self._session.mount("https://", _NoVerifyAdapter())
+        except Exception as _ssl_exc:
+            logger.debug("Custom SSL adapter skipped: %s", _ssl_exc)
+
         self._session.headers.update({
             "x-goog-api-key": api_key,
             "Content-Type": "application/json",
+            "User-Agent": "BioLitAI-X/1.0",
         })
 
         # Smoke-test connectivity with a minimal prompt
@@ -161,22 +181,35 @@ class HypothesisGenerator:
 
         delay = 2.0
         last_exc: Optional[Exception] = None
+        self._last_api_error: str = ""
 
         for attempt in range(1, max_retries + 1):
             try:
                 resp = self._session.post(url, json=payload, timeout=60)
                 if resp.status_code == 429:
                     raise RuntimeError(f"429 RESOURCE_EXHAUSTED: {resp.text[:200]}")
+                if resp.status_code in (400, 401, 403):
+                    # Auth / key errors — no point retrying
+                    try:
+                        err_msg = resp.json().get("error", {}).get("message", resp.text[:200])
+                    except Exception:
+                        err_msg = resp.text[:200]
+                    self._last_api_error = f"HTTP {resp.status_code}: {err_msg}"
+                    logger.error("Gemini API key error: %s", self._last_api_error)
+                    return None
                 resp.raise_for_status()
                 data = resp.json()
                 return data["candidates"][0]["content"]["parts"][0]["text"]
 
             except Exception as exc:
                 last_exc = exc
+                # Always capture the last error for display in offline messages
+                self._last_api_error = f"{type(exc).__name__}: {str(exc)[:200]}"
                 exc_str = str(exc).lower()
                 retryable = any(k in exc_str for k in (
                     "429", "quota", "resource_exhausted",
                     "timeout", "connection", "network", "ssl", "503",
+                    "proxy", "certificate", "handshake",
                 ))
                 if retryable and attempt < max_retries:
                     logger.warning(
@@ -632,11 +665,21 @@ class HypothesisGenerator:
 
         # Choose the right note based on why we're offline
         if self.has_api_key:
-            api_note = (
-                "*Note: Your GEMINI_API_KEY is set but the Gemini API is currently "
-                "unreachable (network/quota/model issue). Showing keyword-matched excerpts instead. "
-                "Check your API key at https://aistudio.google.com/app/apikey*"
-            )
+            err_detail = getattr(self, "_last_api_error", "")
+            if err_detail:
+                api_note = (
+                    f"*⚠️ Gemini API error — `{err_detail}`. "
+                    f"If this says 'API key not valid', regenerate your key at "
+                    f"https://aistudio.google.com/app/apikey and update `.env`. "
+                    f"If this is an SSL/connection error, try adding `REQUESTS_CA_BUNDLE=` "
+                    f"(empty value) to your `.env` file.*"
+                )
+            else:
+                api_note = (
+                    "*Note: Your GEMINI_API_KEY is set but the Gemini API call failed. "
+                    "Check the server console for the exact error. "
+                    "Showing keyword-matched excerpts instead.*"
+                )
         else:
             api_note = (
                 "*Note: Add `GEMINI_API_KEY=your_key` to your `.env` file for "
