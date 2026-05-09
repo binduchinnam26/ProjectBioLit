@@ -335,10 +335,21 @@ def render():
     # ══════════════════════════════════════════════════════════════════════════
     with tab_topic:
         if not topic_graph or topic_graph.number_of_nodes() == 0:
-            st.info(
-                "Topic landscape not available. "
-                "NLP and embedding steps must complete first."
-            )
+            embedder = st.session_state.get("embedder")
+            if embedder is None:
+                st.info(
+                    "Topic landscape requires embeddings. "
+                    "Go to **Semantic Search** and click **Build Embeddings** first, then return here."
+                )
+            else:
+                st.info(
+                    "Topic landscape not yet computed. "
+                    "Click below to run topic modelling (UMAP + HDBSCAN) — takes 1-3 minutes."
+                )
+                if st.button("⚡ Compute Topic Model", type="primary", key="kg_build_topics_btn"):
+                    from ui.pages.analysis import _build_topics_lazy
+                    _build_topics_lazy(papers_df, embedder)
+                    st.rerun()
         else:
             from visualization.network_viz import (
                 render_topic_network,
