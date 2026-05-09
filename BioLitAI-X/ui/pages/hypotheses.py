@@ -11,6 +11,15 @@ from ui.components.cards import empty_state, hypothesis_card
 
 
 def render():
+    try:
+        _render_inner()
+    except Exception as exc:
+        logger.exception("Hypotheses page crashed: %s", exc)
+        st.error(f"⚠️ Page error: {exc}")
+        st.info("Try refreshing the page. If the issue persists, return to Home and re-run the search.")
+
+
+def _render_inner():
     if not st.session_state.get("pipeline_complete"):
         empty_state("💡", "No data loaded yet",
                     "Run a search on the Home page first.")
@@ -94,14 +103,8 @@ def render():
             )
 
     # ── Display hypotheses ────────────────────────────────────────────────────
-    if not hypotheses:
-        # Try loading from database
-        if db and query:
-            try:
-                hypotheses = db.get_hypotheses_by_query(query)
-                st.session_state["hypotheses"] = hypotheses
-            except Exception:
-                pass
+    # NOTE: No DB auto-load here — avoids SQLite lock wait when background
+    # paper-write thread is still running. Session-state is the source of truth.
 
     if not hypotheses:
         st.markdown(

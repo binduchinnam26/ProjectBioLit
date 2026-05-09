@@ -1,11 +1,14 @@
 """Chat with Literature page — multi-turn Gemini chat grounded in loaded papers."""
 
+import logging
 import os
 
 import streamlit as st
 import config
 from ui.components.cards import empty_state
 from utils.helpers import pubmed_url
+
+logger = logging.getLogger(__name__)
 
 
 _STARTER_QUESTIONS = [
@@ -18,6 +21,15 @@ _STARTER_QUESTIONS = [
 
 
 def render():
+    try:
+        _render_inner()
+    except Exception as exc:
+        logger.exception("Chat page crashed: %s", exc)
+        st.error(f"⚠️ Page error: {exc}")
+        st.info("Try refreshing the page. If the issue persists, return to Home and re-run the search.")
+
+
+def _render_inner():
     if not st.session_state.get("pipeline_complete"):
         empty_state("💬", "No data loaded yet",
                     "Run a search on the Home page first.")
