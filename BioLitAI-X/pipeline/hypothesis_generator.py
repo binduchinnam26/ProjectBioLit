@@ -53,22 +53,32 @@ class HypothesisGenerator:
         self._api_key: Optional[str] = None
         self._session = None          # requests.Session
         self._ready = False
+        self._api_working = False     # True only after successful smoke-test
 
     @property
     def has_api_key(self) -> bool:
-        return bool(os.getenv("GEMINI_API_KEY"))
+        return bool(os.getenv("GEMINI_API_KEY", "").strip())
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
     def setup(self):
         """
         Initialise a requests.Session pointed at the Gemini REST API.
-        SSL verification is disabled to work in environments with a
-        self-signed corporate proxy certificate in the chain.
-        When GEMINI_API_KEY is absent the generator operates in offline
-        template-mode (no API calls, pattern-based hypotheses).
+        Calls load_dotenv(override=True) so keys added to .env after server
+        start are picked up without needing a server restart.
+        SSL verification is disabled for environments with a self-signed proxy.
+        When GEMINI_API_KEY is absent or unreachable the generator falls back
+        to offline template-mode automatically.
         """
-        api_key = os.getenv("GEMINI_API_KEY")
+        # Re-read .env on every setup() call — picks up keys added after startup
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(override=True)
+        except ImportError:
+            pass
+
+        # Strip whitespace/CRLF that Windows editors sometimes inject
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not api_key:
             logger.warning(
                 "GEMINI_API_KEY not set — HypothesisGenerator running in offline "
@@ -84,20 +94,33 @@ class HypothesisGenerator:
         self._api_key = api_key
         self._session = requests.Session()
         self._session.verify = False   # bypass self-signed cert chain
-        self._session.headers.update({"x-goog-api-key": api_key})
+        # Send key both as header and as query-param fallback
+        self._session.headers.update({
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+        })
 
         # Smoke-test connectivity with a minimal prompt
+        self._api_working = False
         try:
-            test = self._call_gemini_with_retry("Reply with the single word: ready", max_retries=1)
+            test = self._call_gemini_with_retry("Reply OK", max_retries=1)
             if test:
+                self._api_working = True
                 logger.info("Gemini REST API reachable (model=%s)", config.GEMINI_MODEL)
             else:
-                logger.warning("Gemini REST API test call returned no text — quota or model issue")
+                logger.warning(
+                    "Gemini REST API smoke test returned no text — "
+                    "check quota, model name (%s), and network access",
+                    config.GEMINI_MODEL,
+                )
         except Exception as exc:
             logger.warning("Gemini REST API smoke test failed: %s", exc)
 
         self._ready = True
-        logger.info("HypothesisGenerator ready (transport=REST, model=%s)", config.GEMINI_MODEL)
+        logger.info(
+            "HypothesisGenerator ready (api_working=%s, model=%s)",
+            self._api_working, config.GEMINI_MODEL,
+        )
 
     def _check_ready(self):
         if not self._ready:
@@ -121,7 +144,10 @@ class HypothesisGenerator:
         POST to the Gemini generateContent REST endpoint with exponential
         backoff.  Returns the text string on success, None on total failure.
         """
-        url = f"{_GEMINI_REST_BASE}/models/{config.GEMINI_MODEL}:generateContent"
+        url = (
+            f"{_GEMINI_REST_BASE}/models/{config.GEMINI_MODEL}:generateContent"
+            f"?key={self._api_key}"
+        )
         payload = {
             "system_instruction": {"parts": [{"text": _SYSTEM_INSTRUCTION}]},
             "contents": [{"parts": [{"text": prompt}]}],
@@ -604,11 +630,23 @@ class HypothesisGenerator:
         scored.sort(key=lambda x: x[0], reverse=True)
         top_blocks = scored[:4]
 
+        # Choose the right note based on why we're offline
+        if self.has_api_key:
+            api_note = (
+                "*Note: Your GEMINI_API_KEY is set but the Gemini API is currently "
+                "unreachable (network/quota/model issue). Showing keyword-matched excerpts instead. "
+                "Check your API key at https://aistudio.google.com/app/apikey*"
+            )
+        else:
+            api_note = (
+                "*Note: Add `GEMINI_API_KEY=your_key` to your `.env` file for "
+                "full AI-powered responses.*"
+            )
+
         if top_blocks:
             bullets: List[str] = []
             for _, blk in top_blocks:
                 header = blk["header"]
-                # Extract up to 2 matching sentences from the text
                 sentences = [s.strip() for s in re.split(r"[.!?]", blk["text"]) if len(s.strip()) > 30]
                 matching = [s for s in sentences if any(kw in s.lower() for kw in keywords)][:2]
                 snippet = ". ".join(matching) + "." if matching else sentences[0] + "." if sentences else ""
@@ -620,16 +658,14 @@ class HypothesisGenerator:
                 f"Based on {len(source_pmids)} retrieved papers, here are the most relevant findings "
                 f"for *\"{user_message}\"*:\n\n"
                 f"{bullet_text}\n\n"
-                f"---\n*Note: Full AI-powered analysis requires a valid GEMINI_API_KEY. "
-                f"Add `GEMINI_API_KEY=your_key` to your `.env` file and restart the app.*"
+                f"---\n{api_note}"
             )
         else:
             response = (
                 f"The {len(source_pmids)} retrieved papers were searched for terms related to "
                 f"*\"{user_message}\"*, but no directly matching excerpts were found in the "
-                f"top results. Try rephrasing your question using specific biomedical terms "
-                f"from the dataset.\n\n"
-                f"*For full AI-powered chat, add `GEMINI_API_KEY=your_key` to your `.env` file.*"
+                f"top results. Try rephrasing using specific biomedical terms from the dataset.\n\n"
+                f"---\n{api_note}"
             )
         return response, source_pmids
 
