@@ -263,7 +263,11 @@ def _generate_hypotheses(papers_df, entities_df, embedder, db, query, gap_report
         )
         st.session_state["hypotheses"] = hypotheses
         progress.progress(1.0)
-        status.success(f"✅ {len(hypotheses)} hypotheses generated.")
+        if hypotheses:
+            mode = "offline template" if not gen.has_api_key else "Gemini AI"
+            status.success(f"✅ {len(hypotheses)} hypotheses generated ({mode}).")
+        else:
+            status.warning("⚠️ No hypotheses were generated. Check the logs for details.")
         st.rerun()
 
     except Exception as exc:
