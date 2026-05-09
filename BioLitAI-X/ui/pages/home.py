@@ -387,7 +387,8 @@ def _run_pipeline(
             db.update_query_session(session_id, papers_fetched=len(papers_df),
                                     pipeline_status="complete")
             total_elapsed = _elapsed()
-            _update(6, f"Loaded from cache in {total_elapsed}!",
+            # step=7 marks all 6 steps as done (✅)
+            _update(7, f"Loaded from cache in {total_elapsed}!",
                     papers=len(papers_df), ents=len(entities_df), rels=len(relationships_df))
             st.success(
                 f"⚡ Loaded from cache in {total_elapsed}! "
@@ -467,11 +468,13 @@ def _run_pipeline(
                 logger.warning("NLP skipped: %s", exc)
                 st.warning(f"Entity extraction issue: {exc}")
             _update(4, f"Entities done: {len(entities_df):,} extracted.",
-                    papers=_n_papers, ents=len(entities_df), rels=0)
+                    papers=_n_papers, ents=len(entities_df),
+                    rels=len(relationships_df))
 
             # ── Step 5: Embeddings (runs after NLP to avoid PyTorch conflicts) ─
             _update(5, f"Building semantic embeddings for {_n_papers:,} papers…",
-                    papers=_n_papers, ents=len(entities_df), rels=0)
+                    papers=_n_papers, ents=len(entities_df),
+                    rels=len(relationships_df))
             embedder         = None
             embeddings_array = None
             try:
@@ -491,11 +494,13 @@ def _run_pipeline(
                 st.warning(f"Embedding issue: {exc}")
             _update(5, f"Embeddings ready ({len(embeddings_array):,} vectors)."
                        if embeddings_array is not None else "Embeddings skipped.",
-                    papers=_n_papers, ents=len(entities_df), rels=0)
+                    papers=_n_papers, ents=len(entities_df),
+                    rels=len(relationships_df))
 
             # ── Step 6: Bibliometric networks + basic Knowledge Graph ─────────
             _update(6, "Building networks and knowledge graph...",
-                    papers=_n_papers, ents=len(entities_df), rels=0)
+                    papers=_n_papers, ents=len(entities_df),
+                    rels=len(relationships_df))
             nb_inst = NetworkBuilder()
             try:
                 cog_full = nb_inst.build_coauthorship_network(papers_df)
@@ -558,8 +563,10 @@ def _run_pipeline(
             db.update_query_session(session_id, papers_fetched=_n_papers,
                                     pipeline_status="complete")
             total_elapsed = _elapsed()
-            _update(6, f"Pipeline complete! ({total_elapsed})",
-                    papers=_n_papers, ents=len(entities_df), rels=0)
+            # step=7 marks all 6 steps as done (✅)
+            _update(7, f"Pipeline complete! ({total_elapsed})",
+                    papers=_n_papers, ents=len(entities_df),
+                    rels=len(relationships_df))
             st.success(
                 f"✅ Pipeline complete in {total_elapsed}! "
                 f"{_n_papers:,} papers · {len(entities_df):,} entities · embeddings ready. "
@@ -595,6 +602,8 @@ def _run_pipeline(
             "pipeline_status": "complete", "papers_fetched": len(papers_df),
         })
         st.session_state["past_sessions"] = past
+        # Force sidebar + page to reflect new pipeline state immediately
+        st.rerun()
 
     except Exception as exc:
         db.update_query_session(session_id, pipeline_status="error")
@@ -633,13 +642,17 @@ def _show_results_summary():
         f"✅ **{len(papers_df):,} papers** loaded for query: **{query}**. "
         f"Navigate using the sidebar to explore analysis, graphs, and hypotheses."
     )
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Papers", f"{len(papers_df):,}")
     with col2:
         ents = st.session_state.get("entities_df")
         st.metric("Entities", f"{len(ents):,}" if ents is not None and not ents.empty else "—")
     with col3:
+        rels = st.session_state.get("relationships_df")
+        st.metric("Relationships Mapped",
+                  f"{len(rels):,}" if rels is not None and not rels.empty else "—")
+    with col4:
         hyps = st.session_state.get("hypotheses", [])
         st.metric("Hypotheses", str(len(hyps)))
 

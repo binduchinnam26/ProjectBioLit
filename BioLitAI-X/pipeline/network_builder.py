@@ -299,6 +299,19 @@ class NetworkBuilder:
             if G.has_node(ta) and G.has_node(tb):
                 G.add_edge(ta, tb, weight=weight)
 
+        # BERTopic assigns ONE primary topic per document so most pairs share no
+        # papers.  Supplement with keyword-overlap edges so the graph stays
+        # connected and the topic landscape can be rendered without all nodes
+        # being classified as isolates and removed.
+        for (ta, tb) in combinations(sorted(G.nodes()), 2):
+            if G.has_edge(ta, tb):
+                continue  # already connected by shared papers
+            words_a = set(G.nodes[ta].get("top_words", [])[:10])
+            words_b = set(G.nodes[tb].get("top_words", [])[:10])
+            overlap = len(words_a & words_b)
+            if overlap > 0:
+                G.add_edge(ta, tb, weight=overlap)
+
         if G.number_of_nodes() == 0:
             return G
 

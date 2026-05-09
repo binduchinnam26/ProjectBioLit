@@ -100,16 +100,15 @@ def _compute_layout(
     G: nx.Graph,
     layout_key: str = "",
     network_type: str = "",
+    physics: bool = False,
 ) -> Dict[str, Tuple[float, float]]:
     """
     Compute and cache the VOSviewer-style layout for graph G.
 
-    Uses a two-stage pipeline: UMAP semantic positioning from paper embeddings
-    followed by ForceAtlas2 refinement (near-zero gravity, edge-weight attraction).
-    Falls back to kamada_kawai / spring_layout when embeddings are unavailable.
-
-    Embeddings and papers_df are read from st.session_state so all three viz
-    modes share identical positions when switching tabs.
+    physics=False (default): UMAP+ForceAtlas2 pre-computed layout — stable,
+      consistent positions across Network/Overlay/Density tabs.
+    physics=True: NetworkX spring layout — organic, force-directed positions;
+      re-computed each toggle so the graph "settles" visually differently.
 
     Returns {str(node): (x, y)} with values in approximately [-1, 1].
     """
@@ -117,26 +116,32 @@ def _compute_layout(
     if n == 0:
         return {}
 
-    # Session-state cache key — includes node/edge count to invalidate on graph change
-    ss_key = f"__pos_{layout_key}_{network_type}_{n}_{G.number_of_edges()}"
+    # Cache key includes physics state so toggling physics invalidates cache
+    physics_tag = "phy1" if physics else "phy0"
+    ss_key = f"__pos_{layout_key}_{network_type}_{n}_{G.number_of_edges()}_{physics_tag}"
     cached = st.session_state.get(ss_key)
     if cached is not None:
         return cached
 
-    # Pull embeddings + metadata from session state (set by the pipeline)
-    embeddings_array = st.session_state.get("embeddings_array")
-    papers_df        = st.session_state.get("papers_df")
-    doc_topics_df    = st.session_state.get("doc_topics_df")
-    query            = st.session_state.get("current_query", "")
+    if physics:
+        # Spring layout: organic force-directed, fast on graphs ≤ 300 nodes
+        raw = nx.spring_layout(G, weight="weight", seed=42, iterations=80, k=1.5 / max(n ** 0.5, 1))
+        pos = {str(node): (float(xy[0]), float(xy[1])) for node, xy in raw.items()}
+    else:
+        # Pull embeddings + metadata from session state (set by the pipeline)
+        embeddings_array = st.session_state.get("embeddings_array")
+        papers_df        = st.session_state.get("papers_df")
+        doc_topics_df    = st.session_state.get("doc_topics_df")
+        query            = st.session_state.get("current_query", "")
 
-    pos = compute_vos_layout(
-        G,
-        network_type=network_type or layout_key,
-        papers_df=papers_df,
-        embeddings_array=embeddings_array,
-        doc_topics_df=doc_topics_df,
-        query=query,
-    )
+        pos = compute_vos_layout(
+            G,
+            network_type=network_type or layout_key,
+            papers_df=papers_df,
+            embeddings_array=embeddings_array,
+            doc_topics_df=doc_topics_df,
+            query=query,
+        )
 
     st.session_state[ss_key] = pos
     return pos
@@ -252,6 +257,7 @@ def _apply_filters(
     min_node_weight: int,
     min_edge_weight: int,
     weight_attr: str = "paper_count",
+    keep_isolates: bool = False,
 ) -> nx.Graph:
     G2 = G.copy()
     G2.remove_nodes_from([
@@ -261,7 +267,11 @@ def _apply_filters(
     G2.remove_edges_from([
         (u, v) for u, v, d in G2.edges(data=True) if d.get("weight", 1) < min_edge_weight
     ])
-    G2.remove_nodes_from(list(nx.isolates(G2)))
+    # Only remove isolates when the user explicitly raises the minimum edge threshold;
+    # with the default (min_edge_weight=1) we keep isolated nodes so that topic
+    # landscape nodes remain visible even when they share no papers.
+    if not keep_isolates and min_edge_weight > 1:
+        G2.remove_nodes_from(list(nx.isolates(G2)))
     return G2
 
 
@@ -569,7 +579,7 @@ def _render_network_plotly(
     # Capped edge trace (top-weight edges only)
     edge_trace = _plotly_edge_trace(G, pos)
 
-    # Median weight threshold — only nodes above median get a label when labels_all=False
+    # When Labels=OFF show NO labels; when ON show all (searchable nodes always labeled)
     all_weights = [d.get(weight_attr, d.get("frequency", 1)) for _, d in G.nodes(data=True)]
     median_w = sorted(all_weights)[len(all_weights) // 2] if all_weights else 1
 
@@ -592,7 +602,8 @@ def _render_network_plotly(
             is_match = bool(search_lower and search_lower in ns.lower())
 
             xs.append(x); ys.append(y); sizes.append(size)
-            labels.append(ns[:22] if (labels_all or is_match or w >= median_w) else "")
+            # labels_all=True → show all; labels_all=False → hide all except search matches
+            labels.append(ns[:22] if (labels_all or is_match) else "")
             borders_c.append("#FFD700" if is_match else _darken(color, 0.78))
             borders_w.append(3 if is_match else 1)
 
@@ -676,7 +687,8 @@ def render_coauthorship_network(
     s3.metric("Clusters", clusters)
     s4.metric("Total link strength", sum(d.get("weight", 1) for _, _, d in G2.edges(data=True)))
 
-    pos = _compute_layout(G2, layout_key="coauth", network_type="coauth")
+    pos = _compute_layout(G2, layout_key="coauth", network_type="coauth",
+                          physics=controls.get("physics", False))
     _render_network_plotly(G2, pos, "paper_count", controls, height)
 
 
@@ -717,7 +729,8 @@ def render_keyword_network(
     s2.metric("Links", f"{min(total_edges, _MAX_RENDER_EDGES):,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
     s3.metric("Clusters", clusters)
 
-    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword")
+    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword",
+                          physics=controls.get("physics", False))
     _render_network_plotly(G2, pos, "frequency", controls, height)
 
 
@@ -741,9 +754,11 @@ def render_topic_network(
         st.warning("All nodes filtered out — lower the minimum weight thresholds.")
         return
 
-    pos = _compute_layout(G2, layout_key="topic", network_type="topic")
+    pos = _compute_layout(G2, layout_key="topic", network_type="topic",
+                          physics=controls.get("physics", False))
     net = _get_vosviewer_net(height=f"{height}px", physics=controls.get("physics", False))
     search_lower = controls.get("search", "").lower()
+    labels_all   = controls.get("labels_all", True)
 
     for node, data in G2.nodes(data=True):
         ns          = str(node)
@@ -754,11 +769,13 @@ def render_topic_network(
         paper_count = data.get("paper_count", 0)
         x, y        = pos.get(ns, (0.0, 0.0))
 
-        is_match     = search_lower and search_lower in label.lower()
+        is_match     = bool(search_lower and search_lower in label.lower())
         border_color = _VOS_HIGHLIGHT if is_match else _darken(color, 0.78)
+        # Respect Labels toggle: OFF hides all labels except search hits
+        label_text   = label if (labels_all or is_match) else ""
 
         net.add_node(
-            ns, label=label, size=size,
+            ns, label=label_text, size=size,
             x=x * _LAYOUT_SCALE, y=y * _LAYOUT_SCALE,
             color={
                 "background": color, "border": border_color,
@@ -773,7 +790,10 @@ def render_topic_network(
         )
 
     _add_edges_to_net(net, G2)
-    html_key = f"topic_{G2.number_of_nodes()}_{G2.number_of_edges()}_{controls.get('search','')}_{controls.get('physics')}"
+    # Cache key includes labels_all and physics so toggling either regenerates HTML
+    html_key = (f"topic_{G2.number_of_nodes()}_{G2.number_of_edges()}_"
+                f"{controls.get('search','')}_phy{controls.get('physics')}_"
+                f"lbl{controls.get('labels_all', True)}")
     _render_vosviewer_html(net, height=height, cache_key=html_key)
 
 
@@ -814,8 +834,9 @@ def render_overlay_visualization(
     # Compute overlay score
     overlay_vals = _overlay_year_per_node(G2, papers_df, network_type)
 
-    # Shared layout positions (reuses same cache as Network view for this network_type)
-    pos = _compute_layout(G2, layout_key=network_type, network_type=network_type)
+    # Shared layout positions (same physics state as Network view for this network_type)
+    pos = _compute_layout(G2, layout_key=network_type, network_type=network_type,
+                          physics=controls.get("physics", False))
 
     node_strs = [str(n) for n in G2.nodes()]
     weights   = [G2.nodes[n].get(weight_attr, 1) for n in G2.nodes()]
@@ -940,8 +961,9 @@ def render_density_visualization(
         st.warning("All nodes filtered out.")
         return
 
-    # Shared layout (reuses same cache as Network view for this network_type)
-    pos = _compute_layout(G2, layout_key=network_type, network_type=network_type)
+    # Shared layout (same physics state as Network view for this network_type)
+    pos = _compute_layout(G2, layout_key=network_type, network_type=network_type,
+                          physics=controls.get("physics", False))
 
     node_strs = [str(n) for n in G2.nodes()]
     weights   = np.array([G2.nodes[n].get(weight_attr, 1) for n in G2.nodes()], dtype=float)
