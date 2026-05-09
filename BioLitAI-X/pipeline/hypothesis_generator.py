@@ -161,12 +161,22 @@ class HypothesisGenerator:
 
         delay = 2.0
         last_exc: Optional[Exception] = None
+        self._last_api_error: str = ""
 
         for attempt in range(1, max_retries + 1):
             try:
                 resp = self._session.post(url, json=payload, timeout=60)
                 if resp.status_code == 429:
                     raise RuntimeError(f"429 RESOURCE_EXHAUSTED: {resp.text[:200]}")
+                if resp.status_code in (400, 401, 403):
+                    # Auth / key errors — no point retrying
+                    try:
+                        err_msg = resp.json().get("error", {}).get("message", resp.text[:200])
+                    except Exception:
+                        err_msg = resp.text[:200]
+                    self._last_api_error = f"HTTP {resp.status_code}: {err_msg}"
+                    logger.error("Gemini API key error: %s", self._last_api_error)
+                    return None
                 resp.raise_for_status()
                 data = resp.json()
                 return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -632,11 +642,20 @@ class HypothesisGenerator:
 
         # Choose the right note based on why we're offline
         if self.has_api_key:
-            api_note = (
-                "*Note: Your GEMINI_API_KEY is set but the Gemini API is currently "
-                "unreachable (network/quota/model issue). Showing keyword-matched excerpts instead. "
-                "Check your API key at https://aistudio.google.com/app/apikey*"
-            )
+            err_detail = getattr(self, "_last_api_error", "")
+            if err_detail:
+                api_note = (
+                    f"*Note: Gemini API error — **{err_detail}**. "
+                    f"Your key may be invalid or expired. "
+                    f"Regenerate it at https://aistudio.google.com/app/apikey then "
+                    f"update your `.env` file.*"
+                )
+            else:
+                api_note = (
+                    "*Note: Your GEMINI_API_KEY is set but the Gemini API is currently "
+                    "unreachable (network/quota/model issue). Showing keyword-matched excerpts instead. "
+                    "Check your API key at https://aistudio.google.com/app/apikey*"
+                )
         else:
             api_note = (
                 "*Note: Add `GEMINI_API_KEY=your_key` to your `.env` file for "
