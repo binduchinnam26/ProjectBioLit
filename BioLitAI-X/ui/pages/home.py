@@ -122,7 +122,7 @@ def render():
             key="home_query_input",
         )
 
-        col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+        col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
             max_results = st.slider(
                 "Max Results",
@@ -130,8 +130,7 @@ def render():
                 max_value=config.MAX_RESULTS_MAX,
                 value=config.MAX_RESULTS_DEFAULT,
                 step=100,
-                help="Papers to fetch from PubMed. "
-                     "1,000 = ~60-90s pipeline. 2,000 = ~90-120s. 3,000 = ~2-3 min.",
+                help="Papers to fetch from PubMed (up to 500).",
             )
         with col2:
             _cur_year = datetime.now().year
@@ -147,13 +146,6 @@ def render():
                 "🔍  Search & Analyse",
                 width="stretch",
                 type="primary",
-            )
-        with col4:
-            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-            force_rerun = st.button(
-                "↺  Force Rerun",
-                width="stretch",
-                help="Ignore cached results and re-fetch from PubMed",
             )
 
     # ── PubMed count preview + cache status ──────────────────────────────────
@@ -177,7 +169,7 @@ def render():
         # Cache status banner
         qhash = query_hash(q_stripped)
         _cache_path = Path(config.PROCESSED_DIR) / f"{qhash}.parquet"
-        if _cache_path.exists() and not force_rerun:
+        if _cache_path.exists():
             _age_days = (time.time() - _cache_path.stat().st_mtime) / 86400
             try:
                 _cached_n = pd.read_parquet(_cache_path).shape[0]
@@ -192,9 +184,9 @@ def render():
                 _age_str = f"{int(_age_days)} days ago"
             st.info(
                 f"✅ **Cached results available** — {_n_str}, saved {_age_str}. "
-                f"Click **Search & Analyse** to use cache, or **Force Rerun** to re-fetch."
+                f"Click **Search & Analyse** to load from cache."
             )
-        elif not _cache_path.exists():
+        else:
             st.caption("🔄 No cache found — full pipeline will run.")
 
     # ── Past sessions chips ───────────────────────────────────────────────────
@@ -223,12 +215,12 @@ def render():
     )
 
     # ── Run pipeline on search ────────────────────────────────────────────────
-    if search_clicked or force_rerun:
+    if search_clicked:
         q = (query or "").strip()
         if not q:
             st.error("Please enter a biomedical research query.")
             return
-        _run_pipeline(q, max_results, year_min, year_max, force_rerun=force_rerun)
+        _run_pipeline(q, max_results, year_min, year_max)
 
     # ── Show results summary if pipeline is complete ──────────────────────────
     elif st.session_state.get("pipeline_complete"):
@@ -268,16 +260,15 @@ def _run_pipeline(
     max_results: int,
     year_min: int,
     year_max: int,
-    force_rerun: bool = False,
 ):
     """
     Execute the full pipeline with two modes:
 
-    FAST PATH  — all caches present and force_rerun=False:
+    FAST PATH  — all caches present:
         Loads papers (parquet) + derived results (pickle) + embeddings (npy/faiss).
         Skips all heavy compute. Typically completes in 10–30 seconds.
 
-    SLOW PATH  — first run or force_rerun=True:
+    SLOW PATH  — first run:
         Runs full pipeline (fetch → NLP → embed → topics → graphs).
         Saves all results to cache at the end so next run is instant.
     """
@@ -334,9 +325,7 @@ def _run_pipeline(
     qhash           = query_hash(query)
     papers_cache    = Path(config.PROCESSED_DIR) / f"{qhash}.parquet"
     derived_cache   = Path(config.PROCESSED_DIR) / f"{qhash}_derived.pkl"
-    use_full_cache  = (
-        papers_cache.exists() and derived_cache.exists() and not force_rerun
-    )
+    use_full_cache  = papers_cache.exists() and derived_cache.exists()
 
     try:
         # ══════════════════════════════════════════════════════════════════════
