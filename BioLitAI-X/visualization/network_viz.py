@@ -94,6 +94,45 @@ _VOS_PHYSICS_ON = {
 }
 
 
+# ── Position post-processing ─────────────────────────────────────────────────
+
+def _spread_overlapping_nodes(
+    pos: Dict[str, Tuple[float, float]],
+    min_dist: float = 0.10,
+    max_iterations: int = 80,
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Iteratively push apart any nodes whose layout-space centres are closer than
+    min_dist, using a pairwise repulsion step.  Vectorised with numpy.
+
+    Needed for co-authorship networks: disconnected author groups have similar
+    UMAP embeddings → FA2 never separates them → vis.js stacks them as blobs.
+    min_dist=0.10 gives ~140 px separation at _LAYOUT_SCALE=1400, ensuring
+    individual circles are clearly visible.
+    """
+    import numpy as np
+
+    nodes = list(pos.keys())
+    n = len(nodes)
+    if n < 2:
+        return pos
+
+    arr = np.array([pos[nd] for nd in nodes], dtype=np.float64)
+
+    for _ in range(max_iterations):
+        diff = arr[:, None, :] - arr[None, :, :]          # (n, n, 2)
+        dist = np.sqrt((diff ** 2).sum(axis=-1))           # (n, n)
+        np.fill_diagonal(dist, np.inf)
+        close = dist < min_dist
+        if not close.any():
+            break
+        push_mag = np.where(close, (min_dist - dist) * 0.5, 0.0)
+        unit = diff / (dist[:, :, None] + 1e-9)
+        arr += (unit * push_mag[:, :, None]).sum(axis=1)
+
+    return {nd: (float(arr[i, 0]), float(arr[i, 1])) for i, nd in enumerate(nodes)}
+
+
 # ── Layout computation (shared across all three modes) ────────────────────────
 
 def _compute_layout(
@@ -689,12 +728,14 @@ def render_coauthorship_network(
 
     physics = controls.get("physics", False)
     pos = _compute_layout(G2, layout_key="coauth", network_type="coauth", physics=physics)
+    if not physics:
+        pos = _spread_overlapping_nodes(pos)
     net = _get_vosviewer_net(height=f"{height}px", physics=physics)
     _add_coauth_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
     _add_edges_to_net(net, G2)
     html_key = (
         f"coauth_{G2.number_of_nodes()}_{G2.number_of_edges()}_"
-        f"{controls.get('search', '')}_phy{physics}_lbl{controls.get('labels_all', True)}"
+        f"{controls.get('search', '')}_phy{physics}_lbl{controls.get('labels_all', True)}_sp1"
     )
     _render_vosviewer_html(net, height=height, cache_key=html_key)
 
@@ -736,16 +777,9 @@ def render_keyword_network(
     s2.metric("Links", f"{min(total_edges, _MAX_RENDER_EDGES):,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
     s3.metric("Clusters", clusters)
 
-    physics = controls.get("physics", False)
-    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword", physics=physics)
-    net = _get_vosviewer_net(height=f"{height}px", physics=physics)
-    _add_keyword_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
-    _add_edges_to_net(net, G2)
-    html_key = (
-        f"keyword_{G2.number_of_nodes()}_{G2.number_of_edges()}_"
-        f"{controls.get('search', '')}_phy{physics}_lbl{controls.get('labels_all', True)}"
-    )
-    _render_vosviewer_html(net, height=height, cache_key=html_key)
+    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword",
+                          physics=controls.get("physics", False))
+    _render_network_plotly(G2, pos, "frequency", controls, height)
 
 
 def render_topic_network(
