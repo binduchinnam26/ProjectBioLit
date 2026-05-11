@@ -885,6 +885,8 @@ def render_overlay_visualization(
     # Shared layout positions (same physics state as Network view for this network_type)
     pos = _compute_layout(G2, layout_key=network_type, network_type=network_type,
                           physics=controls.get("physics", False))
+    if network_type == "coauth" and not controls.get("physics", False):
+        pos = _spread_overlapping_nodes(pos)
 
     node_strs = [str(n) for n in G2.nodes()]
     weights   = [G2.nodes[n].get(weight_attr, 1) for n in G2.nodes()]
@@ -1012,6 +1014,8 @@ def render_density_visualization(
     # Shared layout (same physics state as Network view for this network_type)
     pos = _compute_layout(G2, layout_key=network_type, network_type=network_type,
                           physics=controls.get("physics", False))
+    if network_type == "coauth" and not controls.get("physics", False):
+        pos = _spread_overlapping_nodes(pos)
 
     node_strs = [str(n) for n in G2.nodes()]
     weights   = np.array([G2.nodes[n].get(weight_attr, 1) for n in G2.nodes()], dtype=float)
