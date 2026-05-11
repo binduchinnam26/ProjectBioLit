@@ -104,7 +104,7 @@ def render():
         <div class="bx-hero">
           <div class="bx-hero-title">BioLitAI-X</div>
           <div class="bx-hero-subtitle">
-            From Literature to Discovery —
+            From Literature to Discovery - 
             AI-Powered Biomedical Intelligence
           </div>
         </div>
