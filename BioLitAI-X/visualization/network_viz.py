@@ -186,27 +186,22 @@ def _get_vosviewer_net(height: str = "700px", physics: bool = False):
     opts: Dict[str, Any] = {
         "nodes": {
             "font": {
-                "face": "Open Sans",
-                "size": 11, "strokeWidth": 2, "strokeColor": "#FFFFFF",
+                "face": "Open Sans", "color": _VOS_FONT,
+                "size": 11, "strokeWidth": 4, "strokeColor": "#FFFFFF",
             },
             "borderWidth": 1.5,
-            "borderWidthSelected": 4,
+            "borderWidthSelected": 3,
             "shape": "dot",
         },
         "edges": {
-            # curvedCW gives the gently-curved edges visible in VOSviewer
-            "smooth": {"type": "curvedCW", "roundness": 0.15},
-            "selectionWidth": 0,   # don't add extra width on select; color change is enough
+            "smooth": {"type": "continuous", "roundness": 0.15},
+            "selectionWidth": 2,
             "scaling": {"min": config.EDGE_WIDTH_MIN, "max": config.EDGE_WIDTH_MAX},
         },
         "interaction": {
-            "hover": True,
-            "hoverConnectedEdges": True,   # connected edges brighten on hover
-            "selectConnectedEdges": True,  # connected edges highlighted on click
-            "tooltipDelay": 80,
+            "hover": True, "tooltipDelay": 100,
             "navigationButtons": True, "keyboard": True,
             "zoomView": True, "dragNodes": False, "dragView": True,
-            "multiselect": False,
         },
         "layout": {"improvedLayout": False},
     }
@@ -376,18 +371,14 @@ def _add_coauth_nodes(
             ns, label=label_text, size=size,
             x=x * _LAYOUT_SCALE, y=y * _LAYOUT_SCALE,
             color={
-                "background": color,
-                "border": border_color,
-                # Highlight (selected/clicked): keep own color, bright gold ring
-                "highlight": {"background": color, "border": "#FFA500"},
-                # Hover: keep own color, gold ring — same appearance as VOSviewer
-                "hover": {"background": color, "border": "#FFD700"},
+                "background": color, "border": border_color,
+                "highlight": {"background": _VOS_HIGHLIGHT, "border": "#FFA500"},
+                "hover": {"background": color, "border": _darken(color, 0.65)},
             },
             borderWidth=border_width, title=tooltip, shape="dot",
             font={
-                # Label color matches node cluster color — key VOSviewer trait
-                "size": max(9, int(size * 0.30)), "color": color,
-                "face": "Open Sans", "strokeWidth": 2, "strokeColor": "#FFFFFF",
+                "size": max(9, int(size * 0.30)), "color": _VOS_FONT,
+                "face": "Open Sans", "strokeWidth": 4, "strokeColor": "#FFFFFF",
             },
         )
 
@@ -424,17 +415,16 @@ def _add_keyword_nodes(
             ns, label=label_text, size=size,
             x=x * _LAYOUT_SCALE, y=y * _LAYOUT_SCALE,
             color={
-                "background": color,
-                "border": border_color,
-                "highlight": {"background": color, "border": "#FFA500"},
-                "hover": {"background": color, "border": "#FFD700"},
+                "background": color, "border": border_color,
+                "highlight": {"background": _VOS_HIGHLIGHT, "border": "#FFA500"},
+                "hover": {"background": color, "border": _darken(color, 0.65)},
             },
             borderWidth=border_width,
             title=f"<b>{ns}</b><br>Type:&nbsp;{ktype}<br>Occurrences:&nbsp;{freq}",
             shape=_shape_map.get(ktype, "dot"),
             font={
-                "size": max(9, int(size * 0.30)), "color": color,
-                "face": "Open Sans", "strokeWidth": 2, "strokeColor": "#FFFFFF",
+                "size": max(9, int(size * 0.30)), "color": _VOS_FONT,
+                "face": "Open Sans", "strokeWidth": 4, "strokeColor": "#FFFFFF",
             },
         )
 
@@ -453,12 +443,9 @@ def _add_edges_to_net(net, G: nx.Graph) -> int:
         net.add_edge(
             str(u), str(v), weight=weight, width=width,
             color={
-                # Normal: semi-transparent so edges don't overwhelm the nodes
-                "color": _rgba(src_color, 0.35),
-                # Highlight (select/hover): full-opacity source color, not gold —
-                # this is how VOSviewer shows connected edges on node hover/select
-                "highlight": _rgba(src_color, 1.0),
-                "hover": _rgba(src_color, 0.90),
+                "color": _rgba(src_color, 0.45),
+                "highlight": _VOS_HIGHLIGHT,
+                "hover": _rgba(src_color, 0.80),
             },
             title=f"<b>{u}</b> — <b>{v}</b><br>Shared publications: {weight}",
             arrows={"to": {"enabled": False}},
@@ -667,7 +654,10 @@ def render_coauthorship_network(
     controls: Optional[Dict] = None,
     height: int = 750,
 ):
-    """Co-authorship Network view — VOSviewer-style vis.js rendering."""
+    """
+    Co-authorship Network view — rendered with Plotly (not vis.js).
+    Plotly uses Canvas rendering so it never freezes the browser.
+    """
     if G is None or G.number_of_nodes() == 0:
         st.info("No co-authorship data available. Run the pipeline first.")
         return
@@ -697,16 +687,9 @@ def render_coauthorship_network(
     s3.metric("Clusters", clusters)
     s4.metric("Total link strength", sum(d.get("weight", 1) for _, _, d in G2.edges(data=True)))
 
-    physics = controls.get("physics", False)
-    pos = _compute_layout(G2, layout_key="coauth", network_type="coauth", physics=physics)
-    net = _get_vosviewer_net(height=f"{height}px", physics=physics)
-    _add_coauth_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
-    _add_edges_to_net(net, G2)
-    html_key = (
-        f"coauth_{G2.number_of_nodes()}_{G2.number_of_edges()}_"
-        f"{controls.get('search','')}_phy{physics}_lbl{controls.get('labels_all', True)}"
-    )
-    _render_vosviewer_html(net, height=height, cache_key=html_key)
+    pos = _compute_layout(G2, layout_key="coauth", network_type="coauth",
+                          physics=controls.get("physics", False))
+    _render_network_plotly(G2, pos, "paper_count", controls, height)
 
 
 def render_keyword_network(
@@ -714,7 +697,10 @@ def render_keyword_network(
     controls: Optional[Dict] = None,
     height: int = 750,
 ):
-    """Keyword co-occurrence Network view — VOSviewer-style vis.js rendering."""
+    """
+    Keyword co-occurrence Network view — rendered with Plotly (not vis.js).
+    Plotly uses Canvas rendering so it never freezes the browser.
+    """
     if G is None or G.number_of_nodes() == 0:
         st.info("No keyword co-occurrence data available. Run the pipeline first.")
         return
@@ -743,16 +729,9 @@ def render_keyword_network(
     s2.metric("Links", f"{min(total_edges, _MAX_RENDER_EDGES):,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
     s3.metric("Clusters", clusters)
 
-    physics = controls.get("physics", False)
-    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword", physics=physics)
-    net = _get_vosviewer_net(height=f"{height}px", physics=physics)
-    _add_keyword_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
-    _add_edges_to_net(net, G2)
-    html_key = (
-        f"keyword_{G2.number_of_nodes()}_{G2.number_of_edges()}_"
-        f"{controls.get('search','')}_phy{physics}_lbl{controls.get('labels_all', True)}"
-    )
-    _render_vosviewer_html(net, height=height, cache_key=html_key)
+    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword",
+                          physics=controls.get("physics", False))
+    _render_network_plotly(G2, pos, "frequency", controls, height)
 
 
 def render_topic_network(
@@ -800,14 +779,14 @@ def render_topic_network(
             x=x * _LAYOUT_SCALE, y=y * _LAYOUT_SCALE,
             color={
                 "background": color, "border": border_color,
-                "highlight": {"background": color, "border": "#FFA500"},
-                "hover": {"background": color, "border": "#FFD700"},
+                "highlight": {"background": _VOS_HIGHLIGHT, "border": "#FFA500"},
+                "hover": {"background": color, "border": _darken(color, 0.65)},
             },
             title=(f"<b>{label}</b><br>Papers: {paper_count}<br>"
                    f"Top words: {', '.join(top_words[:5])}"),
             shape="dot",
-            font={"size": max(10, int(size * 0.30)), "color": color,
-                  "face": "Open Sans", "strokeWidth": 2, "strokeColor": "#FFFFFF"},
+            font={"size": max(10, int(size * 0.30)), "color": _VOS_FONT,
+                  "face": "Open Sans", "strokeWidth": 4, "strokeColor": "#FFFFFF"},
         )
 
     _add_edges_to_net(net, G2)
