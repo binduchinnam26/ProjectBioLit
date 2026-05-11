@@ -37,9 +37,9 @@ FETCH_RETRIES = 3
 FETCH_RETRY_DELAY = 2        # seconds, doubles on each retry
 
 # ── Query / result sizing ─────────────────────────────────────────────────────
-MAX_RESULTS_DEFAULT = 1000   # 1000 papers completes in ~60-90s; raise slider for deeper searches
+MAX_RESULTS_DEFAULT = 500
 MAX_RESULTS_MIN = 100
-MAX_RESULTS_MAX = 3000       # hard cap; >2000 may exceed 2-min target on slow hardware
+MAX_RESULTS_MAX = 500
 
 # ── NLP / Embeddings ──────────────────────────────────────────────────────────
 SCISPACY_MODEL = "en_core_sci_lg"
