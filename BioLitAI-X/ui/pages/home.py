@@ -172,7 +172,8 @@ def render():
         if _cache_path.exists():
             _age_days = (time.time() - _cache_path.stat().st_mtime) / 86400
             try:
-                _cached_n = pd.read_parquet(_cache_path).shape[0]
+                import pyarrow.parquet as _pq
+                _cached_n = _pq.read_metadata(str(_cache_path)).num_rows
                 _n_str = f"{_cached_n:,} papers"
             except Exception:
                 _n_str = "unknown size"
@@ -490,18 +491,38 @@ def _run_pipeline(
             _update(6, "Building networks and knowledge graph...",
                     papers=_n_papers, ents=len(entities_df),
                     rels=len(relationships_df))
-            nb_inst = NetworkBuilder()
+            _nb1 = NetworkBuilder()
+            _nb2 = NetworkBuilder()
             try:
-                cog_full = nb_inst.build_coauthorship_network(papers_df)
-                kwd_full = nb_inst.build_keyword_cooccurrence_network(papers_df)
-                coauth_stats  = nb_inst.calculate_network_statistics(cog_full)
-                keyword_stats = nb_inst.calculate_network_statistics(kwd_full)
-                coauth_graph  = nb_inst.prepare_graph_for_display(cog_full)
-                keyword_graph = nb_inst.prepare_graph_for_display(kwd_full)
+                # Build both networks in parallel — separate instances, no shared state
+                with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
+                    _fc = _pool.submit(_nb1.build_coauthorship_network, papers_df)
+                    _fk = _pool.submit(_nb2.build_keyword_cooccurrence_network, papers_df)
+                    cog_full = _fc.result()
+                    kwd_full = _fk.result()
+                # Stats + display-prep are read-only on finished graphs → run 4 in parallel
+                with _cf.ThreadPoolExecutor(max_workers=4) as _pool:
+                    _fcs = _pool.submit(_nb1.calculate_network_statistics, cog_full)
+                    _fks = _pool.submit(_nb2.calculate_network_statistics, kwd_full)
+                    _fcd = _pool.submit(_nb1.prepare_graph_for_display, cog_full)
+                    _fkd = _pool.submit(_nb2.prepare_graph_for_display, kwd_full)
+                    coauth_stats  = _fcs.result()
+                    keyword_stats = _fks.result()
+                    coauth_graph  = _fcd.result()
+                    keyword_graph = _fkd.result()
             except Exception as exc:
-                logger.warning("Network build failed: %s", exc)
-                coauth_graph = keyword_graph = None
-                coauth_stats = keyword_stats = {}
+                logger.warning("Parallel network build failed, retrying sequentially: %s", exc)
+                try:
+                    cog_full      = _nb1.build_coauthorship_network(papers_df)
+                    kwd_full      = _nb1.build_keyword_cooccurrence_network(papers_df)
+                    coauth_stats  = _nb1.calculate_network_statistics(cog_full)
+                    keyword_stats = _nb1.calculate_network_statistics(kwd_full)
+                    coauth_graph  = _nb1.prepare_graph_for_display(cog_full)
+                    keyword_graph = _nb1.prepare_graph_for_display(kwd_full)
+                except Exception as exc2:
+                    logger.warning("Network build failed: %s", exc2)
+                    coauth_graph = keyword_graph = None
+                    coauth_stats = keyword_stats = {}
 
             kg = KnowledgeGraph()
             kg_graph = kg.build_from_entities(entities_df, relationships_df)
@@ -515,29 +536,31 @@ def _run_pipeline(
             doc_topics_df    = pd.DataFrame()
             gc.collect()
 
-            # ── Step 6: Save derived cache (enables instant FAST PATH next run) ─
+            # ── Step 6: Save derived cache in background (non-blocking) ─────────
+            # Runs in a daemon thread so the pipeline completes immediately while
+            # the cache is written in parallel. Next run will use the FAST PATH.
             if not no_disk and not low_disk:
-                _update(6, "Saving to cache for instant future loads...",
-                        papers=_n_papers, ents=len(entities_df), rels=0)
-                try:
-                    _derived = {
-                        "entities_df":      entities_df,
-                        "relationships_df": relationships_df,
-                        "coauth_graph":     coauth_graph,
-                        "keyword_graph":    keyword_graph,
-                        "kg_graph":         kg_graph,
-                        "topic_graph":      topic_graph,
-                        "coauth_stats":     coauth_stats,
-                        "keyword_stats":    keyword_stats,
-                        "doc_topics_df":    doc_topics_df,
-                        "topic_labels":     topic_labels,
-                        "topics_over_time": topics_over_time,
-                    }
-                    with open(derived_cache, "wb") as _f:
-                        pickle.dump(_derived, _f, protocol=pickle.HIGHEST_PROTOCOL)
-                    logger.info("Derived cache saved: %s", derived_cache)
-                except Exception as exc:
-                    logger.warning("Derived cache save failed: %s", exc)
+                _derived = {
+                    "entities_df":      entities_df,
+                    "relationships_df": relationships_df,
+                    "coauth_graph":     coauth_graph,
+                    "keyword_graph":    keyword_graph,
+                    "kg_graph":         kg_graph,
+                    "topic_graph":      topic_graph,
+                    "coauth_stats":     coauth_stats,
+                    "keyword_stats":    keyword_stats,
+                    "doc_topics_df":    doc_topics_df,
+                    "topic_labels":     topic_labels,
+                    "topics_over_time": topics_over_time,
+                }
+                def _bg_save_derived(_d=_derived, _p=derived_cache):
+                    try:
+                        with open(_p, "wb") as _f:
+                            pickle.dump(_d, _f, protocol=pickle.HIGHEST_PROTOCOL)
+                        logger.info("Derived cache saved: %s", _p)
+                    except Exception as _e:
+                        logger.warning("Derived cache save failed: %s", _e)
+                threading.Thread(target=_bg_save_derived, daemon=True).start()
 
             # DB paper writes run in background — only needed for session history
             if not no_disk:

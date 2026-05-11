@@ -148,29 +148,46 @@ class EmbeddingEngine:
             return np.empty((0, config.EMBEDDING_DIMENSION), dtype="float32")
 
         pmids = papers_df["pmid"].tolist()
-        texts = [
-            _safe_text(row.get("abstract"))
-            or _safe_text(row.get("title"))
-            or f"biomedical paper {row.get('pmid', '')}"
-            for _, row in papers_df.iterrows()
-        ]
+        # Vectorised text prep — 10-50x faster than iterrows for 500+ papers
+        _abs   = (papers_df["abstract"].fillna("").astype(str).str.strip()
+                  if "abstract" in papers_df.columns
+                  else pd.Series("", index=papers_df.index))
+        _title = (papers_df["title"].fillna("").astype(str).str.strip()
+                  if "title" in papers_df.columns
+                  else pd.Series("", index=papers_df.index))
+        _pmid  = (papers_df["pmid"].astype(str)
+                  if "pmid" in papers_df.columns
+                  else pd.Series("", index=papers_df.index))
+        texts = [a or t or f"biomedical paper {p}"
+                 for a, t, p in zip(_abs, _title, _pmid)]
         total = len(texts)
 
-        _cb(0, total, "Embedding corpus — this may take a few minutes...")
         self._init_index()
         self._current_query_hash = query_hash(query) if query else "default"
 
+        # Chunked encoding: ~5 progress updates so the UI shows live % complete
+        _chunk_size = max(100, (total + 4) // 5)
+        _chunks: List[np.ndarray] = []
+        _cb(0, total, f"Embedding {total} papers…")
         try:
             import torch
             with torch.inference_mode():
-                embeddings = self.model.encode(
-                    texts,
-                    batch_size=batch_size,
-                    show_progress_bar=True,
-                    normalize_embeddings=True,
-                    convert_to_numpy=True,
-                    device="cpu",
-                ).astype("float32")
+                for _start in range(0, total, _chunk_size):
+                    _batch_texts = texts[_start:_start + _chunk_size]
+                    _emb = self.model.encode(
+                        _batch_texts,
+                        batch_size=batch_size,
+                        show_progress_bar=False,
+                        normalize_embeddings=True,
+                        convert_to_numpy=True,
+                        device="cpu",
+                    ).astype("float32")
+                    _chunks.append(_emb)
+                    _done = min(_start + _chunk_size, total)
+                    _cb(_done, total,
+                        f"Embedding: {_done}/{total} papers ({_done * 100 // total}%)…")
+            embeddings = (np.vstack(_chunks) if _chunks
+                          else np.empty((0, config.EMBEDDING_DIMENSION), dtype="float32"))
         except Exception as exc:
             logger.error("model.encode() failed: %s", exc)
             embeddings = np.zeros((total, config.EMBEDDING_DIMENSION), dtype="float32")
