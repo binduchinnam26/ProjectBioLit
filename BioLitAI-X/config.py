@@ -169,7 +169,7 @@ BORDER_COLOR = "#1F2937"
 
 # Node sizing bounds for VOSviewer-style graphs
 NODE_SIZE_MIN = 10
-NODE_SIZE_MAX = 60
+NODE_SIZE_MAX = 80
 
 # Edge sizing bounds
 EDGE_WIDTH_MIN = 0.5
