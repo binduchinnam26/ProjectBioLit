@@ -18,6 +18,7 @@ positions are consistent when switching between modes — identical to the
 way VOSviewer keeps positions stable across its Network/Overlay/Density tabs.
 """
 
+import colorsys
 import json
 import logging
 import math
@@ -36,62 +37,110 @@ logger = logging.getLogger(__name__)
 
 
 # ── VOSviewer visual constants ────────────────────────────────────────────────
-_VOS_BG        = "#FFFFFF"
-_VOS_FONT      = "#1F2937"
-_VOS_HIGHLIGHT = "#FFD700"
-_LAYOUT_SCALE  = 1400.0          # NetworkX [-1,1] → PyVis pixel space
+_VOS_BG        = "#0A0F1E"   # dark canvas matching app theme
+_VOS_FONT      = "#F9FAFB"   # near-white text for dark background
+_VOS_HIGHLIGHT = "#FFD700"   # gold highlight on selection / search
+_LAYOUT_SCALE  = 1400.0      # NetworkX [-1,1] → PyVis pixel space
 
 # Hard render caps — beyond these numbers vis.js freezes the browser
 _MAX_RENDER_NODES = 300
 _MAX_RENDER_EDGES = 1500
 
-# VOSviewer v1.6.7+ uses Viridis for both overlay and density
-_OVERLAY_COLORSCALE = "Viridis"  # dark-blue (low/old) → bright-yellow (high/new)
-_DENSITY_COLORSCALE = "Viridis"  # dark-blue (sparse)  → bright-yellow (dense)
+# VOSviewer blue→teal→green→yellow overlay colorscale (publication year)
+_OVERLAY_COLORSCALE = [
+    [0.00, "#1a0050"],
+    [0.25, "#0d4f8b"],
+    [0.50, "#00897b"],
+    [0.75, "#66bb6a"],
+    [1.00, "#ffee58"],
+]
 
-# White-canvas CSS injected into every PyVis HTML frame
+# VOSviewer dark density colorscale (sparse→dense research areas)
+_DENSITY_COLORSCALE = [
+    [0.00, "#000033"],
+    [0.14, "#000066"],
+    [0.28, "#003366"],
+    [0.43, "#006666"],
+    [0.57, "#009966"],
+    [0.71, "#66cc00"],
+    [0.85, "#cccc00"],
+    [1.00, "#ffff00"],
+]
+
+# Dark-canvas CSS injected into every PyVis HTML frame
 _VOS_CSS = """
 <style>
+  body { background: #0A0F1E !important; margin: 0; }
   #mynetwork {
-    background-color: #FFFFFF;
-    border: 1px solid #E5E7EB;
+    background-color: #0A0F1E !important;
+    border: 1px solid #1F2937;
     border-radius: 8px;
-    box-shadow: 0 2px 16px rgba(0,0,0,0.07);
+    box-shadow: 0 2px 24px rgba(0,0,0,0.6);
   }
+  canvas { background: #0A0F1E !important; }
   .vis-tooltip {
-    background-color: #FFFFFF !important;
-    color: #111827 !important;
-    border: 1px solid #D1D5DB !important;
+    background-color: #1C2539 !important;
+    color: #F9FAFB !important;
+    border: 1px solid #374151 !important;
     border-radius: 6px !important;
     font-family: 'Open Sans', sans-serif !important;
     font-size: 12px !important;
     padding: 8px 10px !important;
     max-width: 300px !important;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.12) !important;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5) !important;
   }
   .vis-navigation .vis-button {
-    background-color: #F9FAFB !important;
-    border: 1px solid #E5E7EB !important;
+    background-color: #1C2539 !important;
+    border: 1px solid #374151 !important;
     border-radius: 4px !important;
+  }
+  .vis-navigation .vis-button:hover {
+    background-color: #374151 !important;
   }
 </style>
 """
 
-# Near-zero gravity ForceAtlas2 physics used only when the physics toggle is ON
-# (organic refinement mode, no central pull)
+# Barnes-Hut physics used only when the user enables the Physics toggle.
+# Low centralGravity (0.1) prevents the spherical collapse; high springLength
+# (200) and low springConstant (0.02) let clusters spread organically.
 _VOS_PHYSICS_ON = {
-    "forceAtlas2Based": {
-        "gravitationalConstant": -50,
-        "centralGravity": 0.0,
-        "springLength": 100,
-        "springConstant": 0.08,
-        "damping": 0.4,
-        "avoidOverlap": 0.5,
+    "barnesHut": {
+        "gravitationalConstant": -12000,
+        "centralGravity": 0.1,
+        "springLength": 200,
+        "springConstant": 0.02,
+        "damping": 0.15,
+        "avoidOverlap": 0.8,
     },
     "minVelocity": 0.5,
-    "solver": "forceAtlas2Based",
-    "stabilization": {"enabled": True, "iterations": 150, "updateInterval": 25},
+    "solver": "barnesHut",
+    "stabilization": {"enabled": True, "iterations": 2000, "updateInterval": 50, "fit": True},
 }
+
+
+# ── Community color palette ───────────────────────────────────────────────────
+
+def _community_color_palette(n: int) -> List[str]:
+    """
+    Return n visually distinct colors.
+
+    Up to 30 communities: use the hand-curated config.COMMUNITY_COLORS list.
+    Beyond 30: generate via golden-ratio hue spacing so adjacent community
+    IDs are never similar hues — identical to how VOSviewer handles 38+ clusters.
+    """
+    if n <= 0:
+        return [config.COMMUNITY_COLORS[0]]
+    if n <= len(config.COMMUNITY_COLORS):
+        return list(config.COMMUNITY_COLORS[:n])
+    golden = 0.618033988749895
+    result: List[str] = []
+    h = 0.0
+    for i in range(n):
+        h = (h + golden) % 1.0
+        lightness = 0.55 if i % 2 == 0 else 0.65
+        r, g, b = colorsys.hls_to_rgb(h, lightness, 0.70)
+        result.append(f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}")
+    return result
 
 
 # ── Layout computation (shared across all three modes) ────────────────────────
@@ -539,7 +588,7 @@ def _plotly_edge_trace(G2: nx.Graph, pos: Dict[str, Tuple[float, float]]):
 
     return go.Scatter(
         x=edge_x, y=edge_y, mode="lines",
-        line=dict(width=0.7, color="rgba(180,180,180,0.45)"),
+        line=dict(width=0.9, color="rgba(100,130,180,0.38)"),
         hoverinfo="none", showlegend=False,
     )
 
@@ -548,14 +597,18 @@ def _plotly_layout(height: int) -> "plotly.graph_objects.Layout":
     import plotly.graph_objects as go
 
     return go.Layout(
-        paper_bgcolor="#FFFFFF", plot_bgcolor="#FFFFFF",
+        paper_bgcolor=_VOS_BG, plot_bgcolor=_VOS_BG,
         xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
         yaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
                    scaleanchor="x", scaleratio=1),
-        margin=dict(l=10, r=110, t=10, b=10),
+        margin=dict(l=10, r=120, t=10, b=10),
         height=height, hovermode="closest",
-        legend=dict(x=1.01, y=1, bgcolor="rgba(255,255,255,0.85)",
-                    bordercolor="#E5E7EB", borderwidth=1, font=dict(size=10)),
+        legend=dict(
+            x=1.01, y=1,
+            bgcolor="rgba(10,15,30,0.92)",
+            bordercolor="#374151", borderwidth=1,
+            font=dict(size=10, color=_VOS_FONT),
+        ),
     )
 
 
@@ -567,44 +620,55 @@ def _render_network_plotly(
     height: int,
 ) -> None:
     """
-    Render the Network view using Plotly instead of vis.js/PyVis.
-    One Scatter trace per community → cluster legend; edge trace underneath.
-    Plotly renders via Canvas so it never freezes regardless of node/edge count.
+    Render the Network view using Plotly Canvas (never freezes browser).
+
+    One Scatter trace per community for the cluster legend.
+    A separate text-only trace carries per-node label sizes and colors,
+    showing labels only for nodes above the 25th-percentile weight
+    — matching VOSviewer's label density behaviour.
     """
     import plotly.graph_objects as go
 
     search_lower = controls.get("search", "").lower().strip()
     labels_all   = controls.get("labels_all", True)
 
-    # Capped edge trace (top-weight edges only)
     edge_trace = _plotly_edge_trace(G, pos)
 
-    # When Labels=OFF show NO labels; when ON show all (searchable nodes always labeled)
     all_weights = [d.get(weight_attr, d.get("frequency", 1)) for _, d in G.nodes(data=True)]
-    median_w = sorted(all_weights)[len(all_weights) // 2] if all_weights else 1
+    if not all_weights:
+        return
+    w_min = min(all_weights)
+    w_max = max(all_weights) if max(all_weights) > w_min else w_min + 1
+    sorted_w = sorted(all_weights)
+    p25 = sorted_w[max(0, len(sorted_w) // 4)]   # 25th-percentile threshold
 
     communities = sorted({d.get("community", 0) for _, d in G.nodes(data=True)})
-    node_traces = []
+    palette = _community_color_palette(len(communities))
+    # Map community id → color using the sorted position (not raw id) so
+    # the first community always gets the first palette colour regardless of
+    # what integer Louvain happened to assign.
+    comm_to_color = {cid: palette[i % len(palette)] for i, cid in enumerate(communities)}
 
+    node_traces = []
     for cid in communities:
         comm_nodes = [(n, d) for n, d in G.nodes(data=True) if d.get("community", 0) == cid]
         if not comm_nodes:
             continue
 
-        color = config.COMMUNITY_COLORS[cid % len(config.COMMUNITY_COLORS)]
-        xs, ys, labels, sizes, hovers, borders_c, borders_w = [], [], [], [], [], [], []
+        color = comm_to_color[cid]
+        xs, ys, sizes, hovers, borders_c, borders_w = [], [], [], [], [], []
 
         for n, d in comm_nodes:
-            ns = str(n)
+            ns  = str(n)
             x, y = pos.get(ns, (0.0, 0.0))
             w    = d.get(weight_attr, d.get("frequency", 1))
-            size = float(d.get("size", config.NODE_SIZE_MIN))
+            # Re-apply sqrt scaling formula with updated NODE_SIZE_MAX (80)
+            norm = (w - w_min) / (w_max - w_min + 1e-9)
+            size = config.NODE_SIZE_MIN + (norm ** 0.5) * (config.NODE_SIZE_MAX - config.NODE_SIZE_MIN)
             is_match = bool(search_lower and search_lower in ns.lower())
 
             xs.append(x); ys.append(y); sizes.append(size)
-            # labels_all=True → show all; labels_all=False → hide all except search matches
-            labels.append(ns[:22] if (labels_all or is_match) else "")
-            borders_c.append("#FFD700" if is_match else _darken(color, 0.78))
+            borders_c.append(_VOS_HIGHLIGHT if is_match else _darken(color, 0.78))
             borders_w.append(3 if is_match else 1)
 
             neighbors = sorted(
@@ -619,26 +683,60 @@ def _render_network_plotly(
 
         node_traces.append(go.Scatter(
             x=xs, y=ys,
-            mode="markers+text",
+            mode="markers",
             marker=dict(
-                size=sizes, color=color, opacity=0.88,
+                size=sizes, color=color, opacity=0.92,
                 line=dict(width=borders_w, color=borders_c),
             ),
-            text=labels,
-            textposition="bottom center",
-            textfont=dict(size=9, color=_VOS_FONT, family="Open Sans"),
             hovertext=hovers,
             hoverinfo="text",
             name=f"Cluster {cid + 1}",
         ))
 
+    # ── Per-node label trace ──────────────────────────────────────────────────
+    # Labels have per-node font sizes and colors (same as node color) — this
+    # cannot be done inside a community trace, so a separate text-only trace
+    # carries them.  Sizes range 8–24px via sqrt scaling; only nodes above the
+    # 25th-percentile weight get a label (prevents overcrowding).
+    if labels_all or search_lower:
+        lx, ly, ltexts, lcolors, lsizes = [], [], [], [], []
+        for n, d in G.nodes(data=True):
+            ns       = str(n)
+            w        = d.get(weight_attr, d.get("frequency", 1))
+            is_match = bool(search_lower and search_lower in ns.lower())
+            # Only label: search hits always; otherwise only above p25 when labels on
+            if not (is_match or (labels_all and w >= p25)):
+                continue
+            norm      = (w - w_min) / (w_max - w_min + 1e-9)
+            lsize     = max(8, int(8 + (norm ** 0.5) * 16))   # 8–24 px
+            cid       = d.get("community", 0)
+            lcolor    = comm_to_color.get(cid, palette[0])
+            x, y      = pos.get(ns, (0.0, 0.0))
+            lx.append(x); ly.append(y)
+            ltexts.append(ns[:24])
+            lcolors.append(lcolor)
+            lsizes.append(lsize)
+
+        if lx:
+            node_traces.append(go.Scatter(
+                x=lx, y=ly,
+                mode="text",
+                text=ltexts,
+                textfont=dict(size=lsizes, color=lcolors, family="Open Sans"),
+                textposition="bottom center",
+                hoverinfo="none",
+                showlegend=False,
+            ))
+
     layout = _plotly_layout(height)
     layout.update(
-        showlegend=len(communities) <= 20,
+        showlegend=len(communities) <= 25,
         legend=dict(
-            x=1.01, y=1, bgcolor="rgba(255,255,255,0.9)",
-            bordercolor="#E5E7EB", borderwidth=1,
-            font=dict(size=9), itemsizing="constant",
+            x=1.01, y=1,
+            bgcolor="rgba(10,15,30,0.92)",
+            bordercolor="#374151", borderwidth=1,
+            font=dict(size=9, color=_VOS_FONT),
+            itemsizing="constant",
         ),
     )
     fig = go.Figure(data=[edge_trace] + node_traces, layout=layout)
@@ -854,10 +952,10 @@ def render_overlay_visualization(
     s2.metric("Year range", f"{int(v_min)} – {int(v_max)}")
     s3.metric("No year data", no_yr)
 
-    # Edge trace (thin gray, same as network view)
+    # Edge trace (same positions as Network view)
     edge_trace = _plotly_edge_trace(G2, pos)
 
-    # Gray trace — nodes without year data
+    # Gray trace — nodes without year data shown as dim dots
     ns_no = [ns for ns in node_strs if ns not in overlay_vals]
     gray_trace = go.Scatter(
         x=[pos.get(ns, (0, 0))[0] for ns in ns_no],
@@ -865,8 +963,8 @@ def render_overlay_visualization(
         mode="markers+text",
         marker=dict(
             size=[node_sizes[i] for i, ns in enumerate(node_strs) if ns not in overlay_vals],
-            color="#D1D5DB",
-            line=dict(width=1, color="rgba(100,100,100,0.35)"),
+            color="#374151",
+            line=dict(width=1, color="rgba(100,100,100,0.30)"),
         ),
         text=[ns[:22] for ns in ns_no],
         textposition="bottom center",
@@ -877,7 +975,7 @@ def render_overlay_visualization(
         showlegend=bool(ns_no),
     )
 
-    # Colored trace — Viridis gradient by avg year
+    # Colored trace — blue→teal→green→yellow gradient by avg publication year
     ns_with = [ns for ns in node_strs if ns in overlay_vals]
     color_trace = go.Scatter(
         x=[pos.get(ns, (0, 0))[0] for ns in ns_with],
@@ -890,13 +988,17 @@ def render_overlay_visualization(
             cmin=v_min, cmax=v_max,
             showscale=True,
             colorbar=dict(
-                title=dict(text="Avg. Publication Year", font=dict(size=11), side="right"),
+                title=dict(text="Avg. Publication Year", font=dict(size=11, color=_VOS_FONT), side="right"),
                 tickvals=[v_min, (v_min + v_max) / 2, v_max],
                 ticktext=[str(int(v_min)), str(int((v_min + v_max) / 2)), str(int(v_max))],
                 len=0.65, thickness=14, x=1.01,
-                ticks="outside", tickfont=dict(size=10),
+                ticks="outside",
+                tickfont=dict(size=10, color=_VOS_FONT),
+                bgcolor="rgba(10,15,30,0.8)",
+                bordercolor="#374151",
             ),
-            line=dict(width=1, color="rgba(80,80,80,0.35)"),
+            line=dict(width=1, color="rgba(255,255,255,0.20)"),
+            opacity=0.92,
         ),
         text=[ns[:22] for ns in ns_with],
         textposition="bottom center",
@@ -913,10 +1015,11 @@ def render_overlay_visualization(
     st.plotly_chart(fig, width="stretch")
 
     st.markdown(
-        "<div style='font-size:11px;color:#6B7280;text-align:center;margin-top:-8px'>"
-        "Color encodes average publication year per item (Viridis scale). &nbsp;"
-        "<b style='color:#440154'>Dark blue</b> = oldest research &nbsp;·&nbsp; "
-        "<b style='color:#fde725'>Bright yellow</b> = most recent research."
+        f"<div style='font-size:11px;color:#9CA3AF;text-align:center;margin-top:-8px'>"
+        "Color encodes average publication year per item. &nbsp;"
+        "<b style='color:#1a0050'>Deep purple</b> = oldest &nbsp;·&nbsp;"
+        "<b style='color:#00897b'>Teal</b> = mid-period &nbsp;·&nbsp;"
+        "<b style='color:#ffee58'>Yellow</b> = most recent research."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1007,37 +1110,43 @@ def render_density_visualization(
 
     ZZ_norm = (ZZ - ZZ.min()) / (ZZ.max() - ZZ.min() + 1e-9)
 
-    # ── Heatmap trace ─────────────────────────────────────────────────────────
+    # ── Heatmap trace — VOSviewer dark density colorscale ─────────────────────
     heatmap = go.Heatmap(
         x=xi.tolist(), y=yi.tolist(), z=ZZ_norm.tolist(),
         colorscale=_DENSITY_COLORSCALE,
         showscale=True,
         colorbar=dict(
-            title=dict(text="Density", font=dict(size=11), side="right"),
+            title=dict(text="Research Density", font=dict(size=11, color=_VOS_FONT), side="right"),
             tickvals=[0, 0.5, 1],
-            ticktext=["Low", "Medium", "High"],
+            ticktext=["Sparse", "Medium", "Dense"],
             len=0.65, thickness=14, x=1.01,
-            ticks="outside", tickfont=dict(size=10),
+            ticks="outside",
+            tickfont=dict(size=10, color=_VOS_FONT),
+            bgcolor="rgba(0,0,0,0.8)",
+            bordercolor="#374151",
         ),
         hoverinfo="skip",
         zsmooth="best",
     )
 
-    # ── Node overlay — white circles (VOSviewer style) ────────────────────────
-    node_sizes_plt = [max(8, 38 * (G2.nodes[n].get(weight_attr, 1) / w_max) ** 0.5) for n in G2.nodes()]
-    label_attr     = "Occurrences" if network_type == "keyword" else "Publications"
+    # ── Node overlay — near-transparent dots + white floating labels ──────────
+    # VOSviewer density view: nodes become nearly invisible so the heatmap
+    # dominates; only labels float above the density landscape.
+    node_sizes_plt = [
+        max(6, int(config.NODE_SIZE_MIN + ((G2.nodes[n].get(weight_attr, 1) / w_max) ** 0.5)
+                   * (config.NODE_SIZE_MAX - config.NODE_SIZE_MIN) * 0.60))
+        for n in G2.nodes()
+    ]
+    label_attr = "Occurrences" if network_type == "keyword" else "Publications"
 
     node_overlay = go.Scatter(
         x=xs.tolist(), y=ys.tolist(),
-        mode="markers+text",
+        mode="markers",
         marker=dict(
             size=node_sizes_plt,
-            color="rgba(255,255,255,0.85)",
-            line=dict(width=1.5, color="rgba(40,40,40,0.65)"),
+            color="rgba(255,255,255,0.12)",   # nearly transparent — heatmap dominates
+            line=dict(width=1.0, color="rgba(255,255,255,0.25)"),
         ),
-        text=[ns[:20] for ns in node_strs],
-        textposition="bottom center",
-        textfont=dict(size=8, color="#111827", family="Open Sans"),
         hovertext=[
             f"<b>{ns}</b><br>{label_attr}: {G2.nodes[n].get(weight_attr, 1)}"
             for ns, n in zip(node_strs, G2.nodes())
@@ -1046,19 +1155,44 @@ def render_density_visualization(
         showlegend=False,
     )
 
+    # White floating label trace — scaled by weight, always visible
+    lx2, ly2, ltexts2, lsizes2 = [], [], [], []
+    for ns, n in zip(node_strs, G2.nodes()):
+        w_n   = G2.nodes[n].get(weight_attr, 1)
+        norm  = (w_n / w_max) ** 0.5
+        lsize = max(7, int(7 + norm * 15))   # 7–22 px
+        x_n, y_n = pos.get(ns, (0.0, 0.0))
+        lx2.append(x_n); ly2.append(y_n)
+        ltexts2.append(ns[:22])
+        lsizes2.append(lsize)
+
+    label_trace = go.Scatter(
+        x=lx2, y=ly2,
+        mode="text",
+        text=ltexts2,
+        textfont=dict(size=lsizes2, color="#FFFFFF", family="Open Sans"),
+        textposition="bottom center",
+        hoverinfo="none",
+        showlegend=False,
+    )
+
     layout = _plotly_layout(height)
+    # Override to pure black for density view — matches VOSviewer Image 6
+    layout.paper_bgcolor = "#000000"
+    layout.plot_bgcolor  = "#000000"
     layout.xaxis.update(range=[x_min, x_max])
     layout.yaxis.update(range=[y_min, y_max])
 
-    fig = go.Figure(data=[heatmap, node_overlay], layout=layout)
+    fig = go.Figure(data=[heatmap, node_overlay, label_trace], layout=layout)
     st.plotly_chart(fig, width="stretch")
 
     st.markdown(
-        "<div style='font-size:11px;color:#6B7280;text-align:center;margin-top:-8px'>"
+        f"<div style='font-size:11px;color:#9CA3AF;text-align:center;margin-top:-8px'>"
         "Research activity density — Gaussian KDE weighted by publication count "
         f"(σ = d̄·h = {sigma:.3f}). &nbsp;"
-        "<b style='color:#440154'>Dark</b> = sparse &nbsp;·&nbsp; "
-        "<b style='color:#fde725'>Bright yellow</b> = high concentration."
+        "<b style='color:#003366'>Dark blue</b> = sparse &nbsp;·&nbsp; "
+        "<b style='color:#66cc00'>Green</b> = moderate &nbsp;·&nbsp; "
+        "<b style='color:#ffff00'>Bright yellow</b> = high concentration."
         "</div>",
         unsafe_allow_html=True,
     )
