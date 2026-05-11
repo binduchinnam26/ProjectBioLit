@@ -687,9 +687,16 @@ def render_coauthorship_network(
     s3.metric("Clusters", clusters)
     s4.metric("Total link strength", sum(d.get("weight", 1) for _, _, d in G2.edges(data=True)))
 
-    pos = _compute_layout(G2, layout_key="coauth", network_type="coauth",
-                          physics=controls.get("physics", False))
-    _render_network_plotly(G2, pos, "paper_count", controls, height)
+    physics = controls.get("physics", False)
+    pos = _compute_layout(G2, layout_key="coauth", network_type="coauth", physics=physics)
+    net = _get_vosviewer_net(height=f"{height}px", physics=physics)
+    _add_coauth_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
+    _add_edges_to_net(net, G2)
+    html_key = (
+        f"coauth_{G2.number_of_nodes()}_{G2.number_of_edges()}_"
+        f"{controls.get('search', '')}_phy{physics}_lbl{controls.get('labels_all', True)}"
+    )
+    _render_vosviewer_html(net, height=height, cache_key=html_key)
 
 
 def render_keyword_network(
@@ -729,9 +736,16 @@ def render_keyword_network(
     s2.metric("Links", f"{min(total_edges, _MAX_RENDER_EDGES):,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
     s3.metric("Clusters", clusters)
 
-    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword",
-                          physics=controls.get("physics", False))
-    _render_network_plotly(G2, pos, "frequency", controls, height)
+    physics = controls.get("physics", False)
+    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword", physics=physics)
+    net = _get_vosviewer_net(height=f"{height}px", physics=physics)
+    _add_keyword_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
+    _add_edges_to_net(net, G2)
+    html_key = (
+        f"keyword_{G2.number_of_nodes()}_{G2.number_of_edges()}_"
+        f"{controls.get('search', '')}_phy{physics}_lbl{controls.get('labels_all', True)}"
+    )
+    _render_vosviewer_html(net, height=height, cache_key=html_key)
 
 
 def render_topic_network(
