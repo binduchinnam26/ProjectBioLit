@@ -70,9 +70,14 @@ NLP_BATCH_SIZE = int(os.getenv("NLP_BATCH_SIZE", "256"))
 # Worker processes for nlp.pipe().
 # KEEP AT 1 ON WINDOWS — spaCy uses 'spawn' on Windows, which requires
 # pickling the model; the UMLS linker is not picklable and will raise errors.
-# On Linux / macOS (fork semantics) you can set this to -1 (all cores) or
-# a specific integer via the NLP_N_PROCESS env var.
-NLP_N_PROCESS = int(os.getenv("NLP_N_PROCESS", "1"))
+# On Linux / macOS (fork semantics) default is 2 workers for ~2x NER speed.
+# Override via NLP_N_PROCESS env var. The NLPProcessor falls back to
+# n_process=1 automatically if multiprocessing fails (e.g. UMLS enabled).
+import platform as _platform
+NLP_N_PROCESS = int(os.getenv(
+    "NLP_N_PROCESS",
+    "1" if _platform.system() == "Windows" else "2",
+))
 
 # Entity types extracted by SciSpaCy — covers all biomedical domains.
 # "ENTITY" is the generic label used by en_core_sci_lg; the NLP processor

@@ -98,9 +98,6 @@ def render_sidebar() -> str:
 
             if papers_df is not None and not papers_df.empty:
                 n_papers = len(papers_df)
-                n_authors = sum(
-                    len(r) for r in papers_df.get("authors", [pd.Series()]) if isinstance(r, list)
-                ) if "authors" in papers_df.columns else 0
                 st.markdown(
                     f"<div style='font-size:12px;color:{config.TEXT_SECONDARY};"
                     f"margin-bottom:4px'>📄 {n_papers:,} papers loaded</div>",
@@ -147,9 +144,3 @@ def render_sidebar() -> str:
 
     return st.session_state.get("active_page", "home")
 
-
-# pandas import needed for author count
-try:
-    import pandas as pd
-except ImportError:
-    pass
