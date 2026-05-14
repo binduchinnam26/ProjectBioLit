@@ -19,7 +19,10 @@ for _d in (RAW_DIR, PROCESSED_DIR, EMBEDDINGS_DIR, DATABASE_DIR):
 # ── Database ──────────────────────────────────────────────────────────────────
 DB_PATH = str(DATABASE_DIR / "biolita.db")
 
-# ── Entrez / PubMed ───────────────────────────────────────────────────────────
+# ── Hugging Face ─────────────────────────────────────────────────────────────
+HF_TOKEN = os.getenv("HF_TOKEN")  # read-only token is sufficient
+
+
 ENTREZ_EMAIL = os.getenv("ENTREZ_EMAIL")
 ENTREZ_API_KEY = os.getenv("ENTREZ_API_KEY")
 
