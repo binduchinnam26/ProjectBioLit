@@ -484,7 +484,9 @@ def render():
                     if all_rels else None
                 )
 
-                min_evidence  = st.slider("Min evidence (papers)", 1, 20, 1, key="kg_min_ev")
+                min_evidence       = st.slider("Min node evidence (papers)", 1, 20, 1, key="kg_min_ev")
+                max_nodes_display  = st.slider("Max nodes displayed", 20, 300, 150, step=10, key="kg_max_nodes")
+                min_edge_cooccur   = st.slider("Min edge co-occurrence (papers)", 1, 10, 2, key="kg_min_cooccur")
                 search_entity = st.text_input("Search entity", placeholder="Entity name...",
                                               key="kg_search")
                 show_gaps = st.toggle("Highlight Research Gaps", value=True, key="kg_show_gaps")
@@ -535,6 +537,8 @@ def render():
                     show_gap_nodes=show_gaps,
                     search_term=search_entity,
                     height=800,
+                    max_nodes=max_nodes_display,
+                    min_edge_cooccurrence=min_edge_cooccur,
                 )
 
             st.markdown(
