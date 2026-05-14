@@ -67,9 +67,10 @@ class EmbeddingEngine:
 
         warnings.filterwarnings("ignore", message=".*Accessing.*__path__.*", category=UserWarning)
         import logging as _logging
-        _logging.getLogger("transformers").setLevel(_logging.ERROR)
-        _logging.getLogger("transformers.modeling_utils").setLevel(_logging.ERROR)
         _logging.getLogger("huggingface_hub").setLevel(_logging.ERROR)
+
+        import transformers as _transformers
+        _transformers.logging.set_verbosity_error()
 
         from sentence_transformers import SentenceTransformer
         import faiss

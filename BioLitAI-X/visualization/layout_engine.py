@@ -158,6 +158,7 @@ def _run_umap(node_embeddings: Dict[str, np.ndarray]) -> Dict[str, Tuple[float, 
         min_dist=0.3,
         metric="cosine",
         random_state=42,
+        n_jobs=1,
         spread=3.0,
         low_memory=False,
     )
@@ -190,7 +191,7 @@ def _run_forceatlas2(
     try:
         from fa2 import ForceAtlas2
     except ImportError:
-        logger.warning("fa2 not installed; skipping ForceAtlas2 stage")
+        logger.debug("fa2 not installed; skipping ForceAtlas2 stage")
         return umap_pos
 
     # FA2 works on undirected simple graphs
