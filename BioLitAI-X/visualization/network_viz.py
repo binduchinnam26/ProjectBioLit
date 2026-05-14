@@ -780,13 +780,61 @@ def render_keyword_network(
     _render_network_plotly(G2, pos, "frequency", controls, height)
 
 
+_TOPIC_PHYSICS = {
+    "forceAtlas2Based": {
+        "gravitationalConstant": -80,
+        "centralGravity": 0.01,
+        "springLength": 200,
+        "springConstant": 0.05,
+        "damping": 0.4,
+        "avoidOverlap": 1.0,
+    },
+    "minVelocity": 0.5,
+    "solver": "forceAtlas2Based",
+    "stabilization": {"enabled": True, "iterations": 200, "updateInterval": 25},
+}
+
+_TOPIC_EDGE_COLORS = {
+    "shared_vocabulary":  "#00D4FF",  # cyan
+    "co_assigned_papers": "#7B61FF",  # purple
+    "semantic_similarity": "#00E676", # green
+}
+
+_TOPIC_DARK_CSS = """
+<style>
+  #mynetwork {
+    background-color: #0A0F1E;
+    border: 1px solid #1F2937;
+    border-radius: 8px;
+    box-shadow: 0 2px 16px rgba(0,0,0,0.4);
+  }
+  .vis-tooltip {
+    background-color: #1A2235 !important;
+    color: #F9FAFB !important;
+    border: 1px solid #374151 !important;
+    border-radius: 8px !important;
+    font-family: 'Open Sans', sans-serif !important;
+    font-size: 12px !important;
+    padding: 10px 12px !important;
+    max-width: 320px !important;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
+  }
+  .vis-navigation .vis-button {
+    background-color: #1C2539 !important;
+    border: 1px solid #374151 !important;
+    border-radius: 4px !important;
+  }
+</style>
+"""
+
+
 def render_topic_network(
     G: nx.Graph,
     controls: Optional[Dict] = None,
     height: int = 750,
     year_range: Optional[tuple] = None,
 ):
-    """VOSviewer Network Visualization — topic landscape."""
+    """Dark-canvas topic landscape with ForceAtlas2Based physics."""
     if G is None or G.number_of_nodes() == 0:
         st.info("No topic data available. Run the pipeline first.")
         return
@@ -800,47 +848,115 @@ def render_topic_network(
         st.warning("All nodes filtered out — lower the minimum weight thresholds.")
         return
 
-    pos = _compute_layout(G2, layout_key="topic", network_type="topic",
-                          physics=controls.get("physics", False))
-    net = _get_vosviewer_net(height=f"{height}px", physics=controls.get("physics", False))
+    # Always use physics-on for topic landscape (ForceAtlas2Based settles well)
+    use_physics = True
+
+    from pyvis.network import Network
+    net = Network(
+        height=f"{height}px", width="100%",
+        bgcolor="#0A0F1E", font_color="#F9FAFB",
+        directed=False, notebook=False,
+    )
+    topic_opts: Dict[str, Any] = {
+        "nodes": {
+            "font": {
+                "face": "Open Sans", "color": "#FFFFFF",
+                "size": 14, "bold": True,
+                "strokeWidth": 3, "strokeColor": "#0A0F1E",
+            },
+            "borderWidth": 2,
+            "borderWidthSelected": 4,
+            "shape": "dot",
+        },
+        "edges": {
+            "smooth": {"type": "continuous", "roundness": 0.2},
+            "selectionWidth": 2,
+        },
+        "interaction": {
+            "hover": True, "tooltipDelay": 80,
+            "navigationButtons": True, "keyboard": True,
+            "zoomView": True, "dragNodes": True, "dragView": True,
+        },
+        "layout": {"improvedLayout": False},
+        "physics": _TOPIC_PHYSICS,
+    }
+    net.set_options(json.dumps(topic_opts))
+
     search_lower = controls.get("search", "").lower()
     labels_all   = controls.get("labels_all", True)
 
     for node, data in G2.nodes(data=True):
         ns          = str(node)
         label       = str(data.get("label", f"Topic {node}"))[:40]
+        full_label  = str(data.get("full_label", label))
         top_words   = data.get("top_words", [])
-        size        = float(data.get("size", config.NODE_SIZE_MIN))
+        size        = float(data.get("size", 20.0))
         color       = data.get("color", config.COMMUNITY_COLORS[0])
         paper_count = data.get("paper_count", 0)
-        x, y        = pos.get(ns, (0.0, 0.0))
+        avg_year    = data.get("avg_year") or ""
+        pmids_list  = data.get("pmids", [])
 
         is_match     = bool(search_lower and search_lower in label.lower())
-        border_color = _VOS_HIGHLIGHT if is_match else _darken(color, 0.78)
-        # Respect Labels toggle: OFF hides all labels except search hits
+        border_color = _VOS_HIGHLIGHT if is_match else _darken(color, 0.85)
         label_text   = label if (labels_all or is_match) else ""
+
+        yr_str    = f"Avg year: {avg_year}" if avg_year else ""
+        words_str = ", ".join(top_words[:6]) if top_words else ""
+        pmid_str  = f"PMIDs: {', '.join(str(p) for p in pmids_list[:3])}{'…' if len(pmids_list) > 3 else ''}" if pmids_list else ""
+
+        tooltip = (
+            f"<div style='font-weight:700;color:#00D4FF;margin-bottom:5px'>{full_label}</div>"
+            f"<div>Papers: <b>{paper_count}</b></div>"
+            + (f"<div>{yr_str}</div>" if yr_str else "")
+            + (f"<div style='margin-top:4px;color:#9CA3AF'>Terms: {words_str}</div>" if words_str else "")
+            + (f"<div style='margin-top:3px;font-size:10px;color:#6B7280'>{pmid_str}</div>" if pmid_str else "")
+        )
 
         net.add_node(
             ns, label=label_text, size=size,
-            x=x * _LAYOUT_SCALE, y=y * _LAYOUT_SCALE,
             color={
                 "background": color, "border": border_color,
                 "highlight": {"background": _VOS_HIGHLIGHT, "border": "#FFA500"},
                 "hover": {"background": color, "border": _darken(color, 0.65)},
             },
-            title=(f"<b>{label}</b><br>Papers: {paper_count}<br>"
-                   f"Top words: {', '.join(top_words[:5])}"),
+            title=tooltip,
             shape="dot",
-            font={"size": max(10, int(size * 0.30)), "color": _VOS_FONT,
-                  "face": "Open Sans", "strokeWidth": 4, "strokeColor": "#FFFFFF"},
+            font={"size": 14, "color": "#FFFFFF", "face": "Open Sans",
+                  "bold": True, "strokeWidth": 3, "strokeColor": "#0A0F1E"},
         )
 
-    _add_edges_to_net(net, G2)
-    # Cache key includes labels_all and physics so toggling either regenerates HTML
+    # Add edges with colors by relationship type
+    all_edges = sorted(G2.edges(data=True), key=lambda e: e[2].get("weight", 1), reverse=True)
+    for u, v, data in all_edges[:_MAX_RENDER_EDGES]:
+        weight   = data.get("weight", 1)
+        width    = max(1.0, min(8.0, float(data.get("width", 1)) * 2))
+        rel_type = data.get("relationship_type", "shared_vocabulary")
+        edge_col = _TOPIC_EDGE_COLORS.get(rel_type, "#00D4FF")
+        net.add_edge(
+            str(u), str(v), weight=weight, width=width,
+            color={"color": _rgba(edge_col, 0.55),
+                   "highlight": _VOS_HIGHLIGHT,
+                   "hover": _rgba(edge_col, 0.90)},
+            title=f"<b>{rel_type.replace('_', ' ')}</b><br>Strength: {weight:.2f}",
+            arrows={"to": {"enabled": False}},
+        )
+
+    # Render HTML with dark CSS injected
     html_key = (f"topic_{G2.number_of_nodes()}_{G2.number_of_edges()}_"
-                f"{controls.get('search','')}_phy{controls.get('physics')}_"
-                f"lbl{controls.get('labels_all', True)}")
-    _render_vosviewer_html(net, height=height, cache_key=html_key)
+                f"{controls.get('search','')}_lbl{controls.get('labels_all', True)}")
+
+    html: Optional[str] = st.session_state.get(f"__html_{html_key}")
+    if html is None:
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
+            net.save_graph(f.name)
+            path = f.name
+        with open(path, "r", encoding="utf-8") as f:
+            html = f.read()
+        os.unlink(path)
+        html = html.replace("</head>", _TOPIC_DARK_CSS + "</head>", 1)
+        st.session_state[f"__html_{html_key}"] = html
+
+    st.components.v1.html(html, height=height + 30, scrolling=False)
 
 
 # B — Overlay Visualization ───────────────────────────────────────────────────

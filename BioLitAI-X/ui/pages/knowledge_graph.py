@@ -76,6 +76,44 @@ def _extract_relationships_lazy(papers_df, entities_df):
             st.error(f"Relationship extraction failed: {exc}")
 
 
+def _build_topics_rich(papers_df, embedder):
+    """Run BERTopic with full data (probs + embeddings) and store to session state."""
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    from pipeline.topic_modeler import TopicModeler
+    from pipeline.network_builder import NetworkBuilder
+
+    embeddings_array = st.session_state.get("embeddings_array")
+
+    with st.spinner("Running topic modelling (UMAP + HDBSCAN)… this may take 1-3 minutes."):
+        try:
+            tm = TopicModeler()
+            tm.setup(n_papers=len(papers_df))
+            abstracts = papers_df["abstract"].fillna("").tolist()
+            doc_topics, doc_probs = tm.fit_transform(abstracts, embeddings_array)
+            topic_labels     = tm.get_topic_labels(papers_df=papers_df)
+            topics_over_time = tm.get_topic_over_time(papers_df)
+            doc_topics_df    = tm.get_document_topics(papers_df)
+            nb = NetworkBuilder()
+            topic_graph = nb.build_topic_network({
+                "doc_topics":   doc_topics,
+                "topic_labels": topic_labels,
+                "doc_probs":    doc_probs if doc_probs is not None and len(doc_probs) > 0 else None,
+                "embeddings":   embeddings_array,
+                "papers_df":    papers_df,
+            })
+            st.session_state.update({
+                "topic_labels":     topic_labels,
+                "topics_over_time": topics_over_time,
+                "doc_topics_df":    doc_topics_df,
+                "topic_graph":      topic_graph,
+            })
+            st.success(f"Topic model complete: {len(topic_labels)} topics discovered.")
+        except Exception as exc:
+            logger.error("Rich topic build failed: %s", exc)
+            st.error(f"Topic modelling failed: {exc}")
+
+
 # ── Visualization mode selector (radio dots, original style) ─────────────────
 
 def _viz_mode_selector(key: str) -> str:
@@ -324,8 +362,7 @@ def render():
                     "Click below to run topic modelling (UMAP + HDBSCAN) — takes 1-3 minutes."
                 )
                 if st.button("⚡ Compute Topic Model", type="primary", key="kg_build_topics_btn"):
-                    from ui.pages.analysis import _build_topics_lazy
-                    _build_topics_lazy(papers_df, embedder)
+                    _build_topics_rich(papers_df, embedder)
                     st.rerun()
         else:
             from visualization.network_viz import (
@@ -353,7 +390,9 @@ def render():
                 st.markdown(
                     "<p style='font-size:13px;color:#6B7280;margin-bottom:6px'>"
                     "Node&nbsp;size&nbsp;=&nbsp;paper count &nbsp;·&nbsp; "
-                    "Edge&nbsp;=&nbsp;shared papers between topics.</p>",
+                    "Cyan&nbsp;edge&nbsp;=&nbsp;shared vocabulary &nbsp;·&nbsp; "
+                    "Purple&nbsp;=&nbsp;co-assigned papers &nbsp;·&nbsp; "
+                    "Green&nbsp;=&nbsp;semantic similarity.</p>",
                     unsafe_allow_html=True,
                 )
                 _controls_hint()
@@ -362,6 +401,64 @@ def render():
                     topic_graph, controls=ctrl, height=780,
                     year_range=(yr_min, yr_max) if yr_min else None,
                 )
+
+                # ── Topic summary table ────────────────────────────────────────
+                if topic_labels:
+                    import pandas as pd
+                    sorted_topics = sorted(
+                        topic_labels.items(), key=lambda x: x[1].get("count", 0), reverse=True
+                    )
+                    max_count = max((v.get("count", 0) for _, v in sorted_topics), default=1) or 1
+                    rows = []
+                    for _, v in sorted_topics[:20]:
+                        count    = v.get("count", 0)
+                        avg_year = v.get("avg_year") or "—"
+                        words    = ", ".join((v.get("top_words") or v.get("words") or [])[:6])
+                        bar_pct  = int(count / max_count * 100)
+                        bar_html = (
+                            f"<div style='display:flex;align-items:center;gap:6px'>"
+                            f"<div style='width:{bar_pct}%;max-width:120px;height:8px;"
+                            f"background:#3B82F6;border-radius:4px'></div>"
+                            f"<span style='font-size:12px'>{count}</span>"
+                            f"</div>"
+                        )
+                        rows.append({
+                            "Topic":     v.get("label", ""),
+                            "Papers":    bar_html,
+                            "Avg Year":  str(avg_year),
+                            "Top Terms": words,
+                        })
+                    if rows:
+                        st.markdown("### Topic Summary")
+                        # Render as HTML table for progress-bar column support
+                        header = "<tr>" + "".join(
+                            f"<th style='text-align:left;padding:6px 10px;"
+                            f"border-bottom:1px solid #374151;color:#9CA3AF;"
+                            f"font-size:12px'>{col}</th>"
+                            for col in ["Topic", "Papers", "Avg Year", "Top Terms"]
+                        ) + "</tr>"
+                        body = ""
+                        for i, r in enumerate(rows):
+                            bg = "#111827" if i % 2 == 0 else "#1C2539"
+                            body += (
+                                f"<tr style='background:{bg}'>"
+                                + f"<td style='padding:6px 10px;font-weight:600;"
+                                  f"color:#F9FAFB;font-size:12px'>{r['Topic']}</td>"
+                                + f"<td style='padding:6px 10px'>{r['Papers']}</td>"
+                                + f"<td style='padding:6px 10px;color:#9CA3AF;"
+                                  f"font-size:12px'>{r['Avg Year']}</td>"
+                                + f"<td style='padding:6px 10px;color:#6B7280;"
+                                  f"font-size:11px'>{r['Top Terms']}</td>"
+                                + "</tr>"
+                            )
+                        table_html = (
+                            f"<div style='overflow-x:auto;border-radius:8px;"
+                            f"border:1px solid #1F2937;margin-top:12px'>"
+                            f"<table style='width:100%;border-collapse:collapse'>"
+                            f"<thead>{header}</thead><tbody>{body}</tbody>"
+                            f"</table></div>"
+                        )
+                        st.markdown(table_html, unsafe_allow_html=True)
 
             elif mode == "overlay":
                 st.markdown(
