@@ -65,20 +65,24 @@ class EmbeddingEngine:
         os.environ["MKL_NUM_THREADS"] = str(num_threads)
         os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
 
-        # Suppress HF Hub authentication advisory (noise, not an error)
-        warnings.filterwarnings("ignore", message=".*unauthenticated requests.*", category=UserWarning)
-        warnings.filterwarnings("ignore", message=".*HF_TOKEN.*")
         warnings.filterwarnings("ignore", message=".*Accessing.*__path__.*", category=UserWarning)
-        # Silence transformers library's own logger (__path__ access messages)
         import logging as _logging
         _logging.getLogger("transformers").setLevel(_logging.ERROR)
         _logging.getLogger("transformers.modeling_utils").setLevel(_logging.ERROR)
+
+        if config.HF_TOKEN:
+            try:
+                import huggingface_hub
+                huggingface_hub.login(token=config.HF_TOKEN, add_to_git_credential=False)
+                logger.info("Hugging Face login successful")
+            except Exception as exc:
+                logger.warning("HF login failed (model download may be slower): %s", exc)
 
         from sentence_transformers import SentenceTransformer
         import faiss
 
         logger.info("Loading embedding model: %s (threads=%d)", config.EMBEDDING_MODEL, num_threads)
-        self.model = SentenceTransformer(config.EMBEDDING_MODEL)
+        self.model = SentenceTransformer(config.EMBEDDING_MODEL, token=config.HF_TOKEN)
 
         self._init_index()
         self._ready = True
