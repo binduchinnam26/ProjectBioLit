@@ -402,8 +402,7 @@ def render_knowledge_graph(
         rel_type = data.get("relationship_type", "unknown")
         evidence_pmids = data.get("evidence_pmids", [])
         confidence = data.get("confidence_score", 0.5)
-        edge_color = _EDGE_COLORS.get(rel_type, _DEFAULT_EDGE_COLOR)
-        edge_color_alpha = _color_opacity(edge_color, 0.5)
+        edge_color_alpha = data.get("color", "rgba(255,255,255,0.25)")
 
         pmid_str = ", ".join(str(p) for p in evidence_pmids[:3])
         tooltip = (
@@ -417,8 +416,8 @@ def render_knowledge_graph(
             str(u), str(v),
             color={"color": edge_color_alpha, "highlight": "#FFD700", "hover": "#FFFFFF"},
             title=tooltip,
-            label=rel_type if len(seen_edges) < 200 else "",
-            font={"size": 7, "color": config.TEXT_SECONDARY, "align": "middle"},
+            label=rel_type,
+            font={"size": 9, "color": "#CCCCCC", "align": "middle"},
         )
 
     if total_edges > _MAX_KG_EDGES:
@@ -433,47 +432,39 @@ def render_knowledge_graph(
 
 
 def render_entity_legend():
-    """Render a grouped entity type legend with node size indicator."""
+    """Render grouped entity type legend with node size note."""
     st.markdown(
         f"<p style='color:{config.TEXT_SECONDARY};font-size:13px;"
-        f"font-weight:600;margin-bottom:6px'>Entity Types</p>",
+        f"font-weight:600;margin-bottom:8px'>Entity Types</p>",
         unsafe_allow_html=True,
     )
-    # Canonical display groups: (label, color, shape_hint)
-    _LEGEND_GROUPS = [
-        ("Disease / Cancer",            "#FF5252"),
-        ("Gene / DNA / RNA / Protein",  "#00E676"),
-        ("Chemical / Drug",             "#00D4FF"),
-        ("Biological Process / Pathway","#A8E6CF"),
-        ("Cell / Cell Type / Cell Line","#7B61FF"),
-        ("Organism",                    "#FFD600"),
-        ("Anatomy",                     "#FF8B94"),
-        ("Lab Procedure",               "#8899AA"),
+    _LEGEND = [
+        ("Diseases",            "#FF5252",  "DISEASE, CANCER"),
+        ("Chemicals",           "#00D4FF",  "CHEMICAL"),
+        ("Genes & Proteins",    "#00E676",  "GENE, PROTEIN, DNA, RNA"),
+        ("Organisms",           "#FFD600",  "ORGANISM, TAXON"),
+        ("Cells",               "#7B61FF",  "CELL_TYPE, CELL_LINE"),
+        ("Anatomy",             "#FF8B94",  "ANATOMY"),
+        ("Pathways",            "#A8E6CF",  "PATHWAY"),
     ]
-    for label, color in _LEGEND_GROUPS:
+    for group_label, color, subtypes in _LEGEND:
         st.markdown(
-            f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:4px'>"
-            f"<div style='width:12px;height:12px;border-radius:50%;"
-            f"background:{color};flex-shrink:0'></div>"
-            f"<span style='color:{config.TEXT_PRIMARY};font-size:11px'>{label}</span>"
-            f"</div>",
+            f"<div style='display:flex;align-items:flex-start;gap:8px;margin-bottom:6px'>"
+            f"<div style='width:13px;height:13px;border-radius:50%;"
+            f"background:{color};flex-shrink:0;margin-top:2px'></div>"
+            f"<div>"
+            f"<span style='color:{config.TEXT_PRIMARY};font-size:11px;font-weight:600'>"
+            f"{group_label}</span>"
+            f"<br><span style='color:{config.TEXT_SECONDARY};font-size:9px'>{subtypes}</span>"
+            f"</div></div>",
             unsafe_allow_html=True,
         )
-    # Node size legend
     st.markdown(
-        f"<p style='color:{config.TEXT_SECONDARY};font-size:12px;"
-        f"font-weight:600;margin-top:10px;margin-bottom:4px'>Node Size</p>",
+        f"<div style='margin-top:10px;padding:6px 8px;background:#1C2539;"
+        f"border-radius:4px;font-size:10px;color:{config.TEXT_SECONDARY}'>"
+        f"Node size = frequency across papers</div>",
         unsafe_allow_html=True,
     )
-    for label, px in [("Low frequency", 6), ("Medium", 11), ("High frequency", 18)]:
-        st.markdown(
-            f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:4px'>"
-            f"<div style='width:{px}px;height:{px}px;border-radius:50%;"
-            f"background:#9CA3AF;flex-shrink:0'></div>"
-            f"<span style='color:{config.TEXT_PRIMARY};font-size:11px'>{label}</span>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
 
 
 def render_relationship_evidence_table(relationships_df, papers_df=None):
