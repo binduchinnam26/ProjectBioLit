@@ -97,7 +97,7 @@ NER_ENTITY_TYPES = [
 ]
 
 # ── Topic Modeling ────────────────────────────────────────────────────────────
-BERTOPIC_MIN_TOPIC_SIZE = 10
+BERTOPIC_MIN_TOPIC_SIZE = 5
 
 # ── Network / Graph ───────────────────────────────────────────────────────────
 KEYWORD_MIN_FREQUENCY = 3    # minimum papers a keyword must appear in

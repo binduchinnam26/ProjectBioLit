@@ -52,9 +52,9 @@ class TopicModeler:
         # n_neighbors capped at 15: UMAP complexity is O(N * n_neighbors) so
         # 15 is ~3x faster than 50 with negligible quality loss for NLP tasks.
         # n_components=3 keeps enough structure for HDBSCAN while being faster.
-        n_neighbors = max(10, min(15, n_papers // 100))
-        min_cluster_size = max(config.BERTOPIC_MIN_TOPIC_SIZE, min(30, n_papers // 100))
-        min_samples = max(5, min_cluster_size // 3)
+        n_neighbors = max(5, min(15, n_papers // 50))
+        min_cluster_size = max(config.BERTOPIC_MIN_TOPIC_SIZE, n_papers // 80)
+        min_samples = max(3, min_cluster_size // 3)
 
         logger.info(
             "Initialising BERTopic (n_papers=%d, n_neighbors=%d, min_cluster_size=%d)",
@@ -99,6 +99,7 @@ class TopicModeler:
             min_df=2,
             ngram_range=(1, 2),
             max_features=10000,
+            token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b",  # minimum 2-char tokens
         )
 
         self.model = BERTopic(
@@ -289,7 +290,7 @@ class TopicModeler:
                 w for w in top_words
                 if " " not in w
                 and w.lower() not in self._LABEL_STOPWORDS
-                and len(w) > 3
+                and len(w) >= 4
             ]
 
             # Prefer specific bigrams; deduplicate components already covered
