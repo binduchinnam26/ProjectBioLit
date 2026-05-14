@@ -69,14 +69,7 @@ class EmbeddingEngine:
         import logging as _logging
         _logging.getLogger("transformers").setLevel(_logging.ERROR)
         _logging.getLogger("transformers.modeling_utils").setLevel(_logging.ERROR)
-
-        if config.HF_TOKEN:
-            try:
-                import huggingface_hub
-                huggingface_hub.login(token=config.HF_TOKEN, add_to_git_credential=False)
-                logger.info("Hugging Face login successful")
-            except Exception as exc:
-                logger.warning("HF login failed (model download may be slower): %s", exc)
+        _logging.getLogger("huggingface_hub").setLevel(_logging.ERROR)
 
         from sentence_transformers import SentenceTransformer
         import faiss
