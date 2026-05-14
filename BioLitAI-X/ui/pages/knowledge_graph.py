@@ -10,7 +10,6 @@ Defaults: Co-authorship tab · Network mode.
 """
 
 import logging
-import pickle
 
 import streamlit as st
 import config
@@ -26,11 +25,8 @@ def _extract_entities_lazy(papers_df):
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     from pipeline.nlp_processor import NLPProcessor
     from pipeline.knowledge_graph import KnowledgeGraph
-    from pathlib import Path
-    from utils.helpers import query_hash
     import pandas as pd
 
-    query = st.session_state.get("current_query", "")
     with st.spinner(
         f"Extracting entities from {len(papers_df):,} papers "
         f"(NER-only — typically 30-90 sec)…"
@@ -44,14 +40,6 @@ def _extract_entities_lazy(papers_df):
             st.session_state["entities_df"] = entities_df
             st.session_state["kg_graph"] = kg_graph
             st.session_state["knowledge_graph"] = kg
-            qh = query_hash(query) if query else "default"
-            derived_cache = Path(config.PROCESSED_DIR) / f"{qh}_derived.pkl"
-            if derived_cache.exists():
-                with open(derived_cache, "rb") as _f:
-                    _d = pickle.load(_f)
-                _d.update({"entities_df": entities_df, "kg_graph": kg_graph})
-                with open(derived_cache, "wb") as _f:
-                    pickle.dump(_d, _f, protocol=pickle.HIGHEST_PROTOCOL)
             st.success(
                 f"Entity extraction complete: {len(entities_df):,} entities from "
                 f"{len(papers_df):,} papers."
@@ -66,10 +54,7 @@ def _extract_relationships_lazy(papers_df, entities_df):
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     from pipeline.nlp_processor import NLPProcessor
     from pipeline.knowledge_graph import KnowledgeGraph
-    from pathlib import Path
-    from utils.helpers import query_hash
 
-    query = st.session_state.get("current_query", "")
     with st.spinner(
         f"Extracting relationships from {len(papers_df):,} papers "
         f"(dep parser — may take 3-6 min)…"
@@ -83,14 +68,6 @@ def _extract_relationships_lazy(papers_df, entities_df):
             st.session_state["relationships_df"] = rels_df
             st.session_state["kg_graph"] = kg_graph
             st.session_state["knowledge_graph"] = kg
-            qh = query_hash(query) if query else "default"
-            derived_cache = Path(config.PROCESSED_DIR) / f"{qh}_derived.pkl"
-            if derived_cache.exists():
-                with open(derived_cache, "rb") as _f:
-                    _d = pickle.load(_f)
-                _d.update({"relationships_df": rels_df, "kg_graph": kg_graph})
-                with open(derived_cache, "wb") as _f:
-                    pickle.dump(_d, _f, protocol=pickle.HIGHEST_PROTOCOL)
             st.success(
                 f"Relationships extracted: {len(rels_df):,} edges added to knowledge graph."
             )

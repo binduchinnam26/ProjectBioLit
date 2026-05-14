@@ -13,11 +13,8 @@ Output positions are always normalised to approximately [-1, 1] so the
 existing rendering code (_LAYOUT_SCALE multiplications) works unchanged.
 """
 
-import hashlib
-import json
 import logging
 import math
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
@@ -26,28 +23,6 @@ import numpy as np
 import config
 
 logger = logging.getLogger(__name__)
-
-
-# ── Disk cache helpers ────────────────────────────────────────────────────────
-
-def _cache_path(query: str, network_type: str) -> Path:
-    h = hashlib.md5(query.encode()).hexdigest()[:8]
-    cache_dir = Path(config.EMBEDDINGS_DIR)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f"layout_{network_type}_{h}.json"
-
-
-def _save_layout(positions: Dict[str, Tuple[float, float]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    serializable = {k: [float(x), float(y)] for k, (x, y) in positions.items()}
-    with open(path, "w") as f:
-        json.dump(serializable, f)
-
-
-def _load_layout(path: Path) -> Dict[str, Tuple[float, float]]:
-    with open(path, "r") as f:
-        data = json.load(f)
-    return {k: (float(v[0]), float(v[1])) for k, v in data.items()}
 
 
 # ── Per-node embedding computation ───────────────────────────────────────────
@@ -356,8 +331,6 @@ def compute_vos_layout(
     embeddings_array: Optional[np.ndarray] = None,
     doc_topics_df=None,
     entities_df=None,
-    query: str = "",
-    force_recompute: bool = False,
 ) -> Dict[str, Tuple[float, float]]:
     """
     Two-stage UMAP + ForceAtlas2 VOSviewer-style layout.
@@ -370,18 +343,6 @@ def compute_vos_layout(
         return {}
 
     node_strs = {str(nd) for nd in G.nodes()}
-
-    # ── Disk cache check ──────────────────────────────────────────────────────
-    cache_key = query or f"_nq_{network_type}_{n}_{G.number_of_edges()}"
-    cpath = _cache_path(cache_key, network_type)
-    if not force_recompute and cpath.exists():
-        try:
-            cached = _load_layout(cpath)
-            if node_strs.issubset(set(cached.keys())):
-                logger.info("Layout cache hit: %s", cpath)
-                return {ns: cached[ns] for ns in node_strs}
-        except Exception as exc:
-            logger.warning("Layout cache load failed: %s", exc)
 
     # ── Fallback when no embeddings ───────────────────────────────────────────
     if embeddings_array is None or papers_df is None or len(embeddings_array) == 0:
@@ -430,12 +391,5 @@ def compute_vos_layout(
 
     # ── Normalise to [-1, 1] ──────────────────────────────────────────────────
     final_pos = _normalise(final_pos)
-
-    # ── Save to disk cache ────────────────────────────────────────────────────
-    try:
-        _save_layout(final_pos, cpath)
-        logger.info("Layout saved: %s", cpath)
-    except Exception as exc:
-        logger.warning("Layout cache save failed: %s", exc)
 
     return final_pos

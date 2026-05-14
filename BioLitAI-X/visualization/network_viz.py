@@ -171,7 +171,6 @@ def _compute_layout(
         embeddings_array = st.session_state.get("embeddings_array")
         papers_df        = st.session_state.get("papers_df")
         doc_topics_df    = st.session_state.get("doc_topics_df")
-        query            = st.session_state.get("current_query", "")
 
         pos = compute_vos_layout(
             G,
@@ -179,7 +178,6 @@ def _compute_layout(
             papers_df=papers_df,
             embeddings_array=embeddings_array,
             doc_topics_df=doc_topics_df,
-            query=query,
         )
 
     st.session_state[ss_key] = pos
