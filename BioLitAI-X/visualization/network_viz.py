@@ -886,30 +886,22 @@ def render_topic_network(
     labels_all   = controls.get("labels_all", True)
 
     for node, data in G2.nodes(data=True):
-        ns          = str(node)
-        label       = str(data.get("label", f"Topic {node}"))[:40]
-        full_label  = str(data.get("full_label", label))
-        top_words   = data.get("top_words", [])
-        size        = float(data.get("size", 20.0))
-        color       = data.get("color", config.COMMUNITY_COLORS[0])
-        paper_count = data.get("paper_count", 0)
-        avg_year    = data.get("avg_year") or ""
-        pmids_list  = data.get("pmids", [])
+        ns           = str(node)
+        label        = str(data.get("label", ns))
+        size         = float(data.get("size", 15.0))
+        color        = data.get("color", config.COMMUNITY_COLORS[0])
+        n_topics     = data.get("n_topics", 0)
+        topic_names  = data.get("topic_names", [])
 
         is_match     = bool(search_lower and search_lower in label.lower())
         border_color = _VOS_HIGHLIGHT if is_match else _darken(color, 0.85)
         label_text   = label if (labels_all or is_match) else ""
 
-        yr_str    = f"Avg year: {avg_year}" if avg_year else ""
-        words_str = ", ".join(top_words[:6]) if top_words else ""
-        pmid_str  = f"PMIDs: {', '.join(str(p) for p in pmids_list[:3])}{'…' if len(pmids_list) > 3 else ''}" if pmids_list else ""
-
+        topics_str = "; ".join(dict.fromkeys(topic_names))  # deduplicate, keep order
         tooltip = (
-            f"<div style='font-weight:700;color:#00D4FF;margin-bottom:5px'>{full_label}</div>"
-            f"<div>Papers: <b>{paper_count}</b></div>"
-            + (f"<div>{yr_str}</div>" if yr_str else "")
-            + (f"<div style='margin-top:4px;color:#9CA3AF'>Terms: {words_str}</div>" if words_str else "")
-            + (f"<div style='margin-top:3px;font-size:10px;color:#6B7280'>{pmid_str}</div>" if pmid_str else "")
+            f"<div style='font-weight:700;color:#00D4FF;margin-bottom:5px'>{label}</div>"
+            f"<div>Appears in <b>{n_topics}</b> topic cluster{'s' if n_topics != 1 else ''}</div>"
+            + (f"<div style='margin-top:4px;color:#9CA3AF;font-size:11px'>{topics_str}</div>" if topics_str else "")
         )
 
         net.add_node(
@@ -925,19 +917,18 @@ def render_topic_network(
                   "bold": True, "strokeWidth": 3, "strokeColor": "#0A0F1E"},
         )
 
-    # Add edges with colors by relationship type
+    # Add edges — color by source-node community for visual cluster grouping
     all_edges = sorted(G2.edges(data=True), key=lambda e: e[2].get("weight", 1), reverse=True)
     for u, v, data in all_edges[:_MAX_RENDER_EDGES]:
         weight   = data.get("weight", 1)
-        width    = max(1.0, min(8.0, float(data.get("width", 1)) * 2))
-        rel_type = data.get("relationship_type", "shared_vocabulary")
-        edge_col = _TOPIC_EDGE_COLORS.get(rel_type, "#00D4FF")
+        width    = max(0.5, min(6.0, float(data.get("width", 1))))
+        src_col  = G2.nodes[u].get("color", "#00D4FF")
         net.add_edge(
             str(u), str(v), weight=weight, width=width,
-            color={"color": _rgba(edge_col, 0.55),
+            color={"color": _rgba(src_col, 0.40),
                    "highlight": _VOS_HIGHLIGHT,
-                   "hover": _rgba(edge_col, 0.90)},
-            title=f"<b>{rel_type.replace('_', ' ')}</b><br>Strength: {weight:.2f}",
+                   "hover": _rgba(src_col, 0.80)},
+            title=f"<b>{u}</b> — <b>{v}</b><br>Co-topic strength: {weight:.2f}",
             arrows={"to": {"enabled": False}},
         )
 

@@ -389,10 +389,10 @@ def render():
             if mode == "network":
                 st.markdown(
                     "<p style='font-size:13px;color:#6B7280;margin-bottom:6px'>"
-                    "Node&nbsp;size&nbsp;=&nbsp;paper count &nbsp;·&nbsp; "
-                    "Cyan&nbsp;edge&nbsp;=&nbsp;shared vocabulary &nbsp;·&nbsp; "
-                    "Purple&nbsp;=&nbsp;co-assigned papers &nbsp;·&nbsp; "
-                    "Green&nbsp;=&nbsp;semantic similarity.</p>",
+                    "Each node = one keyword. &nbsp;·&nbsp; "
+                    "Node size = keyword prominence across topics. &nbsp;·&nbsp; "
+                    "Color = topic cluster. &nbsp;·&nbsp; "
+                    "Edge = keywords co-appear in the same topic.</p>",
                     unsafe_allow_html=True,
                 )
                 _controls_hint()
