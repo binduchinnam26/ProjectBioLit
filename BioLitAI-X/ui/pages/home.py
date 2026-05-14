@@ -295,9 +295,13 @@ def _run_pipeline(
     elif low_disk:
         st.warning(f"⚠️ Low disk: {free_mb} MB. Cache writes skipped.")
 
-    db = DatabaseManager(config.DB_PATH)
-    session_id = db.save_query_session(query, max_results)
-    db.update_query_session(session_id, pipeline_status="running")
+    if no_disk:
+        db = None
+        session_id = None
+    else:
+        db = DatabaseManager(config.DB_PATH)
+        session_id = db.save_query_session(query, max_results)
+        db.update_query_session(session_id, pipeline_status="running")
 
     step_container = st.empty()
     stats_container = st.empty()
@@ -374,8 +378,9 @@ def _run_pipeline(
             if kg_graph is not None:
                 kg.graph = kg_graph
 
-            db.update_query_session(session_id, papers_fetched=len(papers_df),
-                                    pipeline_status="complete")
+            if db:
+                db.update_query_session(session_id, papers_fetched=len(papers_df),
+                                        pipeline_status="complete")
             total_elapsed = _elapsed()
             # step=7 marks all 6 steps as done (✅)
             _update(7, f"Loaded from cache in {total_elapsed}!",
@@ -572,8 +577,9 @@ def _run_pipeline(
                         logger.warning("Background DB write failed: %s", _e)
                 threading.Thread(target=_bg_db_write, daemon=True).start()
 
-            db.update_query_session(session_id, papers_fetched=_n_papers,
-                                    pipeline_status="complete")
+            if db:
+                db.update_query_session(session_id, papers_fetched=_n_papers,
+                                        pipeline_status="complete")
             total_elapsed = _elapsed()
             # step=7 marks all 6 steps as done (✅)
             _update(7, f"Pipeline complete! ({total_elapsed})",
@@ -618,7 +624,8 @@ def _run_pipeline(
         st.rerun()
 
     except Exception as exc:
-        db.update_query_session(session_id, pipeline_status="error")
+        if db:
+            db.update_query_session(session_id, pipeline_status="error")
         logger.error("Pipeline failed: %s", exc, exc_info=True)
         st.error(f"Pipeline failed: {exc}")
 

@@ -32,7 +32,11 @@ class DatabaseManager:
         # 5 s is ample for any transient lock.
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=5)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            # Disk full — WAL sidecar file can't be written; fall back to in-memory journal
+            conn.execute("PRAGMA journal_mode=MEMORY")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=100000")
         conn.execute("PRAGMA temp_store=MEMORY")
