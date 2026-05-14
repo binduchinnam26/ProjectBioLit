@@ -251,92 +251,182 @@ class NetworkBuilder:
     def build_topic_network(self, topic_model_results: Dict[str, Any]) -> nx.Graph:
         """
         Nodes: BERTopic-discovered topics.
-        Edges: papers shared between topics (topic co-assignment).
+        Edges: built via 3 strategies — vocabulary Jaccard, probability
+        co-assignment, and embedding centroid cosine similarity.
 
         topic_model_results expects keys:
-          'doc_topics': list of topic IDs per document
-          'topic_labels': {topic_id: {'label', 'top_words', 'count'}}
+          'doc_topics'   : list of topic IDs per document (required)
+          'topic_labels' : {topic_id: {'label', 'top_words', 'count', 'avg_year'}}
+          'doc_probs'    : probability matrix [n_docs × n_topics] (optional)
+          'embeddings'   : document embedding array (optional)
+          'papers_df'    : DataFrame with pmid, pub_year columns (optional)
         """
-        doc_topics = topic_model_results.get("doc_topics", [])
+        import numpy as np
+
+        doc_topics   = topic_model_results.get("doc_topics", [])
         topic_labels = topic_model_results.get("topic_labels", {})
+        doc_probs    = topic_model_results.get("doc_probs")
+        embeddings   = topic_model_results.get("embeddings")
+        papers_df    = topic_model_results.get("papers_df")
 
         if not doc_topics or not topic_labels:
             return nx.Graph()
 
         G = nx.Graph()
 
-        for tid, info in topic_labels.items():
-            if tid == -1:
-                continue
-            G.add_node(
-                tid,
-                label=info.get("label", f"Topic {tid}"),
-                top_words=info.get("top_words", []),
-                paper_count=info.get("count", 0),
-            )
-
-        # Edge: topics that share papers (same paper assigned to multiple topics)
-        # Using topic co-assignment from document list
-        topic_pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
-        for tid in doc_topics:
-            if tid == -1:
-                continue
-            # Single assignment — build edges from papers that share nearby topics
-            # (BERTopic assigns one primary topic per doc, so we use paper lists)
-
-        # Build paper lists per topic
+        # Build paper-index lists and PMID lists per topic
         topic_papers: Dict[int, List[int]] = defaultdict(list)
+        topic_pmids:  Dict[int, List[str]] = defaultdict(list)
+        pmids: List[str] = []
+        if papers_df is not None and not papers_df.empty:
+            pmids = papers_df["pmid"].astype(str).tolist()
+
         for doc_idx, tid in enumerate(doc_topics):
             if tid >= 0:
                 topic_papers[tid].append(doc_idx)
+                if pmids and doc_idx < len(pmids):
+                    topic_pmids[tid].append(pmids[doc_idx])
 
-        for (ta, tb) in combinations(sorted(topic_papers.keys()), 2):
-            shared = len(set(topic_papers[ta]) & set(topic_papers[tb]))
-            if shared > 0:
-                topic_pair_counts[(ta, tb)] = shared
+        # Build topic→publication-years mapping
+        topic_pub_years: Dict[int, List[int]] = defaultdict(list)
+        if papers_df is not None and "pub_year" in papers_df.columns:
+            for doc_idx, tid in enumerate(doc_topics):
+                if tid >= 0 and doc_idx < len(papers_df):
+                    try:
+                        yr = int(papers_df.iloc[doc_idx]["pub_year"] or 0)
+                    except Exception:
+                        yr = 0
+                    if yr > 0:
+                        topic_pub_years[tid].append(yr)
 
-        for (ta, tb), weight in topic_pair_counts.items():
-            if G.has_node(ta) and G.has_node(tb):
-                G.add_edge(ta, tb, weight=weight)
+        # ── Add nodes ─────────────────────────────────────────────────────────
+        topic_ids = sorted(t for t in topic_labels if t != -1)
+        for tid in topic_ids:
+            info      = topic_labels[tid]
+            top_words = info.get("top_words", info.get("words", []))
+            # 4-word dot-joined label for the node; fall back to info label
+            lw = top_words[:4]
+            label = " · ".join(lw) if lw else info.get("label", f"Topic {tid}")
+            paper_count = len(topic_papers.get(tid, [])) or info.get("count", 0)
+            pub_years   = topic_pub_years.get(tid, [])
+            avg_year    = round(sum(pub_years) / len(pub_years)) if pub_years else (info.get("avg_year") or 0)
 
-        # BERTopic assigns ONE primary topic per document so most pairs share no
-        # papers.  Supplement with keyword-overlap edges so the graph stays
-        # connected and the topic landscape can be rendered without all nodes
-        # being classified as isolates and removed.
-        for (ta, tb) in combinations(sorted(G.nodes()), 2):
-            if G.has_edge(ta, tb):
-                continue  # already connected by shared papers
-            words_a = set(G.nodes[ta].get("top_words", [])[:10])
-            words_b = set(G.nodes[tb].get("top_words", [])[:10])
-            overlap = len(words_a & words_b)
-            if overlap > 0:
-                G.add_edge(ta, tb, weight=overlap)
-
-        if G.number_of_nodes() == 0:
-            return G
-
-        counts = [d.get("paper_count", 1) for _, d in G.nodes(data=True)]
-        w_min, w_max = (min(counts), max(counts)) if counts else (0, 1)
-        color_palette = config.COMMUNITY_COLORS
-
-        for i, node in enumerate(G.nodes()):
-            pc = G.nodes[node].get("paper_count", 1)
-            G.nodes[node].update(
-                {
-                    "color": color_palette[i % len(color_palette)],
-                    "size": _scale_node_size(pc, w_min, w_max),
-                    "community": i,
-                }
+            G.add_node(
+                tid,
+                label=label,
+                full_label=info.get("label", label),
+                top_words=top_words[:10],
+                paper_count=paper_count,
+                pub_years=pub_years,
+                avg_year=avg_year,
+                pmids=topic_pmids.get(tid, [])[:20],
             )
 
-        weights = [d.get("weight", 1) for _, _, d in G.edges(data=True)]
-        ew_min, ew_max = (min(weights), max(weights)) if weights else (0, 1)
+        if G.number_of_nodes() < 2:
+            return G
+
+        # ── Accumulate edge weights from all strategies ────────────────────────
+        edge_weights: Dict[Tuple[int, int], float] = defaultdict(float)
+        edge_rel:     Dict[Tuple[int, int], str]   = {}
+
+        # Strategy A: Vocabulary Jaccard of top-20 word sets (threshold > 0.1)
+        for ta, tb in combinations(topic_ids, 2):
+            if not G.has_node(ta) or not G.has_node(tb):
+                continue
+            words_a = set(G.nodes[ta].get("top_words", [])[:20])
+            words_b = set(G.nodes[tb].get("top_words", [])[:20])
+            union   = words_a | words_b
+            if not union:
+                continue
+            jaccard = len(words_a & words_b) / len(union)
+            if jaccard > 0.1:
+                key = (min(ta, tb), max(ta, tb))
+                edge_weights[key] += jaccard
+                edge_rel.setdefault(key, "shared_vocabulary")
+
+        # Strategy B: Probability co-assignment (requires doc_probs)
+        if doc_probs is not None:
+            try:
+                prob_arr = np.array(doc_probs)
+                if prob_arr.ndim == 2 and prob_arr.shape[0] > 0:
+                    for doc_i in range(prob_arr.shape[0]):
+                        row = prob_arr[doc_i]
+                        # Topics with prob > 0.1 for this document
+                        strong = [int(j) for j, p in enumerate(row) if p > 0.1 and G.has_node(j)]
+                        n_strong = len(strong)
+                        if n_strong < 2:
+                            continue
+                        contrib = 1.0 / n_strong
+                        for i in range(n_strong):
+                            for j in range(i + 1, n_strong):
+                                key = (min(strong[i], strong[j]), max(strong[i], strong[j]))
+                                edge_weights[key] += contrib
+                                edge_rel.setdefault(key, "co_assigned_papers")
+            except Exception as exc:
+                logger.warning("Strategy B (prob co-assignment) failed: %s", exc)
+
+        # Strategy C: Topic centroid cosine similarity (requires embeddings)
+        if embeddings is not None:
+            try:
+                emb_arr = np.array(embeddings)
+                centroids: Dict[int, np.ndarray] = {}
+                for tid in topic_ids:
+                    idxs = [i for i in topic_papers.get(tid, []) if i < len(emb_arr)]
+                    if idxs:
+                        centroids[tid] = emb_arr[idxs].mean(axis=0)
+
+                centroid_ids = sorted(centroids.keys())
+                for i in range(len(centroid_ids)):
+                    for j in range(i + 1, len(centroid_ids)):
+                        ta, tb = centroid_ids[i], centroid_ids[j]
+                        if not G.has_node(ta) or not G.has_node(tb):
+                            continue
+                        v1, v2 = centroids[ta], centroids[tb]
+                        norm = np.linalg.norm(v1) * np.linalg.norm(v2)
+                        if norm < 1e-9:
+                            continue
+                        sim = float(np.dot(v1, v2) / norm)
+                        if sim > 0.3:
+                            key = (min(ta, tb), max(ta, tb))
+                            edge_weights[key] += sim
+                            edge_rel.setdefault(key, "semantic_similarity")
+            except Exception as exc:
+                logger.warning("Strategy C (embedding centroid) failed: %s", exc)
+
+        # ── Add edges with combined weight > 0.15 ─────────────────────────────
+        for (ta, tb), weight in edge_weights.items():
+            if weight > 0.15 and G.has_node(ta) and G.has_node(tb):
+                G.add_edge(
+                    ta, tb,
+                    weight=weight,
+                    relationship_type=edge_rel.get((ta, tb), "shared_vocabulary"),
+                )
+
+        # ── Community detection and node sizing ───────────────────────────────
+        partition = _louvain_communities(G)
+        counts = [G.nodes[n].get("paper_count", 1) for n in G.nodes()]
+        c_min, c_max = (min(counts), max(counts)) if counts else (1, 1)
+
+        for node in G.nodes():
+            pc    = G.nodes[node].get("paper_count", 1)
+            comm  = partition.get(node, 0)
+            ratio = (pc - c_min) / (c_max - c_min + 1e-9)
+            G.nodes[node].update({
+                "color":     config.COMMUNITY_COLORS[comm % len(config.COMMUNITY_COLORS)],
+                "size":      20.0 + ratio * 80.0,
+                "community": comm,
+            })
+
+        # Edge widths
+        all_weights = [d.get("weight", 1) for _, _, d in G.edges(data=True)]
+        ew_min = min(all_weights) if all_weights else 0.0
+        ew_max = max(all_weights) if all_weights else 1.0
         for u, v, d in G.edges(data=True):
             d["width"] = _scale_edge_width(d.get("weight", 1), ew_min, ew_max)
 
         logger.info(
             "Topic network: %d topics, %d connections",
-            G.number_of_nodes(), G.number_of_edges()
+            G.number_of_nodes(), G.number_of_edges(),
         )
         return G
 
