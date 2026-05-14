@@ -86,7 +86,16 @@ class KnowledgeGraph:
             if name not in entity_info:
                 entity_info[name] = {"entity_type": etype, "umls_id": umls_id}
 
-        counts = list(entity_paper_count.values())
+        # Filter E — only keep entities appearing in >= 2 distinct papers
+        entity_info = {
+            name: info for name, info in entity_info.items()
+            if len(self._entity_pmids[name]) >= 2
+        }
+        # Recompute paper_count as unique-paper count (not row count)
+        for name in entity_info:
+            entity_paper_count[name] = len(self._entity_pmids[name])
+
+        counts = list(entity_paper_count[name] for name in entity_info)
         w_min = min(counts) if counts else 0
         w_max = max(counts) if counts else 1
 
@@ -134,11 +143,19 @@ class KnowledgeGraph:
                         cooccur_pmids[key].add(pmid)
 
             for (e1, e2), pmids_set in cooccur_pmids.items():
+                if e1 == e2:  # no self-loops
+                    continue
+                weight = len(pmids_set)
+                if weight < 2:  # edge weight filter
+                    continue
                 G.add_edge(
                     e1, e2,
-                    relationship_type="co-occurs with",
+                    relationship_type="co-occurs",
+                    label="co-occurs",
                     evidence_pmids=list(pmids_set),
-                    confidence_score=min(0.8, len(pmids_set) / 5.0),
+                    weight=weight,
+                    color="rgba(255,255,255,0.25)",
+                    confidence_score=min(0.8, weight / 5.0),
                 )
 
         # ── Add edges ─────────────────────────────────────────────────────────
@@ -153,11 +170,21 @@ class KnowledgeGraph:
                     rel_groups[(src, tgt, verb)].append(pmid)
 
             for (src, tgt, verb), pmids in rel_groups.items():
-                confidence = min(1.0, len(set(pmids)) / 5.0)
+                if src == tgt:  # no self-loops
+                    continue
+                unique_pmids = list(set(pmids))
+                weight = len(unique_pmids)
+                if weight < 2:  # edge weight filter
+                    continue
+                confidence = min(1.0, weight / 5.0)
+                edge_label = verb if verb else "co-occurs"
                 G.add_edge(
                     src, tgt,
-                    relationship_type=verb,
-                    evidence_pmids=list(set(pmids)),
+                    relationship_type=edge_label,
+                    label=edge_label,
+                    evidence_pmids=unique_pmids,
+                    weight=weight,
+                    color="rgba(255,255,255,0.25)",
                     confidence_score=confidence,
                 )
 

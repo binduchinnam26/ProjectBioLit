@@ -69,135 +69,165 @@ _UMLS_SEMTYPE_MAP: Dict[str, str] = {
     "T061": "LABORATORY_PROCEDURE", "T063": "LABORATORY_PROCEDURE",
 }
 
-# Only these labels are meaningful biomedical entities.
-# "ENTITY" is the only label en_core_sci_lg emits; specific labels
-# (DISEASE, CHEMICAL, etc.) come from UMLS reclassification or other models.
-# We keep ENTITY here so the model produces output, but filter its content
-# heavily via _BIO_STOPWORDS and minimum length below.
-_BIOMEDICAL_ENTITY_TYPES: frozenset = frozenset({
-    # Generic label from en_core_sci_lg (reclassified to specific type if UMLS is on)
-    "ENTITY",
-    # Specific labels from UMLS reclassification or domain-specific SciSpaCy models
-    "DISEASE", "GENE_OR_GENOME", "CHEMICAL",
-    "BIOLOGICAL_PROCESS", "CELL", "ORGANISM", "LABORATORY_PROCEDURE",
-    # Extended labels from UMLS or future models
-    "CANCER", "DNA", "RNA", "PROTEIN",
-    "CELL_TYPE", "CELL_LINE", "PATHWAY", "ANATOMY",
+# Filter A — entity type whitelist (exact labels to accept)
+_ENTITY_WHITELIST: frozenset = frozenset({
+    "DISEASE", "CHEMICAL", "GENE_OR_GENE_PRODUCT", "ORGANISM",
+    "CELL_TYPE", "CELL_LINE", "PROTEIN", "DNA", "RNA",
+    "CANCER", "PATHWAY", "SIMPLE_CHEMICAL", "TAXON",
+    # Backward-compat labels from en_core_sci_lg / UMLS reclassification
+    "GENE_OR_GENOME", "BIOLOGICAL_PROCESS", "CELL",
+    "LABORATORY_PROCEDURE", "ANATOMY",
 })
 
-# Generic words that appear as NER spans but carry no biomedical meaning.
-# Checked against entity TEXT (not the label) after lowercasing.
-_BIO_STOPWORDS: frozenset = frozenset({
-    # Study / methodology
-    "study", "studies", "data", "results", "result", "level", "levels",
-    "finding", "findings", "evidence", "week", "weeks", "day", "days",
-    "review", "tissue", "tissues", "diverse", "production",
-    "evaluated", "analyzed", "investigated", "potential", "complex",
-    "model", "models", "mechanism", "mechanisms", "efficacy",
-    "effect", "effects", "species", "cells", "cell", "function",
-    "functions", "skin", "healthy", "unclear", "expression",
-    "consistent", "background", "objective", "objectives",
-    "method", "methods", "conclusion", "conclusions", "introduction",
-    "abstract", "purpose", "aims", "aim", "scope", "context",
-    "analysis", "analyses", "information", "literature", "research",
-    "report", "reports", "case", "cases", "subjects", "subject",
-    "patient", "patients", "sample", "samples", "group", "groups",
-    "control", "controls", "number", "numbers", "rate", "rates",
-    "factor", "factors", "role", "roles", "type", "types",
-    "significant", "significantly", "associated", "association",
-    "compared", "comparison", "including", "related", "different",
-    "differences", "common", "similar", "various", "multiple",
-    "large", "small", "high", "low", "dose", "doses",
-    "response", "responses", "activity", "activities",
-    "protein", "proteins", "gene", "genes", "pathway", "pathways",
-    "line", "lines", "organ", "organs", "marker", "markers",
-    "target", "targets", "site", "sites", "process", "processes",
-    "condition", "conditions", "status", "outcome", "outcomes",
-    "endpoint", "endpoints", "concentration", "concentrations",
-    "treatment", "treatments", "therapy", "therapies",
-    "approach", "approaches", "strategy", "strategies",
-    "mechanism", "mechanisms", "pathway", "pathways",
-    "network", "networks", "system", "systems",
-    # Action verbs — all common inflections
+# Filter B — hard stopword blocklist
+BIOMEDICAL_STOPWORDS: frozenset = frozenset({
+    "study", "studies", "data", "results", "result", "findings", "finding",
+    "evidence", "analysis", "analyses", "review", "reviews", "report",
+    "reports", "model", "models", "mechanism", "mechanisms", "potential",
+    "complex", "complexes", "production", "induced", "diverse", "diversity",
+    "analyzed", "investigated", "function", "functions", "levels", "level",
+    "tissue", "tissues", "days", "weeks", "months", "years", "effects",
+    "effect", "efficacy", "method", "methods", "approach", "approaches",
+    "response", "responses", "activity", "activities", "treatment",
+    "treatments", "patient", "patients", "sample", "samples", "group",
+    "groups", "control", "controls", "type", "types", "factor", "factors",
+    "role", "roles", "process", "processes", "pathway", "pathways",
+    "expression", "healthy", "unclear", "consistent", "species", "cells",
+    "cell", "skin", "human", "humans", "animal", "animals", "vitro", "vivo",
+    "distribution", "concentration", "exposure", "increase", "decrease",
+    "association", "correlation", "significant", "significantly",
+    "however", "although", "therefore", "conclusion", "objective",
+    "background", "purpose", "method", "result", "discuss",
+    # Extra verb forms still slipping through
+    "accelerate", "accelerates", "accelerated", "acceleration",
+    "modulate", "modulates", "modulated", "modulation",
+    "regulate", "regulates", "regulated", "regulation",
+    "promote", "promotes", "promoted", "promotion",
+    "inhibit", "inhibits", "inhibited", "inhibition",
+    "activate", "activates", "activated", "activation",
+    "suppress", "suppresses", "suppressed", "suppression",
+    "enhance", "enhances", "enhanced", "enhancement",
+    "reduce", "reduces", "reduced", "reduction",
+    "induce", "induces", "induced", "induction",
+    "mediate", "mediates", "mediated", "mediation",
+    "facilitate", "facilitates", "facilitated",
+    "involve", "involves", "involved", "involvement",
+    "contribute", "contributes", "contributed", "contribution",
+    "improve", "improves", "improved", "improvement",
+    "alter", "alters", "altered", "alteration",
+    "affect", "affects", "affected",
+    "indicate", "indicates", "indicated", "indication",
+    "suggest", "suggests", "suggested",
+    "demonstrate", "demonstrates", "demonstrated",
+    "show", "shows", "showed", "shown",
+    "observe", "observes", "observed", "observation",
+    "identify", "identifies", "identified",
+    "detect", "detects", "detected", "detection",
+    "develop", "develops", "developed", "development",
     "increase", "increases", "increased", "increasing",
     "decrease", "decreases", "decreased", "decreasing",
-    "reduce", "reduces", "reduced", "reducing", "reduction", "reductions",
-    "promote", "promotes", "promoted", "promoting", "promotion",
-    "inhibit", "inhibits", "inhibited", "inhibiting", "inhibition",
-    "activate", "activates", "activated", "activating", "activation",
-    "suppress", "suppresses", "suppressed", "suppressing", "suppression",
-    "enhance", "enhances", "enhanced", "enhancing", "enhancement",
-    "modulate", "modulates", "modulated", "modulating", "modulation",
-    "regulate", "regulates", "regulated", "regulating", "regulation",
-    "affect", "affects", "affected", "affecting",
-    "alter", "alters", "altered", "altering", "alteration", "alterations",
-    "change", "changes", "changed", "changing",
-    "improve", "improves", "improved", "improving", "improvement",
-    "stimulate", "stimulates", "stimulated", "stimulating", "stimulation",
-    "induce", "induces", "induced", "inducing", "induction",
-    "produce", "produces", "produced", "producing",
-    "generate", "generates", "generated", "generating",
-    "lead", "leads", "leading",
-    "cause", "causes", "caused", "causing",
-    "show", "shows", "showed", "shown", "showing",
-    "demonstrate", "demonstrates", "demonstrated", "demonstrating",
-    "suggest", "suggests", "suggested", "suggesting",
-    "indicate", "indicates", "indicated", "indicating", "indication",
-    "reveal", "reveals", "revealed", "revealing",
-    "observe", "observes", "observed", "observing", "observation",
-    "find", "finds", "found",
-    "accelerate", "accelerates", "accelerated", "accelerating", "acceleration",
-    "mediate", "mediates", "mediated", "mediating", "mediation",
-    "facilitate", "facilitates", "facilitated", "facilitating",
-    "block", "blocks", "blocked", "blocking",
-    "prevent", "prevents", "prevented", "preventing", "prevention",
-    "protect", "protects", "protected", "protecting", "protection",
-    "impair", "impairs", "impaired", "impairing", "impairment",
-    "develop", "develops", "developed", "developing", "development",
-    "maintain", "maintains", "maintained", "maintaining",
-    "support", "supports", "supported", "supporting",
-    "involve", "involves", "involved", "involving", "involvement",
-    "require", "requires", "required", "requiring", "requirement",
-    "contribute", "contributes", "contributed", "contributing", "contribution",
-    "play", "plays", "played", "playing",
-    "undergo", "undergoes", "undergone", "undergoing",
-    "associate", "associates", "associated", "associating",
-    "correlate", "correlates", "correlated", "correlating", "correlation",
-    "regulate", "upregulate", "downregulate", "upregulated", "downregulated",
-    "overexpress", "overexpressed", "overexpressing", "overexpression",
-    "interact", "interacts", "interacted", "interacting", "interaction",
+    "occur", "occurs", "occurred", "occurrence",
+    "interact", "interacts", "interacted", "interaction",
     "bind", "binds", "bound", "binding",
-    "express", "expresses", "expressed", "expressing",
-    "identify", "identifies", "identified", "identifying",
-    "detect", "detects", "detected", "detecting", "detection",
-    "measure", "measures", "measured", "measuring", "measurement",
-    "assess", "assesses", "assessed", "assessing", "assessment",
-    "examine", "examines", "examined", "examining",
-    "evaluate", "evaluates", "evaluated", "evaluating", "evaluation",
-    "investigate", "investigates", "investigated", "investigating",
-    "determine", "determines", "determined", "determining",
-    "include", "includes", "included", "including",
-    "represent", "represents", "represented", "representing",
-    "occur", "occurs", "occurred", "occurring", "occurrence",
-    "provide", "provides", "provided", "providing",
-    "exhibit", "exhibits", "exhibited", "exhibiting",
-    "present", "presents", "presented", "presenting",
-    "confirm", "confirms", "confirmed", "confirming", "confirmation",
-    "report", "reports", "reported", "reporting",
-    # Adjectives / adverbs
-    "markedly", "substantially", "notably", "strongly",
-    "greatly", "moderately", "potentially", "possibly",
-    "likely", "unlikely", "important", "critical", "essential",
-    "relevant", "novel", "unique", "specific", "general",
-    "overall", "total", "elevated", "altered",
-    # Statistical / measurement
-    "mean", "median", "average", "standard", "deviation", "error",
-    "confidence", "interval", "ratio", "hazard", "odds",
-    "percent", "percentage", "proportion", "prevalence", "incidence",
-    "correlation", "regression", "coefficient", "variable",
-    "hour", "hours", "month", "months", "year", "years",
-    "minute", "minutes", "milligram", "microgram", "nanogram",
+    "express", "expresses", "expressed",
+    "upregulate", "upregulated", "downregulate", "downregulated",
+    "overexpress", "overexpressed", "overexpression",
+    "marker", "markers", "target", "targets", "site", "sites",
+    "condition", "conditions", "status", "outcome", "outcomes",
+    "significant", "number", "rate", "rates", "measure", "measures",
+    "dose", "doses", "concentration", "concentrations",
+    "mean", "median", "percent", "percentage", "proportion",
+    "correlation", "regression", "variable", "coefficient",
+    "hour", "hours", "month", "year", "minute",
 })
+
+
+def _infer_entity_type(text: str) -> str:
+    """
+    Heuristic type inference for ENTITY-labeled spans from en_core_sci_lg.
+    Returns a specific biomedical type or 'ENTITY' if unclassifiable.
+    Used because en_core_sci_lg emits only the generic ENTITY label;
+    specialized models (bc5cdr, bionlp13cg) emit specific labels directly.
+    """
+    t = text.lower().strip()
+    words = set(t.split())
+
+    # Disease
+    _disease_kws = {
+        "disease", "disorder", "syndrome", "cancer", "tumor", "tumour",
+        "carcinoma", "sarcoma", "lymphoma", "leukemia", "leukaemia",
+        "melanoma", "glioma", "adenoma", "neoplasm", "malignancy",
+        "hepatitis", "arthritis", "diabetes", "hypertension",
+        "depression", "schizophrenia", "alzheimer", "parkinson",
+        "asthma", "fibrosis", "cirrhosis", "infection", "deficiency",
+        "neuropathy", "retinopathy", "nephropathy", "myopathy",
+    }
+    if words & _disease_kws or any(kw in t for kw in _disease_kws):
+        return "DISEASE"
+    if any(t.endswith(s) for s in ("itis", "osis", "emia", "oma", "pathy",
+                                    "trophy", "plasia", "malacia")):
+        return "DISEASE"
+
+    # Cell type / cell line
+    _cell_kws = {
+        "lymphocyte", "macrophage", "neutrophil", "monocyte",
+        "fibroblast", "hepatocyte", "neuron", "astrocyte", "platelet",
+        "thymocyte", "erythrocyte", "leukocyte", "osteoblast", "chondrocyte",
+    }
+    if words & _cell_kws:
+        return "CELL_TYPE"
+    if any(t.endswith(s) for s in ("cyte", "blast", "phage")):
+        return "CELL_TYPE"
+
+    # Organism
+    _organism_kws = {
+        "virus", "bacteria", "bacterium", "fungus", "parasite", "pathogen",
+        "staphylococcus", "streptococcus", "escherichia", "salmonella",
+        "mycobacterium", "klebsiella", "pseudomonas", "candida",
+        "influenza", "coronavirus", "hiv", "sars",
+    }
+    if words & _organism_kws or any(kw in t for kw in _organism_kws):
+        return "ORGANISM"
+    if any(t.endswith(s) for s in ("virus", "coccus", "bacillus", "ella",
+                                    "monas", "mycetes")):
+        return "ORGANISM"
+
+    # Chemical / drug
+    _drug_suffixes = (
+        "mab", "nib", "vir", "pril", "olol", "azole",
+        "cycline", "mycin", "cillin", "statin", "sartan",
+        "pam", "lam", "flurane", "caine",
+    )
+    if any(t.endswith(s) for s in _drug_suffixes):
+        return "CHEMICAL"
+    _chem_kws = {
+        "acid", "oxide", "chloride", "sulfate", "sulphate", "phosphate",
+        "hydroxide", "acetate", "sodium", "potassium", "calcium", "magnesium",
+        "vitamin", "glucose", "insulin", "lipid", "steroid",
+        "cytokine", "chemokine", "antibody", "antigen",
+    }
+    if words & _chem_kws or any(kw in t for kw in _chem_kws):
+        return "CHEMICAL"
+
+    # Gene / protein
+    # All-uppercase abbreviation: TP53, BRCA2, TNF, IL6
+    if text.isupper() and 2 <= len(text) <= 10 and text.replace("-", "").isalnum():
+        return "GENE_OR_GENE_PRODUCT"
+    # Mixed-case with digit (p53, Bcl-2, NF-kB, mTOR)
+    if len(text.split()) == 1 and len(text) >= 3:
+        upper_count = sum(1 for c in text if c.isupper())
+        digit_count = sum(1 for c in text if c.isdigit())
+        if upper_count >= 2 and (digit_count >= 1 or "-" in text):
+            return "GENE_OR_GENE_PRODUCT"
+    _protein_suffixes = (
+        "receptor", "kinase", "transferase", "synthase",
+        "reductase", "oxidase", "protease", "peptide", "enzyme",
+        "polymerase", "ligase", "channel", "transporter",
+    )
+    if any(t.endswith(s) for s in _protein_suffixes):
+        return "PROTEIN"
+
+    return "ENTITY"  # unclassifiable — will be dropped by Filter A
 
 _NLP_BATCH_SIZE = config.NLP_BATCH_SIZE   # abstracts per nlp.pipe() batch
 
@@ -307,7 +337,7 @@ class NLPProcessor:
             for ent in sent.ents:
                 ent_type = ent.label_
 
-                # Try UMLS reclassification for ENTITY catch-all before type filter
+                # Try UMLS reclassification first
                 umls_id: Optional[str] = None
                 try:
                     if ent._.kb_ents:
@@ -323,15 +353,26 @@ class NLPProcessor:
                 except AttributeError:
                     pass
 
-                # Reject types not in biomedical set (incl. unresolved ENTITY)
-                if ent_type not in _BIOMEDICAL_ENTITY_TYPES:
+                # For remaining ENTITY labels: try heuristic type inference
+                if ent_type == "ENTITY":
+                    ent_type = _infer_entity_type(ent.text.strip())
+
+                # Filter A — type whitelist (drops unclassifiable ENTITY)
+                if ent_type not in _ENTITY_WHITELIST:
                     continue
 
                 entity_text = ent.text.strip()
-                # Reject short tokens and generic stopwords
-                if len(entity_text) < 5:
+
+                # Filter B — stopword blocklist
+                if entity_text.lower() in BIOMEDICAL_STOPWORDS:
                     continue
-                if entity_text.lower() in _BIO_STOPWORDS:
+
+                # Filter C — minimum 4 characters
+                if len(entity_text) < 4:
+                    continue
+
+                # Filter D — must contain at least one letter
+                if not any(c.isalpha() for c in entity_text):
                     continue
 
                 results.append((entity_text, ent_type, umls_id, sent_text))
