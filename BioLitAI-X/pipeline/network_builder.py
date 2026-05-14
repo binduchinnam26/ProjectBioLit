@@ -322,12 +322,10 @@ class NetworkBuilder:
             n  = len(words)
             if n < 2:
                 continue
-            n_pairs = n * (n - 1) / 2
-            pair_weight = pc / n_pairs  # normalise so dense topics don't dominate
             for i in range(n):
                 for j in range(i + 1, n):
                     key = (min(words[i], words[j]), max(words[i], words[j]))
-                    edge_weights[key] += pair_weight
+                    edge_weights[key] += pc  # accumulate paper count across shared topics
 
         for (w1, w2), weight in edge_weights.items():
             if G.has_node(w1) and G.has_node(w2):
