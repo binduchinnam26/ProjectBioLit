@@ -78,10 +78,27 @@ class TopicModeler:
             prediction_data=True,
             core_dist_n_jobs=-1,
         )
+        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+        _extra_stops = {
+            "study", "studies", "group", "groups", "patient", "patients",
+            "treatment", "treatments", "result", "results", "method", "methods",
+            "analysis", "analyses", "effect", "effects", "data", "model", "models",
+            "using", "used", "based", "significant", "significantly", "associated",
+            "association", "compared", "comparison", "including", "level", "levels",
+            "role", "showed", "shown", "shows", "identified", "found", "reported",
+            "observed", "performed", "conducted", "number", "total", "rate", "rates",
+            "sample", "samples", "mean", "median", "review", "clinical", "respectively",
+            "related", "factor", "factors", "potential", "possible", "different",
+            "differences", "common", "similar", "various", "multiple", "large", "small",
+            "new", "type", "types", "case", "cases", "high", "low", "increased",
+            "decreased", "increase", "decrease", "vs", "et", "al", "p", "ci",
+            "95", "hr", "or", "rr", "risk", "odds", "ratio", "doi", "fig",
+        }
         vectorizer_model = CountVectorizer(
-            stop_words="english",
+            stop_words=list(set(ENGLISH_STOP_WORDS) | _extra_stops),
             min_df=2,
             ngram_range=(1, 2),
+            max_features=10000,
         )
 
         self.model = BERTopic(
@@ -230,6 +247,22 @@ class TopicModeler:
 
     # ── Topic labels ──────────────────────────────────────────────────────────
 
+    # Generic academic/statistical words that add no biomedical meaning to a label
+    _LABEL_STOPWORDS = {
+        "study", "studies", "group", "groups", "patient", "patients",
+        "treatment", "treatments", "result", "results", "method", "methods",
+        "analysis", "analyses", "effect", "effects", "data", "model", "models",
+        "using", "used", "based", "significant", "significantly", "associated",
+        "association", "compared", "comparison", "including", "level", "levels",
+        "role", "showed", "shown", "shows", "identified", "found", "reported",
+        "observed", "performed", "conducted", "number", "total", "rate", "rates",
+        "sample", "samples", "mean", "median", "review", "clinical", "respectively",
+        "related", "factor", "factors", "potential", "possible", "different",
+        "differences", "common", "similar", "various", "multiple", "large", "small",
+        "new", "type", "types", "case", "cases", "high", "low", "increased",
+        "decreased", "increase", "decrease", "vs", "et", "al",
+    }
+
     def get_topic_labels(self) -> Dict[int, Dict]:
         """
         Return human-readable topic labels with top keywords.
@@ -245,21 +278,45 @@ class TopicModeler:
         for _, row in topic_info.iterrows():
             tid = int(row["Topic"])
             if tid == -1:
-                continue  # outlier bucket
+                continue
 
             top_words_data = self.model.get_topic(tid)
-            top_words = (
-                [w for w, _ in top_words_data[:10]]
-                if top_words_data
-                else []
-            )
+            top_words = [w for w, _ in top_words_data[:15]] if top_words_data else []
 
-            # Build a concise label from top 3 keywords
-            label = " | ".join(top_words[:3]) if top_words else f"Topic {tid}"
+            # Separate multi-word phrases (bigrams) from single words
+            phrases = [w for w in top_words if " " in w]
+            singles = [
+                w for w in top_words
+                if " " not in w
+                and w.lower() not in self._LABEL_STOPWORDS
+                and len(w) > 3
+            ]
+
+            # Prefer specific bigrams; deduplicate components already covered
+            selected: List[str] = []
+            covered_tokens: set = set()
+            for phrase in phrases:
+                tokens = set(phrase.lower().split())
+                if not tokens & covered_tokens:
+                    selected.append(phrase)
+                    covered_tokens |= tokens
+                if len(selected) == 3:
+                    break
+
+            # Fill remaining slots with specific single words
+            for word in singles:
+                if word.lower() not in covered_tokens and len(selected) < 3:
+                    selected.append(word)
+                    covered_tokens.add(word.lower())
+
+            if not selected:
+                selected = top_words[:3]
+
+            label = " | ".join(w.title() for w in selected) or f"Topic {tid}"
 
             labels[tid] = {
                 "label": label,
-                "top_words": top_words,
+                "top_words": top_words[:10],
                 "count": int(row.get("Count", 0)),
             }
 
