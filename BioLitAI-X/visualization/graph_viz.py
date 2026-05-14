@@ -143,7 +143,6 @@ def _compute_kg_layout(G_sub: nx.MultiDiGraph) -> Dict[str, Tuple[float, float]]
     papers_df     = st.session_state.get("papers_df")
     embeddings    = st.session_state.get("embeddings_array")
     entities_df   = st.session_state.get("entities_df")
-    query         = st.session_state.get("current_query", "")
 
     pos = compute_vos_layout(
         G_sub,
@@ -151,7 +150,6 @@ def _compute_kg_layout(G_sub: nx.MultiDiGraph) -> Dict[str, Tuple[float, float]]
         papers_df=papers_df,
         embeddings_array=embeddings,
         entities_df=entities_df,
-        query=query,
     )
     st.session_state[ss_key] = pos
     return pos
