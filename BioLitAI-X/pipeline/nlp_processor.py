@@ -69,15 +69,20 @@ _UMLS_SEMTYPE_MAP: Dict[str, str] = {
     "T061": "LABORATORY_PROCEDURE", "T063": "LABORATORY_PROCEDURE",
 }
 
-# Only these labels are meaningful biomedical entities — discard ENTITY catch-all
+# Only these labels are meaningful biomedical entities.
+# "ENTITY" is the only label en_core_sci_lg emits; specific labels
+# (DISEASE, CHEMICAL, etc.) come from UMLS reclassification or other models.
+# We keep ENTITY here so the model produces output, but filter its content
+# heavily via _BIO_STOPWORDS and minimum length below.
 _BIOMEDICAL_ENTITY_TYPES: frozenset = frozenset({
-    # Core labels produced by en_core_sci_lg
+    # Generic label from en_core_sci_lg (reclassified to specific type if UMLS is on)
+    "ENTITY",
+    # Specific labels from UMLS reclassification or domain-specific SciSpaCy models
     "DISEASE", "GENE_OR_GENOME", "CHEMICAL",
     "BIOLOGICAL_PROCESS", "CELL", "ORGANISM", "LABORATORY_PROCEDURE",
-    # Extended labels from UMLS reclassification or future models
+    # Extended labels from UMLS or future models
     "CANCER", "DNA", "RNA", "PROTEIN",
     "CELL_TYPE", "CELL_LINE", "PATHWAY", "ANATOMY",
-    # Note: "ENTITY" (en_core_sci_lg catch-all) is intentionally excluded
 })
 
 # Generic words that appear as NER spans but carry no biomedical meaning.
