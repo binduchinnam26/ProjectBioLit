@@ -345,6 +345,12 @@ def compute_vos_layout(
 
     node_strs = {str(nd) for nd in G.nodes()}
 
+    # UMAP needs many data points to produce meaningful positions.
+    # For small graphs use the spring/kamada-kawai fallback which keeps
+    # all nodes visible and well-distributed.
+    if n < 15:
+        return _fallback_layout(G)
+
     # ── Fallback when no embeddings ───────────────────────────────────────────
     if embeddings_array is None or papers_df is None or len(embeddings_array) == 0:
         logger.info("No embeddings; fallback layout for %s", network_type)

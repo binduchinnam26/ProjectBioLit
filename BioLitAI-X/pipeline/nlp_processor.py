@@ -69,6 +69,48 @@ _UMLS_SEMTYPE_MAP: Dict[str, str] = {
     "T061": "LABORATORY_PROCEDURE", "T063": "LABORATORY_PROCEDURE",
 }
 
+# Only these labels are meaningful biomedical entities — discard ENTITY catch-all
+_BIOMEDICAL_ENTITY_TYPES: frozenset = frozenset({
+    # Core labels produced by en_core_sci_lg
+    "DISEASE", "GENE_OR_GENOME", "CHEMICAL",
+    "BIOLOGICAL_PROCESS", "CELL", "ORGANISM", "LABORATORY_PROCEDURE",
+    # Extended labels from UMLS reclassification or future models
+    "CANCER", "DNA", "RNA", "PROTEIN",
+    "CELL_TYPE", "CELL_LINE", "PATHWAY", "ANATOMY",
+    # Note: "ENTITY" (en_core_sci_lg catch-all) is intentionally excluded
+})
+
+# Generic words that appear as NER spans but carry no biomedical meaning.
+# Checked against entity TEXT (not the label) after lowercasing.
+_BIO_STOPWORDS: frozenset = frozenset({
+    "study", "studies", "data", "results", "result", "level", "levels",
+    "finding", "findings", "evidence", "week", "weeks", "day", "days",
+    "review", "tissue", "tissues", "induced", "diverse", "production",
+    "increased", "decreased", "evaluated", "analyzed", "investigated",
+    "potential", "complex", "model", "models", "mechanism", "mechanisms",
+    "efficacy", "effect", "effects", "species", "cells", "cell",
+    "function", "functions", "skin", "healthy", "unclear", "expressed",
+    "expression", "consistent", "background", "objective", "objectives",
+    "method", "methods", "conclusion", "conclusions", "introduction",
+    "abstract", "purpose", "aims", "aim", "scope", "context",
+    "analysis", "analyses", "information", "literature", "research",
+    "report", "reports", "case", "cases", "subjects", "subject",
+    "patient", "patients", "sample", "samples", "group", "groups",
+    "control", "controls", "number", "numbers", "rate", "rates",
+    "factor", "factors", "role", "roles", "type", "types",
+    "significant", "significantly", "associated", "association",
+    "compared", "comparison", "including", "related", "different",
+    "differences", "common", "similar", "various", "multiple",
+    "large", "small", "high", "low", "dose", "doses",
+    "response", "responses", "activity", "activities", "protein",
+    "proteins", "gene", "genes", "pathway", "pathways",
+    "line", "lines", "organ", "organs", "marker", "markers",
+    "target", "targets", "site", "sites", "process", "processes",
+    "condition", "conditions", "status", "outcome", "outcomes",
+    "endpoint", "endpoints", "concentration", "concentrations",
+    "treatment", "treatments", "therapy", "therapies",
+})
+
 _NLP_BATCH_SIZE = config.NLP_BATCH_SIZE   # abstracts per nlp.pipe() batch
 
 # Components disabled for the fast NER-only pass.
@@ -171,19 +213,13 @@ class NLPProcessor:
         Called by extract_entities() and process_corpus() via nlp.pipe().
         """
         results: List[Tuple[str, str, Optional[str], str]] = []
-        allowed = set(config.NER_ENTITY_TYPES)
 
         for sent in doc.sents:
             sent_text = sent.text.strip()
             for ent in sent.ents:
                 ent_type = ent.label_
-                if ent_type not in allowed:
-                    continue
 
-                entity_text = ent.text.strip()
-                if not entity_text or len(entity_text) < 2:
-                    continue
-
+                # Try UMLS reclassification for ENTITY catch-all before type filter
                 umls_id: Optional[str] = None
                 try:
                     if ent._.kb_ents:
@@ -198,6 +234,17 @@ class NLPProcessor:
                                         break
                 except AttributeError:
                     pass
+
+                # Reject types not in biomedical set (incl. unresolved ENTITY)
+                if ent_type not in _BIOMEDICAL_ENTITY_TYPES:
+                    continue
+
+                entity_text = ent.text.strip()
+                # Reject single chars, very short tokens, and generic stopwords
+                if len(entity_text) < 4:
+                    continue
+                if entity_text.lower() in _BIO_STOPWORDS:
+                    continue
 
                 results.append((entity_text, ent_type, umls_id, sent_text))
 

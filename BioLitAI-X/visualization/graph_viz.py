@@ -24,12 +24,20 @@ logger = logging.getLogger(__name__)
 
 # ── Entity type → display shape ───────────────────────────────────────────────
 _ENTITY_SHAPE = {
-    "DISEASE": "dot",
-    "GENE_OR_GENOME": "diamond",
-    "CHEMICAL": "square",
-    "BIOLOGICAL_PROCESS": "ellipse",
-    "CELL": "triangle",
-    "ORGANISM": "star",
+    "DISEASE":              "dot",
+    "CANCER":               "dot",
+    "GENE_OR_GENOME":       "diamond",
+    "DNA":                  "diamond",
+    "RNA":                  "diamond",
+    "PROTEIN":              "diamond",
+    "CHEMICAL":             "square",
+    "BIOLOGICAL_PROCESS":   "ellipse",
+    "PATHWAY":              "ellipse",
+    "CELL":                 "triangle",
+    "CELL_TYPE":            "triangle",
+    "CELL_LINE":            "triangle",
+    "ORGANISM":             "star",
+    "ANATOMY":              "triangleDown",
     "LABORATORY_PROCEDURE": "triangleDown",
 }
 
@@ -43,6 +51,7 @@ _EDGE_COLORS = {
     "cause":               "#F97316",
     "associate":           "#EC4899",
     "semantic_similarity": "#9CA3AF",
+    "co-occurs with":      "#374151",
 }
 _DEFAULT_EDGE_COLOR = "#4B5563"
 
@@ -85,8 +94,8 @@ def _color_opacity(hex_color: str, opacity: float) -> str:
     return f"rgba({r},{g},{b},{opacity})"
 
 
-_MAX_KG_NODES = 150   # cap entity KG nodes sent to vis.js
-_MAX_KG_EDGES = 500   # cap entity KG edges sent to vis.js
+_DEFAULT_MAX_KG_NODES = 150  # default node cap; overrideable via render param
+_MAX_KG_EDGES = 500          # cap entity KG edges sent to vis.js
 
 # Scale factor applied to normalised [-1,1] positions when injecting into PyVis
 _KG_LAYOUT_SCALE = 2000
@@ -187,6 +196,8 @@ def render_knowledge_graph(
     show_gap_nodes: bool = True,
     search_term: str = "",
     height: int = 800,
+    max_nodes: int = _DEFAULT_MAX_KG_NODES,
+    min_edge_cooccurrence: int = 2,
 ):
     """
     Render the full biomedical knowledge graph in VOSviewer style.
@@ -201,7 +212,7 @@ def render_knowledge_graph(
         return
 
     # ── Filter graph ──────────────────────────────────────────────────────────
-    allowed_entities = entity_type_filter or set(config.NER_ENTITY_TYPES)
+    allowed_entities = entity_type_filter or set(config.ENTITY_TYPE_COLORS.keys())
     nodes_to_keep = [
         n for n, d in G.nodes(data=True)
         if d.get("entity_type", "UNKNOWN") in allowed_entities
@@ -224,20 +235,20 @@ def render_knowledge_graph(
 
     # ── Node cap: keep top-N by paper_count to prevent vis.js freeze ─────────
     total_kg_nodes = G_sub.number_of_nodes()
-    if total_kg_nodes > _MAX_KG_NODES:
+    if total_kg_nodes > max_nodes:
         top_nodes = sorted(
             G_sub.nodes(data=True),
             key=lambda nd: nd[1].get("paper_count", 0),
             reverse=True,
-        )[:_MAX_KG_NODES]
+        )[:max_nodes]
         G_sub = G_sub.subgraph({nd[0] for nd in top_nodes}).copy()
         st.info(
-            f"Showing top {_MAX_KG_NODES} entities of {total_kg_nodes:,} by evidence strength. "
-            "Increase Min evidence or filter by entity type to change the selection."
+            f"Showing top {max_nodes} entities of {total_kg_nodes:,} by evidence strength. "
+            "Adjust the Max nodes slider or filter by entity type to change the selection."
         )
 
     # ── Lazy-load: only build vis.js HTML when user clicks Render ─────────────
-    render_key = f"kg_render_{total_kg_nodes}_{G_sub.number_of_edges()}_{min_evidence}_{search_term}"
+    render_key = f"kg_render_{total_kg_nodes}_{G_sub.number_of_edges()}_{min_evidence}_{min_edge_cooccurrence}_{max_nodes}_{search_term}"
     if not st.session_state.get(render_key):
         st.info(
             f"Entity graph ready: {G_sub.number_of_nodes()} nodes, "
@@ -299,12 +310,22 @@ def render_knowledge_graph(
         show_label = paper_count >= median_count or is_highlight or is_search_match
         display_label = node_str[:28] if show_label else ""
 
+        node_pmids = data.get("evidence_pmids", [])[:3]
+        pmid_str = (
+            " · ".join(
+                f"<a href='https://pubmed.ncbi.nlm.nih.gov/{p}/' "
+                f"style='color:#60A5FA'>{p}</a>"
+                for p in node_pmids
+            )
+            if node_pmids else ""
+        )
+
         tooltip = (
             f"<b>{node_str}</b><br>"
             f"Type: <span style='color:{color}'>{etype}</span><br>"
-            f"UMLS: {umls_id}<br>"
-            f"Papers: {paper_count}<br>"
-            f"Outgoing relationships:<br>{edge_summary or '(none)'}"
+            f"Papers: {paper_count}"
+            + (f"<br>PMIDs: {pmid_str}" if pmid_str else "")
+            + (f"<br>Relationships:<br>{edge_summary}" if edge_summary else "")
         )
 
         px, py = positions.get(node_str, (0.0, 0.0))
@@ -327,12 +348,15 @@ def render_knowledge_graph(
             font={"size": max(8, int(size * 0.3)), "color": config.TEXT_PRIMARY},
         )
 
-    # ── Add edges (capped at _MAX_KG_EDGES, top by confidence) ────────────────
+    # ── Add edges (capped at _MAX_KG_EDGES, verb-based preferred) ────────────
     total_edges = G_sub.number_of_edges()
+    # Sort: verb-based relationships first (not co-occurrence), then by confidence
     all_edges = sorted(
         G_sub.edges(data=True),
-        key=lambda e: e[2].get("confidence_score", 0.5),
-        reverse=True,
+        key=lambda e: (
+            0 if e[2].get("relationship_type", "") != "co-occurs with" else 1,
+            -e[2].get("confidence_score", 0.5),
+        ),
     )
     seen_edges: Set[tuple] = set()
     for u, v, data in all_edges:
@@ -340,6 +364,10 @@ def render_knowledge_graph(
             break
         edge_key = (str(u), str(v))
         if edge_key in seen_edges:
+            continue
+        # Enforce minimum co-occurrence evidence for edges
+        evidence_pmids = data.get("evidence_pmids", [])
+        if len(evidence_pmids) < min_edge_cooccurrence:
             continue
         seen_edges.add(edge_key)
 
@@ -372,22 +400,49 @@ def render_knowledge_graph(
         )
 
     extra_css = _GAP_NODE_CSS if has_gap_nodes else ""
-    cache_key = f"kg_{G_sub.number_of_nodes()}_{min(total_edges, _MAX_KG_EDGES)}_{search_lower}_{min_evidence}"
+    cache_key = f"kg_{G_sub.number_of_nodes()}_{min(total_edges, _MAX_KG_EDGES)}_{search_lower}_{min_evidence}_{min_edge_cooccurrence}_{max_nodes}"
     _render_html(net, height=height, extra_css=extra_css, cache_key=cache_key)
 
 
 def render_entity_legend():
-    """Render a color-coded entity type legend."""
+    """Render a grouped entity type legend with node size indicator."""
     st.markdown(
-        "<p style='color:{};font-size:13px;font-weight:600;margin-bottom:6px'>"
-        "Entity Types</p>".format(config.TEXT_SECONDARY),
+        f"<p style='color:{config.TEXT_SECONDARY};font-size:13px;"
+        f"font-weight:600;margin-bottom:6px'>Entity Types</p>",
         unsafe_allow_html=True,
     )
-    for etype, color in config.ENTITY_TYPE_COLORS.items():
+    # Canonical display groups: (label, color, shape_hint)
+    _LEGEND_GROUPS = [
+        ("Disease / Cancer",            "#FF5252"),
+        ("Gene / DNA / RNA / Protein",  "#00E676"),
+        ("Chemical / Drug",             "#00D4FF"),
+        ("Biological Process / Pathway","#A8E6CF"),
+        ("Cell / Cell Type / Cell Line","#7B61FF"),
+        ("Organism",                    "#FFD600"),
+        ("Anatomy",                     "#FF8B94"),
+        ("Lab Procedure",               "#8899AA"),
+    ]
+    for label, color in _LEGEND_GROUPS:
         st.markdown(
             f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:4px'>"
-            f"<div style='width:12px;height:12px;border-radius:50%;background:{color};flex-shrink:0'></div>"
-            f"<span style='color:{config.TEXT_PRIMARY};font-size:12px'>{etype}</span>"
+            f"<div style='width:12px;height:12px;border-radius:50%;"
+            f"background:{color};flex-shrink:0'></div>"
+            f"<span style='color:{config.TEXT_PRIMARY};font-size:11px'>{label}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    # Node size legend
+    st.markdown(
+        f"<p style='color:{config.TEXT_SECONDARY};font-size:12px;"
+        f"font-weight:600;margin-top:10px;margin-bottom:4px'>Node Size</p>",
+        unsafe_allow_html=True,
+    )
+    for label, px in [("Low frequency", 6), ("Medium", 11), ("High frequency", 18)]:
+        st.markdown(
+            f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:4px'>"
+            f"<div style='width:{px}px;height:{px}px;border-radius:50%;"
+            f"background:#9CA3AF;flex-shrink:0'></div>"
+            f"<span style='color:{config.TEXT_PRIMARY};font-size:11px'>{label}</span>"
             f"</div>",
             unsafe_allow_html=True,
         )

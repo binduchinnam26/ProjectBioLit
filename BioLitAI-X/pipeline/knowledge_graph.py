@@ -8,7 +8,7 @@ import json
 import logging
 import math
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 import numpy as np
@@ -92,7 +92,7 @@ class KnowledgeGraph:
 
         for name, info in entity_info.items():
             etype = info["entity_type"]
-            color = config.ENTITY_TYPE_COLORS.get(etype, "#9CA3AF")
+            color = config.ENTITY_TYPE_COLORS.get(etype, "#8899AA")
             G.add_node(
                 name,
                 entity_type=etype,
@@ -101,6 +101,7 @@ class KnowledgeGraph:
                 color=color,
                 size=_scale_node_size(entity_paper_count[name], w_min, w_max),
                 is_gap_node=False,
+                evidence_pmids=sorted(self._entity_pmids[name])[:20],
             )
 
         # ── Community detection on undirected projection ───────────────────────
@@ -109,6 +110,36 @@ class KnowledgeGraph:
         for node, comm in partition.items():
             if G.has_node(node):
                 G.nodes[node]["community"] = comm
+
+        # ── Sentence co-occurrence edges ──────────────────────────────────────
+        # Build edges between entities appearing in the same sentence.
+        # These serve as the baseline; verb-based edges will be added after
+        # and the renderer prefers verb-based edges over co-occurrence.
+        if "sentence_context" in entities_df.columns:
+            sent_ents: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+            for _, row in entities_df.iterrows():
+                pmid = str(row.get("pmid", ""))
+                sent = str(row.get("sentence_context", ""))[:200]
+                name = row.get("entity_text", "")
+                if pmid and sent and name and G.has_node(name):
+                    sent_ents[(pmid, sent)].append(name)
+
+            cooccur_pmids: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+            for (pmid, _), ents in sent_ents.items():
+                unique_ents = list(dict.fromkeys(ents))[:6]  # cap per sentence
+                for i in range(len(unique_ents)):
+                    for j in range(i + 1, len(unique_ents)):
+                        e1, e2 = unique_ents[i], unique_ents[j]
+                        key: Tuple[str, str] = (min(e1, e2), max(e1, e2))
+                        cooccur_pmids[key].add(pmid)
+
+            for (e1, e2), pmids_set in cooccur_pmids.items():
+                G.add_edge(
+                    e1, e2,
+                    relationship_type="co-occurs with",
+                    evidence_pmids=list(pmids_set),
+                    confidence_score=min(0.8, len(pmids_set) / 5.0),
+                )
 
         # ── Add edges ─────────────────────────────────────────────────────────
         if not relationships_df.empty:

@@ -83,21 +83,28 @@ NLP_N_PROCESS = int(os.getenv(
 ))
 
 # Entity types extracted by SciSpaCy — covers all biomedical domains.
-# "ENTITY" is the generic label used by en_core_sci_lg; the NLP processor
-# reclassifies it using UMLS semantic types where available.
+# ENTITY catch-all is excluded; the NLP processor reclassifies it via UMLS
+# or drops it if no specific type can be assigned.
 NER_ENTITY_TYPES = [
     "DISEASE",
+    "CANCER",
     "GENE_OR_GENOME",
+    "DNA",
+    "RNA",
+    "PROTEIN",
     "CHEMICAL",
     "BIOLOGICAL_PROCESS",
+    "PATHWAY",
     "CELL",
+    "CELL_TYPE",
+    "CELL_LINE",
     "ORGANISM",
+    "ANATOMY",
     "LABORATORY_PROCEDURE",
-    "ENTITY",          # fallback for en_core_sci_lg generic labels
 ]
 
 # ── Topic Modeling ────────────────────────────────────────────────────────────
-BERTOPIC_MIN_TOPIC_SIZE = 10
+BERTOPIC_MIN_TOPIC_SIZE = 5
 
 # ── Network / Graph ───────────────────────────────────────────────────────────
 KEYWORD_MIN_FREQUENCY = 3    # minimum papers a keyword must appear in
@@ -153,14 +160,30 @@ COMMUNITY_COLORS = [
 ]
 
 ENTITY_TYPE_COLORS = {
-    "DISEASE": "#EF4444",
-    "GENE_OR_GENOME": "#3B82F6",
-    "CHEMICAL": "#10B981",
-    "LABORATORY_PROCEDURE": "#F59E0B",
-    "CELL": "#8B5CF6",
-    "ORGANISM": "#06B6D4",
-    "BIOLOGICAL_PROCESS": "#F97316",
-    "ENTITY": "#9CA3AF",    # neutral grey for unclassified en_core_sci_lg entities
+    # Disease group — red
+    "DISEASE":              "#FF5252",
+    "CANCER":               "#FF5252",
+    # Gene / molecular biology group — green
+    "GENE_OR_GENOME":       "#00E676",
+    "DNA":                  "#00E676",
+    "RNA":                  "#00E676",
+    "PROTEIN":              "#00E676",
+    # Chemical / drug group — cyan
+    "CHEMICAL":             "#00D4FF",
+    # Biological process / pathway group — mint
+    "BIOLOGICAL_PROCESS":   "#A8E6CF",
+    "PATHWAY":              "#A8E6CF",
+    # Cell group — purple
+    "CELL":                 "#7B61FF",
+    "CELL_TYPE":            "#7B61FF",
+    "CELL_LINE":            "#7B61FF",
+    # Organism group — yellow
+    "ORGANISM":             "#FFD600",
+    # Anatomy group — pink
+    "ANATOMY":              "#FF8B94",
+    # Procedure / other — grey
+    "LABORATORY_PROCEDURE": "#8899AA",
+    "ENTITY":               "#8899AA",
 }
 
 CANVAS_BACKGROUND = "#0A0F1E"
