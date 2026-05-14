@@ -834,7 +834,7 @@ def render_topic_network(
     height: int = 750,
     year_range: Optional[tuple] = None,
 ):
-    """Dark-canvas topic landscape with ForceAtlas2Based physics."""
+    """Topic keyword landscape — one node per keyword, edges = co-topic."""
     if G is None or G.number_of_nodes() == 0:
         st.info("No topic data available. Run the pipeline first.")
         return
@@ -848,29 +848,37 @@ def render_topic_network(
         st.warning("All nodes filtered out — lower the minimum weight thresholds.")
         return
 
-    # Always use physics-on for topic landscape (ForceAtlas2Based settles well)
-    use_physics = True
+    n_nodes = G2.number_of_nodes()
+    n_edges = G2.number_of_edges()
+    st.caption(f"Keyword network: **{n_nodes} keywords**, **{n_edges} connections**")
 
-    from pyvis.network import Network
-    net = Network(
-        height=f"{height}px", width="100%",
-        bgcolor="#0A0F1E", font_color="#F9FAFB",
-        directed=False, notebook=False,
-    )
+    if n_edges == 0:
+        st.warning("Graph has nodes but no edges — re-run 'Compute Topic Model' to rebuild.")
+
+    # Pre-compute spring layout so nodes stay compact and edges are visible
+    k_val = 2.5 / max(n_nodes ** 0.5, 1)
+    raw_pos = nx.spring_layout(G2, weight="weight", seed=42, k=k_val, iterations=120)
+    pos = {str(n): (float(xy[0]), float(xy[1])) for n, xy in raw_pos.items()}
+
+    use_physics = controls.get("physics", False)
+
+    net = _get_vosviewer_net(height=f"{height}px", physics=use_physics)
+
+    # Override net options for topic keyword display
     topic_opts: Dict[str, Any] = {
         "nodes": {
             "font": {
-                "face": "Open Sans", "color": "#FFFFFF",
-                "size": 14, "bold": True,
-                "strokeWidth": 3, "strokeColor": "#0A0F1E",
+                "face": "Open Sans", "color": "#1F2937",
+                "size": 13, "strokeWidth": 3, "strokeColor": "#FFFFFF",
             },
             "borderWidth": 2,
             "borderWidthSelected": 4,
             "shape": "dot",
         },
         "edges": {
-            "smooth": {"type": "continuous", "roundness": 0.2},
-            "selectionWidth": 2,
+            "smooth": {"type": "continuous", "roundness": 0.15},
+            "selectionWidth": 3,
+            "scaling": {"min": 1, "max": 8},
         },
         "interaction": {
             "hover": True, "tooltipDelay": 80,
@@ -878,7 +886,22 @@ def render_topic_network(
             "zoomView": True, "dragNodes": True, "dragView": True,
         },
         "layout": {"improvedLayout": False},
-        "physics": _TOPIC_PHYSICS,
+        "physics": (
+            {
+                "forceAtlas2Based": {
+                    "gravitationalConstant": -30,
+                    "centralGravity": 0.3,
+                    "springLength": 120,
+                    "springConstant": 0.08,
+                    "damping": 0.5,
+                    "avoidOverlap": 0.8,
+                },
+                "minVelocity": 0.5,
+                "solver": "forceAtlas2Based",
+                "stabilization": {"enabled": True, "iterations": 150, "updateInterval": 25},
+            }
+            if use_physics else {"enabled": False}
+        ),
     }
     net.set_options(json.dumps(topic_opts))
 
@@ -886,26 +909,28 @@ def render_topic_network(
     labels_all   = controls.get("labels_all", True)
 
     for node, data in G2.nodes(data=True):
-        ns           = str(node)
-        label        = str(data.get("label", ns))
-        size         = float(data.get("size", 15.0))
-        color        = data.get("color", config.COMMUNITY_COLORS[0])
-        n_topics     = data.get("n_topics", 0)
-        topic_names  = data.get("topic_names", [])
+        ns          = str(node)
+        label       = str(data.get("label", ns))
+        size        = float(data.get("size", 15.0))
+        color       = data.get("color", config.COMMUNITY_COLORS[0])
+        n_topics    = data.get("n_topics", 0)
+        topic_names = data.get("topic_names", [])
+        x, y        = pos.get(ns, (0.0, 0.0))
 
         is_match     = bool(search_lower and search_lower in label.lower())
-        border_color = _VOS_HIGHLIGHT if is_match else _darken(color, 0.85)
+        border_color = _VOS_HIGHLIGHT if is_match else _darken(color, 0.78)
         label_text   = label if (labels_all or is_match) else ""
 
-        topics_str = "; ".join(dict.fromkeys(topic_names))  # deduplicate, keep order
+        topics_str = "; ".join(dict.fromkeys(topic_names))
         tooltip = (
-            f"<div style='font-weight:700;color:#00D4FF;margin-bottom:5px'>{label}</div>"
-            f"<div>Appears in <b>{n_topics}</b> topic cluster{'s' if n_topics != 1 else ''}</div>"
-            + (f"<div style='margin-top:4px;color:#9CA3AF;font-size:11px'>{topics_str}</div>" if topics_str else "")
+            f"<b>{label}</b><br>"
+            f"In {n_topics} topic cluster{'s' if n_topics != 1 else ''}<br>"
+            + (f"{topics_str}" if topics_str else "")
         )
 
         net.add_node(
             ns, label=label_text, size=size,
+            x=x * _LAYOUT_SCALE, y=y * _LAYOUT_SCALE,
             color={
                 "background": color, "border": border_color,
                 "highlight": {"background": _VOS_HIGHLIGHT, "border": "#FFA500"},
@@ -913,41 +938,31 @@ def render_topic_network(
             },
             title=tooltip,
             shape="dot",
-            font={"size": 14, "color": "#FFFFFF", "face": "Open Sans",
-                  "bold": True, "strokeWidth": 3, "strokeColor": "#0A0F1E"},
+            font={"size": 13, "color": _VOS_FONT, "face": "Open Sans",
+                  "strokeWidth": 3, "strokeColor": "#FFFFFF"},
         )
 
-    # Add edges — color by source-node community for visual cluster grouping
+    # Edges — thick and opaque so they're clearly visible
     all_edges = sorted(G2.edges(data=True), key=lambda e: e[2].get("weight", 1), reverse=True)
     for u, v, data in all_edges[:_MAX_RENDER_EDGES]:
         weight   = data.get("weight", 1)
-        width    = max(0.5, min(6.0, float(data.get("width", 1))))
-        src_col  = G2.nodes[u].get("color", "#00D4FF")
+        width    = max(1.5, min(8.0, float(data.get("width", 1.5))))
+        src_col  = G2.nodes[u].get("color", config.COMMUNITY_COLORS[0])
         net.add_edge(
             str(u), str(v), weight=weight, width=width,
-            color={"color": _rgba(src_col, 0.40),
-                   "highlight": _VOS_HIGHLIGHT,
-                   "hover": _rgba(src_col, 0.80)},
-            title=f"<b>{u}</b> — <b>{v}</b><br>Co-topic strength: {weight:.2f}",
+            color={
+                "color": _rgba(src_col, 0.70),
+                "highlight": _VOS_HIGHLIGHT,
+                "hover": _rgba(src_col, 0.95),
+            },
+            title=f"<b>{u}</b> — <b>{v}</b><br>Co-topic strength: {int(weight)}",
             arrows={"to": {"enabled": False}},
         )
 
-    # Render HTML with dark CSS injected
-    html_key = (f"topic_{G2.number_of_nodes()}_{G2.number_of_edges()}_"
-                f"{controls.get('search','')}_lbl{controls.get('labels_all', True)}")
-
-    html: Optional[str] = st.session_state.get(f"__html_{html_key}")
-    if html is None:
-        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-            net.save_graph(f.name)
-            path = f.name
-        with open(path, "r", encoding="utf-8") as f:
-            html = f.read()
-        os.unlink(path)
-        html = html.replace("</head>", _TOPIC_DARK_CSS + "</head>", 1)
-        st.session_state[f"__html_{html_key}"] = html
-
-    st.components.v1.html(html, height=height + 30, scrolling=False)
+    html_key = (f"topic_{n_nodes}_{n_edges}_"
+                f"{controls.get('search','')}_phy{use_physics}_"
+                f"lbl{controls.get('labels_all', True)}")
+    _render_vosviewer_html(net, height=height, cache_key=html_key)
 
 
 # B — Overlay Visualization ───────────────────────────────────────────────────
