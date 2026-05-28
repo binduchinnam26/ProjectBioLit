@@ -1,7 +1,13 @@
 """Shared utility functions for BioLitAI-X."""
 
+import hashlib
 import re
 from typing import Any, Dict, List
+
+
+def query_hash(query: str) -> str:
+    """Return a short deterministic hash for a query string (used to name cache files)."""
+    return hashlib.sha256(query.strip().lower().encode()).hexdigest()[:16]
 
 
 def safe_filename(text: str, max_len: int = 64) -> str:
