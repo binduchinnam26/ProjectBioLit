@@ -10,8 +10,6 @@ Defaults: Co-authorship tab · Network mode.
 """
 
 import logging
-import pickle
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st

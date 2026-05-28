@@ -4,7 +4,6 @@ All tables are created here via CREATE TABLE IF NOT EXISTS statements.
 """
 
 SCHEMA_SQL = """
-PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
 -- ── Core paper record ─────────────────────────────────────────────────────────

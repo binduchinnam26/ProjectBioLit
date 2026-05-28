@@ -84,22 +84,3 @@ def render():
                 if st.button("Compute Topic Model", type="primary", key="build_topics_btn"):
                     build_topics_lazy(papers_df)
                     st.rerun()
-
-    # ── Network Explorer callout ──────────────────────────────────────────────
-    st.markdown(
-        f"<hr style='border-color:{config.BORDER_COLOR};margin:1.5rem 0'>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"<div style='background:{config.PRIMARY_ACCENT}10;border:1px solid "
-        f"{config.PRIMARY_ACCENT}30;border-radius:8px;padding:14px 18px;"
-        f"margin-bottom:0.5rem'>"
-        f"<span style='font-size:14px;font-weight:600;color:{config.PRIMARY_ACCENT}'>"
-        f"🕸️ Bibliometric Network Explorer</span><br>"
-        f"<span style='font-size:13px;color:{config.TEXT_SECONDARY}'>"
-        f"Interactive co-authorship, keyword, topic, and entity networks "
-        f"with Network · Overlay · Density visualization modes are available "
-        f"on the <b>Knowledge Graph</b> page.</span>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )

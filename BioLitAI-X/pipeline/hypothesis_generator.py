@@ -53,50 +53,105 @@ class HypothesisGenerator:
         self._api_key: Optional[str] = None
         self._session = None          # requests.Session
         self._ready = False
+        self._api_working = False     # True only after successful smoke-test
+
+    @property
+    def has_api_key(self) -> bool:
+        return bool(os.getenv("GEMINI_API_KEY", "").strip())
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
     def setup(self):
         """
         Initialise a requests.Session pointed at the Gemini REST API.
-        SSL verification is disabled to work in environments with a
-        self-signed corporate proxy certificate in the chain.
-        Raises EnvironmentError if GEMINI_API_KEY is missing.
+        Calls load_dotenv(override=True) so keys added to .env after server
+        start are picked up without needing a server restart.
+        SSL verification is disabled for environments with a self-signed proxy.
+        When GEMINI_API_KEY is absent or unreachable the generator falls back
+        to offline template-mode automatically.
         """
-        api_key = os.getenv("GEMINI_API_KEY")
+        # Re-read .env on every setup() call — picks up keys added after startup
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(override=True)
+        except ImportError:
+            pass
+
+        # Strip whitespace/CRLF that Windows editors sometimes inject
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not api_key:
-            raise EnvironmentError(
-                "GEMINI_API_KEY not found in .env file. Please add your "
-                "Google Gemini API key as GEMINI_API_KEY=your_key_here "
-                "in the .env file before running."
+            logger.warning(
+                "GEMINI_API_KEY not set — HypothesisGenerator running in offline "
+                "template mode. Add GEMINI_API_KEY to .env for AI-generated hypotheses."
             )
+            self._ready = True
+            return
 
         import requests
         import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        import ssl
+        urllib3.disable_warnings()
 
         self._api_key = api_key
         self._session = requests.Session()
-        self._session.verify = False   # bypass self-signed cert chain
-        self._session.headers.update({"x-goog-api-key": api_key})
+        self._session.verify = False
+
+        # Mount a custom adapter that disables SSL at the socket level —
+        # needed on Windows where the system cert store may intercept TLS
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.ssl_ import create_urllib3_context
+
+            class _NoVerifyAdapter(HTTPAdapter):
+                def init_poolmanager(self, *args, **kwargs):
+                    ctx = create_urllib3_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    kwargs["ssl_context"] = ctx
+                    super().init_poolmanager(*args, **kwargs)
+
+            self._session.mount("https://", _NoVerifyAdapter())
+        except Exception as _ssl_exc:
+            logger.debug("Custom SSL adapter skipped: %s", _ssl_exc)
+
+        self._session.headers.update({
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+            "User-Agent": "BioLitAI-X/1.0",
+        })
 
         # Smoke-test connectivity with a minimal prompt
+        self._api_working = False
         try:
-            test = self._call_gemini_with_retry("Reply with the single word: ready", max_retries=1)
+            test = self._call_gemini_with_retry("Reply OK", max_retries=1)
             if test:
+                self._api_working = True
                 logger.info("Gemini REST API reachable (model=%s)", config.GEMINI_MODEL)
+                time.sleep(config.HYPOTHESIS_API_DELAY)  # avoid back-to-back call after smoke test
             else:
-                logger.warning("Gemini REST API test call returned no text — quota or model issue")
+                logger.warning(
+                    "Gemini REST API smoke test returned no text — "
+                    "check quota, model name (%s), and network access",
+                    config.GEMINI_MODEL,
+                )
         except Exception as exc:
             logger.warning("Gemini REST API smoke test failed: %s", exc)
 
         self._ready = True
-        logger.info("HypothesisGenerator ready (transport=REST, model=%s)", config.GEMINI_MODEL)
+        logger.info(
+            "HypothesisGenerator ready (api_working=%s, model=%s)",
+            self._api_working, config.GEMINI_MODEL,
+        )
 
     def _check_ready(self):
-        if not self._ready or self._session is None:
+        if not self._ready:
             raise RuntimeError(
                 "HypothesisGenerator.setup() must be called before use."
+            )
+        # In online mode a session is required; offline mode has no session
+        if self.has_api_key and self._session is None:
+            raise RuntimeError(
+                "HypothesisGenerator session not initialised. Call setup() first."
             )
 
     # ── Gemini REST call ──────────────────────────────────────────────────────
@@ -110,7 +165,10 @@ class HypothesisGenerator:
         POST to the Gemini generateContent REST endpoint with exponential
         backoff.  Returns the text string on success, None on total failure.
         """
-        url = f"{_GEMINI_REST_BASE}/models/{config.GEMINI_MODEL}:generateContent"
+        url = (
+            f"{_GEMINI_REST_BASE}/models/{config.GEMINI_MODEL}:generateContent"
+            f"?key={self._api_key}"
+        )
         payload = {
             "system_instruction": {"parts": [{"text": _SYSTEM_INSTRUCTION}]},
             "contents": [{"parts": [{"text": prompt}]}],
@@ -124,22 +182,35 @@ class HypothesisGenerator:
 
         delay = 2.0
         last_exc: Optional[Exception] = None
+        self._last_api_error: str = ""
 
         for attempt in range(1, max_retries + 1):
             try:
                 resp = self._session.post(url, json=payload, timeout=60)
                 if resp.status_code == 429:
                     raise RuntimeError(f"429 RESOURCE_EXHAUSTED: {resp.text[:200]}")
+                if resp.status_code in (400, 401, 403):
+                    # Auth / key errors — no point retrying
+                    try:
+                        err_msg = resp.json().get("error", {}).get("message", resp.text[:200])
+                    except Exception:
+                        err_msg = resp.text[:200]
+                    self._last_api_error = f"HTTP {resp.status_code}: {err_msg}"
+                    logger.error("Gemini API key error: %s", self._last_api_error)
+                    return None
                 resp.raise_for_status()
                 data = resp.json()
                 return data["candidates"][0]["content"]["parts"][0]["text"]
 
             except Exception as exc:
                 last_exc = exc
+                # Always capture the last error for display in offline messages
+                self._last_api_error = f"{type(exc).__name__}: {str(exc)[:200]}"
                 exc_str = str(exc).lower()
                 retryable = any(k in exc_str for k in (
                     "429", "quota", "resource_exhausted",
                     "timeout", "connection", "network", "ssl", "503",
+                    "proxy", "certificate", "handshake",
                 ))
                 if retryable and attempt < max_retries:
                     logger.warning(
@@ -277,9 +348,18 @@ class HypothesisGenerator:
             f"existing work"
         )
 
+        # Offline fallback when no API key is configured
+        if not self.has_api_key:
+            return self._generate_hypothesis_offline(gap_pair, evidence_context, query_used)
+
         raw_response = self._call_gemini_with_retry(prompt)
         if raw_response is None:
-            return None
+            # API call failed — fall back to template-based offline generation
+            logger.warning(
+                "Gemini API call failed for %s ↔ %s; using offline fallback",
+                concept_a, concept_b,
+            )
+            return self._generate_hypothesis_offline(gap_pair, evidence_context, query_used)
 
         parsed = self._parse_structured_response(raw_response)
         confidence_score = _CONFIDENCE_MAP.get(
@@ -369,7 +449,8 @@ class HypothesisGenerator:
             except Exception as exc:
                 logger.error("Hypothesis failed for %s ↔ %s: %s", ca, cb, exc)
 
-            if i < total - 1:
+            # Only sleep between API calls; skip delay entirely in offline mode
+            if i < total - 1 and self.has_api_key:
                 time.sleep(config.HYPOTHESIS_API_DELAY)
 
         hypotheses.sort(key=lambda h: h.get("confidence_score", 0), reverse=True)
@@ -446,10 +527,191 @@ class HypothesisGenerator:
             + f"User question: {user_message}"
         )
 
-        response_text = self._call_gemini_with_retry(prompt) or \
-            "Unable to generate a response. Please try again."
+        # Offline fallback when no API key is configured
+        if not self.has_api_key:
+            return self._chat_offline(user_message, paper_context, source_pmids)
+
+        response_text = self._call_gemini_with_retry(prompt)
+        if response_text is None:
+            # API call failed — fall back to keyword-match offline response
+            logger.warning("Gemini API call failed for chat query; using offline fallback")
+            return self._chat_offline(user_message, paper_context, source_pmids)
 
         return response_text, source_pmids
+
+    # ── Response parser ───────────────────────────────────────────────────────
+
+    # ── Offline / template-based hypothesis generation ────────────────────────
+
+    def _generate_hypothesis_offline(
+        self,
+        gap_pair: Dict[str, Any],
+        evidence_context: Dict[str, str],
+        query_used: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Template-based hypothesis builder that works without any API key.
+        Produces a structured hypothesis dict grounded in retrieved paper snippets.
+        """
+        concept_a = gap_pair.get("concept_a", "")
+        concept_b = gap_pair.get("concept_b", "") or ""
+        gap_type  = gap_pair.get("gap_type", "structural")
+
+        # Extract PMID citations from evidence text
+        all_evidence = (
+            evidence_context.get("evidence_a", "")
+            + evidence_context.get("evidence_b", "")
+            + evidence_context.get("connecting_evidence", "")
+        )
+        cited_pmids = list(set(re.findall(r"PMID[:\s]*(\d{6,9})", all_evidence)))[:5]
+
+        hyp_text = (
+            f"We hypothesize that {concept_a} and {concept_b} share a "
+            f"previously undescribed functional relationship. "
+            f"Investigating this connection may reveal novel therapeutic or "
+            f"mechanistic insights in the context of {query_used or 'biomedical research'}."
+        )
+        rationale = (
+            f"Both {concept_a} and {concept_b} appear in the retrieved literature "
+            f"but no direct co-occurrence edge exists between them in the current "
+            f"knowledge graph (gap type: {gap_type}). "
+            f"The connecting evidence suggests shared biological pathways or co-regulatory "
+            f"mechanisms that have not been explicitly tested."
+        )
+        experiment = (
+            f"Design a controlled in vitro assay measuring the effect of modulating "
+            f"{concept_a} activity on {concept_b}-associated endpoints, using the "
+            f"experimental models described in the supporting papers as reference controls."
+        )
+        supporting = (
+            f"Papers {', '.join(['PMID:' + p for p in cited_pmids]) or 'from the corpus'} "
+            f"provide indirect evidence supporting this connection."
+        )
+        novelty = (
+            f"No direct study linking {concept_a} and {concept_b} was identified "
+            f"in the current corpus, making this a structurally novel research gap."
+        )
+
+        hypothesis_obj = {
+            "concept_a":            concept_a,
+            "concept_b":            concept_b,
+            "hypothesis_text":      hyp_text,
+            "biological_rationale": rationale,
+            "supporting_evidence":  supporting,
+            "suggested_experiment": experiment,
+            "confidence_label":     "Medium",
+            "confidence_score":     2,
+            "novelty":              novelty,
+            "evidence_pmids":       cited_pmids,
+            "raw_response":         hyp_text,
+            "query_used":           query_used,
+            "gap_type":             gap_type,
+        }
+
+        if self.db:
+            try:
+                self.db.insert_hypothesis(
+                    concept_a=concept_a,
+                    concept_b=concept_b,
+                    hypothesis_text=hyp_text,
+                    evidence_pmids=cited_pmids,
+                    confidence_score=2,
+                    raw_response=hyp_text,
+                    query_used=query_used,
+                )
+            except Exception as exc:
+                logger.warning("Failed to persist offline hypothesis to DB: %s", exc)
+
+        return hypothesis_obj
+
+    def _chat_offline(
+        self,
+        user_message: str,
+        paper_context: str,
+        source_pmids: List[str],
+    ) -> Tuple[str, List[str]]:
+        """
+        Keyword-match based chat response when Gemini API is unavailable.
+        Extracts relevant sentences and paper metadata from retrieved abstracts.
+        """
+        keywords = [w for w in user_message.lower().split() if len(w) > 3]
+
+        # Parse the paper_context into (header, body) pairs
+        blocks: List[Dict[str, str]] = []
+        current: Dict[str, str] = {}
+        for line in paper_context.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("[PMID"):
+                if current:
+                    blocks.append(current)
+                current = {"header": line, "text": ""}
+            elif current:
+                current["text"] += " " + line
+
+        if current:
+            blocks.append(current)
+
+        # Score each block by keyword matches in its text
+        scored: List[tuple] = []
+        for blk in blocks:
+            text_lower = blk["text"].lower()
+            score = sum(1 for kw in keywords if kw in text_lower)
+            if score > 0:
+                scored.append((score, blk))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_blocks = scored[:4]
+
+        # Choose the right note based on why we're offline
+        if self.has_api_key:
+            err_detail = getattr(self, "_last_api_error", "")
+            if err_detail:
+                api_note = (
+                    f"*⚠️ Gemini API error — `{err_detail}`. "
+                    f"If this says 'API key not valid', regenerate your key at "
+                    f"https://aistudio.google.com/app/apikey and update `.env`. "
+                    f"If this is an SSL/connection error, try adding `REQUESTS_CA_BUNDLE=` "
+                    f"(empty value) to your `.env` file.*"
+                )
+            else:
+                api_note = (
+                    "*Note: Your GEMINI_API_KEY is set but the Gemini API call failed. "
+                    "Check the server console for the exact error. "
+                    "Showing keyword-matched excerpts instead.*"
+                )
+        else:
+            api_note = (
+                "*Note: Add `GEMINI_API_KEY=your_key` to your `.env` file for "
+                "full AI-powered responses.*"
+            )
+
+        if top_blocks:
+            bullets: List[str] = []
+            for _, blk in top_blocks:
+                header = blk["header"]
+                sentences = [s.strip() for s in re.split(r"[.!?]", blk["text"]) if len(s.strip()) > 30]
+                matching = [s for s in sentences if any(kw in s.lower() for kw in keywords)][:2]
+                snippet = ". ".join(matching) + "." if matching else sentences[0] + "." if sentences else ""
+                if snippet:
+                    bullets.append(f"**{header}**\n{snippet}")
+
+            bullet_text = "\n\n".join(bullets)
+            response = (
+                f"Based on {len(source_pmids)} retrieved papers, here are the most relevant findings "
+                f"for *\"{user_message}\"*:\n\n"
+                f"{bullet_text}\n\n"
+                f"---\n{api_note}"
+            )
+        else:
+            response = (
+                f"The {len(source_pmids)} retrieved papers were searched for terms related to "
+                f"*\"{user_message}\"*, but no directly matching excerpts were found in the "
+                f"top results. Try rephrasing using specific biomedical terms from the dataset.\n\n"
+                f"---\n{api_note}"
+            )
+        return response, source_pmids
 
     # ── Response parser ───────────────────────────────────────────────────────
 

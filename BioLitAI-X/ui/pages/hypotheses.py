@@ -1,11 +1,25 @@
 """AI Hypotheses panel page."""
 
+import logging
+import os
+
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 import config
 from ui.components.cards import empty_state, hypothesis_card
 
 
 def render():
+    try:
+        _render_inner()
+    except Exception as exc:
+        logger.exception("Hypotheses page crashed: %s", exc)
+        st.error(f"⚠️ Page error: {exc}")
+        st.info("Try refreshing the page. If the issue persists, return to Home and re-run the search.")
+
+
+def _render_inner():
     if not st.session_state.get("pipeline_complete"):
         empty_state("💡", "No data loaded yet",
                     "Run a search on the Home page first.")
@@ -26,6 +40,14 @@ def render():
         f"Generated from knowledge graph gaps, grounded in retrieved literature evidence.</p>",
         unsafe_allow_html=True,
     )
+
+    # ── API key status banner ────────────────────────────────────────────────
+    if not os.getenv("GEMINI_API_KEY", "").strip():
+        st.info(
+            "ℹ️ **GEMINI_API_KEY not configured** — hypotheses will be generated "
+            "using template-based reasoning. Add `GEMINI_API_KEY=your_key` to "
+            "your `.env` file and click Generate again for AI-powered hypotheses."
+        )
 
     # ── Generate button ───────────────────────────────────────────────────────
     gen_col, filt_col = st.columns([2, 3])
@@ -67,36 +89,21 @@ def render():
         unsafe_allow_html=True,
     )
 
-    # ── If no gaps detected yet, run gap detection ────────────────────────────
-    if not gap_report:
+    # ── Gap status (shown once, never blocks page load) ───────────────────────
+    if gap_report:
+        st.caption(f"✅ {len(gap_report)} research gaps ready as hypothesis input.")
+    else:
         kg = st.session_state.get("knowledge_graph")
         if kg and kg.graph.number_of_nodes() > 0:
-            with st.spinner("Detecting research gaps..."):
-                try:
-                    from pipeline.gap_detector import GapDetector
-                    gd = GapDetector(kg)
-                    gd.find_structural_gaps()
-                    gd.find_cross_domain_gaps()
-                    gd.find_temporal_gaps(papers_df)
-                    gap_report = gd.compile_gap_report()
-                    st.session_state["gap_report"] = gap_report
-                except Exception as exc:
-                    st.warning(f"Gap detection failed: {exc}")
+            st.caption("Research gaps will be detected automatically when you generate hypotheses.")
         else:
-            st.info(
-                "Knowledge graph is empty. NLP processing must complete to detect gaps. "
-                "You can still generate hypotheses once the graph is available."
+            st.caption(
+                "No NLP knowledge graph available — keyword-based gaps will be used automatically."
             )
 
     # ── Display hypotheses ────────────────────────────────────────────────────
-    if not hypotheses:
-        # Try loading from database
-        if db and query:
-            try:
-                hypotheses = db.get_hypotheses_by_query(query)
-                st.session_state["hypotheses"] = hypotheses
-            except Exception:
-                pass
+    # NOTE: No DB auto-load here — avoids SQLite lock wait when background
+    # paper-write thread is still running. Session-state is the source of truth.
 
     if not hypotheses:
         st.markdown(
@@ -145,6 +152,60 @@ def render():
         st.info("No hypotheses match the current filters.")
 
 
+def _keyword_gap_fallback(papers_df) -> list:
+    """
+    Derive simple concept-pair gaps from top keyword co-occurrence when the
+    NLP knowledge graph was not built.  Returns a gap_report-compatible list.
+    """
+    from collections import Counter, defaultdict
+    from itertools import combinations
+
+    keyword_counts: Counter = Counter()
+    pair_counts: defaultdict = defaultdict(int)
+
+    for _, row in papers_df.iterrows():
+        kws = []
+        for kw in (row.get("author_keywords") or []):
+            if kw and len(kw) > 3:
+                kws.append(kw.lower().strip())
+        for mesh in (row.get("mesh_terms") or []):
+            if isinstance(mesh, dict):
+                desc = mesh.get("descriptor", "")
+                if desc and len(desc) > 3:
+                    kws.append(desc.lower().strip())
+        kws = list(set(kws))[:15]
+        for kw in kws:
+            keyword_counts[kw] += 1
+        for a, b in combinations(sorted(kws), 2):
+            pair_counts[(a, b)] += 1
+
+    # Keep only well-attested keywords
+    min_freq = max(2, len(papers_df) // 50)
+    top_kws = {kw for kw, c in keyword_counts.items() if c >= min_freq}
+
+    # Candidate pairs: co-occur rarely relative to their individual frequency
+    # → they represent a gap (both present but not often together)
+    gap_pairs = []
+    for (a, b), co_count in pair_counts.items():
+        if a not in top_kws or b not in top_kws:
+            continue
+        freq_a = keyword_counts[a]
+        freq_b = keyword_counts[b]
+        expected = (freq_a * freq_b) / max(len(papers_df), 1)
+        # Under-connected: co-occurrence far below expectation
+        if co_count < max(2, expected * 0.3):
+            gap_pairs.append({
+                "concept_a":        a,
+                "concept_b":        b,
+                "gap_type":         "structural",
+                "shared_neighbors": [],
+                "score":            1.0 / max(co_count, 1),
+            })
+
+    gap_pairs.sort(key=lambda g: g["score"], reverse=True)
+    return gap_pairs[:20]
+
+
 def _generate_hypotheses(papers_df, entities_df, embedder, db, query, gap_report):
     """Run batch hypothesis generation with progress tracking."""
     if papers_df is None or papers_df.empty:
@@ -152,8 +213,29 @@ def _generate_hypotheses(papers_df, entities_df, embedder, db, query, gap_report
         return
 
     if not gap_report:
-        st.error("No research gaps detected. Ensure NLP and knowledge graph steps completed.")
-        return
+        # 1) Try KG-based gap detection first
+        kg = st.session_state.get("knowledge_graph")
+        if kg and kg.graph.number_of_nodes() > 0:
+            try:
+                from pipeline.gap_detector import GapDetector
+                with st.spinner("Detecting research gaps from knowledge graph..."):
+                    detector = GapDetector(knowledge_graph=kg)
+                    gap_report = detector.compile_gap_report()
+                if gap_report:
+                    st.session_state["gap_report"] = gap_report
+                    st.info(f"Detected {len(gap_report)} research gaps from knowledge graph.")
+            except Exception as exc:
+                logger.debug("KG gap detection failed: %s", exc)
+
+        # 2) Fall back to keyword co-occurrence if KG gave nothing
+        if not gap_report:
+            gap_report = _keyword_gap_fallback(papers_df) if papers_df is not None else []
+            if gap_report:
+                st.session_state["gap_report"] = gap_report
+                st.info(f"Using keyword-derived gaps ({len(gap_report)} pairs) as input.")
+            else:
+                st.error("No research gaps detected. Run the pipeline so entities can be extracted.")
+                return
 
     progress = st.progress(0.0)
     status = st.empty()
@@ -168,8 +250,14 @@ def _generate_hypotheses(papers_df, entities_df, embedder, db, query, gap_report
 
     try:
         from pipeline.hypothesis_generator import HypothesisGenerator
-        gen = HypothesisGenerator(db_manager=db, embedding_engine=embedder)
-        gen.setup()
+        gen = st.session_state.get("hyp_generator")
+        if gen is None:
+            gen = HypothesisGenerator(db_manager=db, embedding_engine=embedder)
+            gen.setup()
+            st.session_state["hyp_generator"] = gen
+        else:
+            gen.db = db
+            gen.embedder = embedder
 
         hypotheses = gen.generate_batch_hypotheses(
             gap_report=gap_report,
@@ -180,7 +268,19 @@ def _generate_hypotheses(papers_df, entities_df, embedder, db, query, gap_report
         )
         st.session_state["hypotheses"] = hypotheses
         progress.progress(1.0)
-        status.success(f"✅ {len(hypotheses)} hypotheses generated.")
+        if hypotheses:
+            api_err = getattr(gen, "_last_api_error", "")
+            if gen.has_api_key and api_err:
+                status.warning(
+                    f"⚠️ Gemini API error: **{api_err}** — hypotheses generated using "
+                    f"offline template mode. Regenerate your API key at "
+                    f"https://aistudio.google.com/app/apikey"
+                )
+            else:
+                mode = "offline template" if not gen.has_api_key else "Gemini AI"
+                status.success(f"✅ {len(hypotheses)} hypotheses generated ({mode}).")
+        else:
+            status.warning("⚠️ No hypotheses were generated. Check the logs for details.")
         st.rerun()
 
     except Exception as exc:

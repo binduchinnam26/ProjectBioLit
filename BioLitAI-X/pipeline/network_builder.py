@@ -250,80 +250,111 @@ class NetworkBuilder:
 
     def build_topic_network(self, topic_model_results: Dict[str, Any]) -> nx.Graph:
         """
-        Nodes: BERTopic-discovered topics.
-        Edges: papers shared between topics (topic co-assignment).
+        Nodes: one node per unique keyword extracted from BERTopic topics.
+        Edges: two keywords are connected when they co-appear in the same topic.
 
         topic_model_results expects keys:
-          'doc_topics': list of topic IDs per document
-          'topic_labels': {topic_id: {'label', 'top_words', 'count'}}
+          'doc_topics'   : list of topic IDs per document (required)
+          'topic_labels' : {topic_id: {'label', 'top_words', 'count', 'avg_year'}}
+          'doc_probs'    : probability matrix (unused here, kept for API compat)
+          'embeddings'   : (unused here, kept for API compat)
+          'papers_df'    : DataFrame with pmid, pub_year columns (optional)
         """
-        doc_topics = topic_model_results.get("doc_topics", [])
+        doc_topics   = topic_model_results.get("doc_topics", [])
         topic_labels = topic_model_results.get("topic_labels", {})
 
-        if not doc_topics or not topic_labels:
+        if not topic_labels:
             return nx.Graph()
 
-        G = nx.Graph()
+        N_WORDS_PER_TOPIC = 10
+
+        # Count papers per topic from doc_topics list
+        topic_paper_count: Dict[int, int] = defaultdict(int)
+        for tid in doc_topics:
+            if tid >= 0:
+                topic_paper_count[tid] += 1
+
+        # Accumulate per-word data across topics
+        word_total_weight: Dict[str, float] = defaultdict(float)
+        word_topic_ids:    Dict[str, List[int]] = defaultdict(list)
+        word_topic_names:  Dict[str, List[str]] = defaultdict(list)
+
+        # topic_id → ordered word list (top N)
+        topic_word_lists: Dict[int, List[str]] = {}
 
         for tid, info in topic_labels.items():
             if tid == -1:
                 continue
+            words = (info.get("top_words") or info.get("words") or [])[:N_WORDS_PER_TOPIC]
+            if not words:
+                continue
+            pc         = topic_paper_count.get(tid, info.get("count", 1)) or 1
+            topic_name = info.get("label", f"Topic {tid}")
+            topic_word_lists[tid] = words
+
+            for rank, word in enumerate(words):
+                # Higher-ranked words (lower rank index) get more weight
+                rank_weight = pc / (rank + 1)
+                word_total_weight[word] += rank_weight
+                word_topic_ids[word].append(tid)
+                word_topic_names[word].append(topic_name)
+
+        G = nx.Graph()
+
+        for word, total_w in word_total_weight.items():
             G.add_node(
-                tid,
-                label=info.get("label", f"Topic {tid}"),
-                top_words=info.get("top_words", []),
-                paper_count=info.get("count", 0),
+                word,
+                label=word,
+                paper_count=total_w,
+                topic_ids=word_topic_ids[word],
+                topic_names=word_topic_names[word],
+                n_topics=len(word_topic_ids[word]),
             )
 
-        # Edge: topics that share papers (same paper assigned to multiple topics)
-        # Using topic co-assignment from document list
-        topic_pair_counts: Dict[Tuple[int, int], int] = defaultdict(int)
-        for tid in doc_topics:
-            if tid == -1:
-                continue
-            # Single assignment — build edges from papers that share nearby topics
-            # (BERTopic assigns one primary topic per doc, so we use paper lists)
-
-        # Build paper lists per topic
-        topic_papers: Dict[int, List[int]] = defaultdict(list)
-        for doc_idx, tid in enumerate(doc_topics):
-            if tid >= 0:
-                topic_papers[tid].append(doc_idx)
-
-        for (ta, tb) in combinations(sorted(topic_papers.keys()), 2):
-            shared = len(set(topic_papers[ta]) & set(topic_papers[tb]))
-            if shared > 0:
-                topic_pair_counts[(ta, tb)] = shared
-
-        for (ta, tb), weight in topic_pair_counts.items():
-            if G.has_node(ta) and G.has_node(tb):
-                G.add_edge(ta, tb, weight=weight)
-
-        if G.number_of_nodes() == 0:
+        if G.number_of_nodes() < 2:
             return G
 
-        counts = [d.get("paper_count", 1) for _, d in G.nodes(data=True)]
-        w_min, w_max = (min(counts), max(counts)) if counts else (0, 1)
-        color_palette = config.COMMUNITY_COLORS
+        # ── Edges: keywords co-appearing in the same topic ────────────────────
+        edge_weights: Dict[Tuple[str, str], float] = defaultdict(float)
 
-        for i, node in enumerate(G.nodes()):
-            pc = G.nodes[node].get("paper_count", 1)
-            G.nodes[node].update(
-                {
-                    "color": color_palette[i % len(color_palette)],
-                    "size": _scale_node_size(pc, w_min, w_max),
-                    "community": i,
-                }
-            )
+        for tid, words in topic_word_lists.items():
+            pc = topic_paper_count.get(tid, topic_labels[tid].get("count", 1)) or 1
+            n  = len(words)
+            if n < 2:
+                continue
+            for i in range(n):
+                for j in range(i + 1, n):
+                    key = (min(words[i], words[j]), max(words[i], words[j]))
+                    edge_weights[key] += pc  # accumulate paper count across shared topics
 
-        weights = [d.get("weight", 1) for _, _, d in G.edges(data=True)]
-        ew_min, ew_max = (min(weights), max(weights)) if weights else (0, 1)
+        for (w1, w2), weight in edge_weights.items():
+            if G.has_node(w1) and G.has_node(w2):
+                G.add_edge(w1, w2, weight=weight, relationship_type="co_topic")
+
+        # ── Community detection and node sizing ───────────────────────────────
+        partition = _louvain_communities(G)
+        weights   = [G.nodes[n].get("paper_count", 1) for n in G.nodes()]
+        w_min, w_max = (min(weights), max(weights)) if weights else (1, 1)
+
+        for node in G.nodes():
+            pw    = G.nodes[node].get("paper_count", 1)
+            comm  = partition.get(node, 0)
+            ratio = (pw - w_min) / (w_max - w_min + 1e-9)
+            G.nodes[node].update({
+                "color":     config.COMMUNITY_COLORS[comm % len(config.COMMUNITY_COLORS)],
+                "size":      10.0 + ratio * 50.0,
+                "community": comm,
+            })
+
+        all_w = [d.get("weight", 1) for _, _, d in G.edges(data=True)]
+        ew_min = min(all_w) if all_w else 0.0
+        ew_max = max(all_w) if all_w else 1.0
         for u, v, d in G.edges(data=True):
             d["width"] = _scale_edge_width(d.get("weight", 1), ew_min, ew_max)
 
         logger.info(
-            "Topic network: %d topics, %d connections",
-            G.number_of_nodes(), G.number_of_edges()
+            "Topic keyword network: %d keyword nodes, %d edges",
+            G.number_of_nodes(), G.number_of_edges(),
         )
         return G
 

@@ -94,22 +94,60 @@ _VOS_PHYSICS_ON = {
 }
 
 
+# ── Position post-processing ─────────────────────────────────────────────────
+
+def _spread_overlapping_nodes(
+    pos: Dict[str, Tuple[float, float]],
+    min_dist: float = 0.10,
+    max_iterations: int = 80,
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Iteratively push apart any nodes whose layout-space centres are closer than
+    min_dist, using a pairwise repulsion step.  Vectorised with numpy.
+
+    Needed for co-authorship networks: disconnected author groups have similar
+    UMAP embeddings → FA2 never separates them → vis.js stacks them as blobs.
+    min_dist=0.10 gives ~140 px separation at _LAYOUT_SCALE=1400, ensuring
+    individual circles are clearly visible.
+    """
+    import numpy as np
+
+    nodes = list(pos.keys())
+    n = len(nodes)
+    if n < 2:
+        return pos
+
+    arr = np.array([pos[nd] for nd in nodes], dtype=np.float64)
+
+    for _ in range(max_iterations):
+        diff = arr[:, None, :] - arr[None, :, :]          # (n, n, 2)
+        dist = np.sqrt((diff ** 2).sum(axis=-1))           # (n, n)
+        np.fill_diagonal(dist, np.inf)
+        close = dist < min_dist
+        if not close.any():
+            break
+        push_mag = np.where(close, (min_dist - dist) * 0.5, 0.0)
+        unit = diff / (dist[:, :, None] + 1e-9)
+        arr += (unit * push_mag[:, :, None]).sum(axis=1)
+
+    return {nd: (float(arr[i, 0]), float(arr[i, 1])) for i, nd in enumerate(nodes)}
+
+
 # ── Layout computation (shared across all three modes) ────────────────────────
 
 def _compute_layout(
     G: nx.Graph,
     layout_key: str = "",
     network_type: str = "",
+    physics: bool = False,
 ) -> Dict[str, Tuple[float, float]]:
     """
     Compute and cache the VOSviewer-style layout for graph G.
 
-    Uses a two-stage pipeline: UMAP semantic positioning from paper embeddings
-    followed by ForceAtlas2 refinement (near-zero gravity, edge-weight attraction).
-    Falls back to kamada_kawai / spring_layout when embeddings are unavailable.
-
-    Embeddings and papers_df are read from st.session_state so all three viz
-    modes share identical positions when switching tabs.
+    physics=False (default): UMAP+ForceAtlas2 pre-computed layout — stable,
+      consistent positions across Network/Overlay/Density tabs.
+    physics=True: NetworkX spring layout — organic, force-directed positions;
+      re-computed each toggle so the graph "settles" visually differently.
 
     Returns {str(node): (x, y)} with values in approximately [-1, 1].
     """
@@ -117,26 +155,30 @@ def _compute_layout(
     if n == 0:
         return {}
 
-    # Session-state cache key — includes node/edge count to invalidate on graph change
-    ss_key = f"__pos_{layout_key}_{network_type}_{n}_{G.number_of_edges()}"
+    # Cache key includes physics state so toggling physics invalidates cache
+    physics_tag = "phy1" if physics else "phy0"
+    ss_key = f"__pos_{layout_key}_{network_type}_{n}_{G.number_of_edges()}_{physics_tag}"
     cached = st.session_state.get(ss_key)
     if cached is not None:
         return cached
 
-    # Pull embeddings + metadata from session state (set by the pipeline)
-    embeddings_array = st.session_state.get("embeddings_array")
-    papers_df        = st.session_state.get("papers_df")
-    doc_topics_df    = st.session_state.get("doc_topics_df")
-    query            = st.session_state.get("current_query", "")
+    if physics:
+        # Spring layout: organic force-directed, fast on graphs ≤ 300 nodes
+        raw = nx.spring_layout(G, weight="weight", seed=42, iterations=80, k=1.5 / max(n ** 0.5, 1))
+        pos = {str(node): (float(xy[0]), float(xy[1])) for node, xy in raw.items()}
+    else:
+        # Pull embeddings + metadata from session state (set by the pipeline)
+        embeddings_array = st.session_state.get("embeddings_array")
+        papers_df        = st.session_state.get("papers_df")
+        doc_topics_df    = st.session_state.get("doc_topics_df")
 
-    pos = compute_vos_layout(
-        G,
-        network_type=network_type or layout_key,
-        papers_df=papers_df,
-        embeddings_array=embeddings_array,
-        doc_topics_df=doc_topics_df,
-        query=query,
-    )
+        pos = compute_vos_layout(
+            G,
+            network_type=network_type or layout_key,
+            papers_df=papers_df,
+            embeddings_array=embeddings_array,
+            doc_topics_df=doc_topics_df,
+        )
 
     st.session_state[ss_key] = pos
     return pos
@@ -252,6 +294,7 @@ def _apply_filters(
     min_node_weight: int,
     min_edge_weight: int,
     weight_attr: str = "paper_count",
+    keep_isolates: bool = False,
 ) -> nx.Graph:
     G2 = G.copy()
     G2.remove_nodes_from([
@@ -261,7 +304,11 @@ def _apply_filters(
     G2.remove_edges_from([
         (u, v) for u, v, d in G2.edges(data=True) if d.get("weight", 1) < min_edge_weight
     ])
-    G2.remove_nodes_from(list(nx.isolates(G2)))
+    # Only remove isolates when the user explicitly raises the minimum edge threshold;
+    # with the default (min_edge_weight=1) we keep isolated nodes so that topic
+    # landscape nodes remain visible even when they share no papers.
+    if not keep_isolates and min_edge_weight > 1:
+        G2.remove_nodes_from(list(nx.isolates(G2)))
     return G2
 
 
@@ -569,7 +616,7 @@ def _render_network_plotly(
     # Capped edge trace (top-weight edges only)
     edge_trace = _plotly_edge_trace(G, pos)
 
-    # Median weight threshold — only nodes above median get a label when labels_all=False
+    # When Labels=OFF show NO labels; when ON show all (searchable nodes always labeled)
     all_weights = [d.get(weight_attr, d.get("frequency", 1)) for _, d in G.nodes(data=True)]
     median_w = sorted(all_weights)[len(all_weights) // 2] if all_weights else 1
 
@@ -592,7 +639,8 @@ def _render_network_plotly(
             is_match = bool(search_lower and search_lower in ns.lower())
 
             xs.append(x); ys.append(y); sizes.append(size)
-            labels.append(ns[:22] if (labels_all or is_match or w >= median_w) else "")
+            # labels_all=True → show all; labels_all=False → hide all except search matches
+            labels.append(ns[:22] if (labels_all or is_match) else "")
             borders_c.append("#FFD700" if is_match else _darken(color, 0.78))
             borders_w.append(3 if is_match else 1)
 
@@ -676,8 +724,18 @@ def render_coauthorship_network(
     s3.metric("Clusters", clusters)
     s4.metric("Total link strength", sum(d.get("weight", 1) for _, _, d in G2.edges(data=True)))
 
-    pos = _compute_layout(G2, layout_key="coauth", network_type="coauth")
-    _render_network_plotly(G2, pos, "paper_count", controls, height)
+    physics = controls.get("physics", False)
+    pos = _compute_layout(G2, layout_key="coauth", network_type="coauth", physics=physics)
+    if not physics:
+        pos = _spread_overlapping_nodes(pos)
+    net = _get_vosviewer_net(height=f"{height}px", physics=physics)
+    _add_coauth_nodes(net, G2, pos, controls.get("search", ""), controls.get("labels_all", True))
+    _add_edges_to_net(net, G2)
+    html_key = (
+        f"coauth_{G2.number_of_nodes()}_{G2.number_of_edges()}_"
+        f"{controls.get('search', '')}_phy{physics}_lbl{controls.get('labels_all', True)}_sp1"
+    )
+    _render_vosviewer_html(net, height=height, cache_key=html_key)
 
 
 def render_keyword_network(
@@ -717,8 +775,57 @@ def render_keyword_network(
     s2.metric("Links", f"{min(total_edges, _MAX_RENDER_EDGES):,}" + (f" of {total_edges:,}" if total_edges > _MAX_RENDER_EDGES else ""))
     s3.metric("Clusters", clusters)
 
-    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword")
+    pos = _compute_layout(G2, layout_key="keyword", network_type="keyword",
+                          physics=controls.get("physics", False))
     _render_network_plotly(G2, pos, "frequency", controls, height)
+
+
+_TOPIC_PHYSICS = {
+    "forceAtlas2Based": {
+        "gravitationalConstant": -80,
+        "centralGravity": 0.01,
+        "springLength": 200,
+        "springConstant": 0.05,
+        "damping": 0.4,
+        "avoidOverlap": 1.0,
+    },
+    "minVelocity": 0.5,
+    "solver": "forceAtlas2Based",
+    "stabilization": {"enabled": True, "iterations": 200, "updateInterval": 25},
+}
+
+_TOPIC_EDGE_COLORS = {
+    "shared_vocabulary":  "#00D4FF",  # cyan
+    "co_assigned_papers": "#7B61FF",  # purple
+    "semantic_similarity": "#00E676", # green
+}
+
+_TOPIC_DARK_CSS = """
+<style>
+  #mynetwork {
+    background-color: #0A0F1E;
+    border: 1px solid #1F2937;
+    border-radius: 8px;
+    box-shadow: 0 2px 16px rgba(0,0,0,0.4);
+  }
+  .vis-tooltip {
+    background-color: #1A2235 !important;
+    color: #F9FAFB !important;
+    border: 1px solid #374151 !important;
+    border-radius: 8px !important;
+    font-family: 'Open Sans', sans-serif !important;
+    font-size: 12px !important;
+    padding: 10px 12px !important;
+    max-width: 320px !important;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
+  }
+  .vis-navigation .vis-button {
+    background-color: #1C2539 !important;
+    border: 1px solid #374151 !important;
+    border-radius: 4px !important;
+  }
+</style>
+"""
 
 
 def render_topic_network(
@@ -727,7 +834,7 @@ def render_topic_network(
     height: int = 750,
     year_range: Optional[tuple] = None,
 ):
-    """VOSviewer Network Visualization — topic landscape."""
+    """Topic keyword landscape — one node per keyword, edges = co-topic."""
     if G is None or G.number_of_nodes() == 0:
         st.info("No topic data available. Run the pipeline first.")
         return
@@ -741,39 +848,120 @@ def render_topic_network(
         st.warning("All nodes filtered out — lower the minimum weight thresholds.")
         return
 
-    pos = _compute_layout(G2, layout_key="topic", network_type="topic")
-    net = _get_vosviewer_net(height=f"{height}px", physics=controls.get("physics", False))
+    n_nodes = G2.number_of_nodes()
+    n_edges = G2.number_of_edges()
+    st.caption(f"Keyword network: **{n_nodes} keywords**, **{n_edges} connections**")
+
+    if n_edges == 0:
+        st.warning("Graph has nodes but no edges — re-run 'Compute Topic Model' to rebuild.")
+
+    # Pre-compute spring layout so nodes stay compact and edges are visible
+    k_val = 2.5 / max(n_nodes ** 0.5, 1)
+    raw_pos = nx.spring_layout(G2, weight="weight", seed=42, k=k_val, iterations=120)
+    pos = {str(n): (float(xy[0]), float(xy[1])) for n, xy in raw_pos.items()}
+
+    use_physics = controls.get("physics", False)
+
+    net = _get_vosviewer_net(height=f"{height}px", physics=use_physics)
+
+    # Override net options for topic keyword display
+    topic_opts: Dict[str, Any] = {
+        "nodes": {
+            "font": {
+                "face": "Open Sans", "color": "#1F2937",
+                "size": 13, "strokeWidth": 3, "strokeColor": "#FFFFFF",
+            },
+            "borderWidth": 2,
+            "borderWidthSelected": 4,
+            "shape": "dot",
+        },
+        "edges": {
+            "smooth": {"type": "continuous", "roundness": 0.15},
+            "selectionWidth": 3,
+            "scaling": {"min": 1, "max": 8},
+        },
+        "interaction": {
+            "hover": True, "tooltipDelay": 80,
+            "navigationButtons": True, "keyboard": True,
+            "zoomView": True, "dragNodes": True, "dragView": True,
+        },
+        "layout": {"improvedLayout": False},
+        "physics": (
+            {
+                "forceAtlas2Based": {
+                    "gravitationalConstant": -30,
+                    "centralGravity": 0.3,
+                    "springLength": 120,
+                    "springConstant": 0.08,
+                    "damping": 0.5,
+                    "avoidOverlap": 0.8,
+                },
+                "minVelocity": 0.5,
+                "solver": "forceAtlas2Based",
+                "stabilization": {"enabled": True, "iterations": 150, "updateInterval": 25},
+            }
+            if use_physics else {"enabled": False}
+        ),
+    }
+    net.set_options(json.dumps(topic_opts))
+
     search_lower = controls.get("search", "").lower()
+    labels_all   = controls.get("labels_all", True)
 
     for node, data in G2.nodes(data=True):
         ns          = str(node)
-        label       = str(data.get("label", f"Topic {node}"))[:40]
-        top_words   = data.get("top_words", [])
-        size        = float(data.get("size", config.NODE_SIZE_MIN))
+        label       = str(data.get("label", ns))
+        size        = float(data.get("size", 15.0))
         color       = data.get("color", config.COMMUNITY_COLORS[0])
-        paper_count = data.get("paper_count", 0)
+        n_topics    = data.get("n_topics", 0)
+        topic_names = data.get("topic_names", [])
         x, y        = pos.get(ns, (0.0, 0.0))
 
-        is_match     = search_lower and search_lower in label.lower()
+        is_match     = bool(search_lower and search_lower in label.lower())
         border_color = _VOS_HIGHLIGHT if is_match else _darken(color, 0.78)
+        label_text   = label if (labels_all or is_match) else ""
+
+        topics_str = "; ".join(dict.fromkeys(topic_names))
+        tooltip = (
+            f"<b>{label}</b><br>"
+            f"In {n_topics} topic cluster{'s' if n_topics != 1 else ''}<br>"
+            + (f"{topics_str}" if topics_str else "")
+        )
 
         net.add_node(
-            ns, label=label, size=size,
+            ns, label=label_text, size=size,
             x=x * _LAYOUT_SCALE, y=y * _LAYOUT_SCALE,
             color={
                 "background": color, "border": border_color,
                 "highlight": {"background": _VOS_HIGHLIGHT, "border": "#FFA500"},
                 "hover": {"background": color, "border": _darken(color, 0.65)},
             },
-            title=(f"<b>{label}</b><br>Papers: {paper_count}<br>"
-                   f"Top words: {', '.join(top_words[:5])}"),
+            title=tooltip,
             shape="dot",
-            font={"size": max(10, int(size * 0.30)), "color": _VOS_FONT,
-                  "face": "Open Sans", "strokeWidth": 4, "strokeColor": "#FFFFFF"},
+            font={"size": 13, "color": _VOS_FONT, "face": "Open Sans",
+                  "strokeWidth": 3, "strokeColor": "#FFFFFF"},
         )
 
-    _add_edges_to_net(net, G2)
-    html_key = f"topic_{G2.number_of_nodes()}_{G2.number_of_edges()}_{controls.get('search','')}_{controls.get('physics')}"
+    # Edges — thick and opaque so they're clearly visible
+    all_edges = sorted(G2.edges(data=True), key=lambda e: e[2].get("weight", 1), reverse=True)
+    for u, v, data in all_edges[:_MAX_RENDER_EDGES]:
+        weight   = data.get("weight", 1)
+        width    = max(1.5, min(8.0, float(data.get("width", 1.5))))
+        src_col  = G2.nodes[u].get("color", config.COMMUNITY_COLORS[0])
+        net.add_edge(
+            str(u), str(v), weight=weight, width=width,
+            color={
+                "color": _rgba(src_col, 0.70),
+                "highlight": _VOS_HIGHLIGHT,
+                "hover": _rgba(src_col, 0.95),
+            },
+            title=f"<b>{u}</b> — <b>{v}</b><br>Co-topic strength: {int(weight)}",
+            arrows={"to": {"enabled": False}},
+        )
+
+    html_key = (f"topic_{n_nodes}_{n_edges}_"
+                f"{controls.get('search','')}_phy{use_physics}_"
+                f"lbl{controls.get('labels_all', True)}")
     _render_vosviewer_html(net, height=height, cache_key=html_key)
 
 
@@ -814,8 +1002,11 @@ def render_overlay_visualization(
     # Compute overlay score
     overlay_vals = _overlay_year_per_node(G2, papers_df, network_type)
 
-    # Shared layout positions (reuses same cache as Network view for this network_type)
-    pos = _compute_layout(G2, layout_key=network_type, network_type=network_type)
+    # Shared layout positions (same physics state as Network view for this network_type)
+    pos = _compute_layout(G2, layout_key=network_type, network_type=network_type,
+                          physics=controls.get("physics", False))
+    if network_type == "coauth" and not controls.get("physics", False):
+        pos = _spread_overlapping_nodes(pos)
 
     node_strs = [str(n) for n in G2.nodes()]
     weights   = [G2.nodes[n].get(weight_attr, 1) for n in G2.nodes()]
@@ -940,8 +1131,11 @@ def render_density_visualization(
         st.warning("All nodes filtered out.")
         return
 
-    # Shared layout (reuses same cache as Network view for this network_type)
-    pos = _compute_layout(G2, layout_key=network_type, network_type=network_type)
+    # Shared layout (same physics state as Network view for this network_type)
+    pos = _compute_layout(G2, layout_key=network_type, network_type=network_type,
+                          physics=controls.get("physics", False))
+    if network_type == "coauth" and not controls.get("physics", False):
+        pos = _spread_overlapping_nodes(pos)
 
     node_strs = [str(n) for n in G2.nodes()]
     weights   = np.array([G2.nodes[n].get(weight_attr, 1) for n in G2.nodes()], dtype=float)

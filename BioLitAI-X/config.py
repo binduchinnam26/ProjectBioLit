@@ -19,7 +19,10 @@ for _d in (RAW_DIR, PROCESSED_DIR, EMBEDDINGS_DIR, DATABASE_DIR):
 # ── Database ──────────────────────────────────────────────────────────────────
 DB_PATH = str(DATABASE_DIR / "biolita.db")
 
-# ── Entrez / PubMed ───────────────────────────────────────────────────────────
+# ── Hugging Face ─────────────────────────────────────────────────────────────
+HF_TOKEN = os.getenv("HF_TOKEN")  # read-only token is sufficient
+
+
 ENTREZ_EMAIL = os.getenv("ENTREZ_EMAIL")
 ENTREZ_API_KEY = os.getenv("ENTREZ_API_KEY")
 
@@ -37,9 +40,9 @@ FETCH_RETRIES = 3
 FETCH_RETRY_DELAY = 2        # seconds, doubles on each retry
 
 # ── Query / result sizing ─────────────────────────────────────────────────────
-MAX_RESULTS_DEFAULT = 1000   # 1000 papers completes in ~60-90s; raise slider for deeper searches
+MAX_RESULTS_DEFAULT = 500
 MAX_RESULTS_MIN = 100
-MAX_RESULTS_MAX = 3000       # hard cap; >2000 may exceed 2-min target on slow hardware
+MAX_RESULTS_MAX = 500
 
 # ── NLP / Embeddings ──────────────────────────────────────────────────────────
 SCISPACY_MODEL = "en_core_sci_lg"
@@ -70,26 +73,38 @@ NLP_BATCH_SIZE = int(os.getenv("NLP_BATCH_SIZE", "256"))
 # Worker processes for nlp.pipe().
 # KEEP AT 1 ON WINDOWS — spaCy uses 'spawn' on Windows, which requires
 # pickling the model; the UMLS linker is not picklable and will raise errors.
-# On Linux / macOS (fork semantics) you can set this to -1 (all cores) or
-# a specific integer via the NLP_N_PROCESS env var.
-NLP_N_PROCESS = int(os.getenv("NLP_N_PROCESS", "1"))
+# On Linux / macOS (fork semantics) default is 2 workers for ~2x NER speed.
+# Override via NLP_N_PROCESS env var. The NLPProcessor falls back to
+# n_process=1 automatically if multiprocessing fails (e.g. UMLS enabled).
+import platform as _platform
+NLP_N_PROCESS = int(os.getenv(
+    "NLP_N_PROCESS",
+    "1" if _platform.system() == "Windows" else "2",
+))
 
 # Entity types extracted by SciSpaCy — covers all biomedical domains.
-# "ENTITY" is the generic label used by en_core_sci_lg; the NLP processor
-# reclassifies it using UMLS semantic types where available.
+# ENTITY catch-all is excluded; the NLP processor reclassifies it via UMLS
+# or drops it if no specific type can be assigned.
 NER_ENTITY_TYPES = [
     "DISEASE",
+    "CANCER",
     "GENE_OR_GENOME",
+    "DNA",
+    "RNA",
+    "PROTEIN",
     "CHEMICAL",
     "BIOLOGICAL_PROCESS",
+    "PATHWAY",
     "CELL",
+    "CELL_TYPE",
+    "CELL_LINE",
     "ORGANISM",
+    "ANATOMY",
     "LABORATORY_PROCEDURE",
-    "ENTITY",          # fallback for en_core_sci_lg generic labels
 ]
 
 # ── Topic Modeling ────────────────────────────────────────────────────────────
-BERTOPIC_MIN_TOPIC_SIZE = 10
+BERTOPIC_MIN_TOPIC_SIZE = 5
 
 # ── Network / Graph ───────────────────────────────────────────────────────────
 KEYWORD_MIN_FREQUENCY = 3    # minimum papers a keyword must appear in
@@ -108,7 +123,7 @@ GEMINI_TOP_P = 0.85
 GEMINI_TOP_K = 40
 GEMINI_MAX_OUTPUT_TOKENS = 2048
 HYPOTHESIS_BATCH_SIZE = 10
-HYPOTHESIS_API_DELAY = 2     # seconds between Gemini calls
+HYPOTHESIS_API_DELAY = 5     # seconds between Gemini calls; free tier = 15 RPM → need ≥4s
 
 # ── Visualization ─────────────────────────────────────────────────────────────
 COMMUNITY_COLORS = [
@@ -145,14 +160,30 @@ COMMUNITY_COLORS = [
 ]
 
 ENTITY_TYPE_COLORS = {
-    "DISEASE": "#EF4444",
-    "GENE_OR_GENOME": "#3B82F6",
-    "CHEMICAL": "#10B981",
-    "LABORATORY_PROCEDURE": "#F59E0B",
-    "CELL": "#8B5CF6",
-    "ORGANISM": "#06B6D4",
-    "BIOLOGICAL_PROCESS": "#F97316",
-    "ENTITY": "#9CA3AF",    # neutral grey for unclassified en_core_sci_lg entities
+    # Disease group — red
+    "DISEASE":              "#FF5252",
+    "CANCER":               "#FF5252",
+    # Gene / molecular biology group — green
+    "GENE_OR_GENOME":       "#00E676",
+    "DNA":                  "#00E676",
+    "RNA":                  "#00E676",
+    "PROTEIN":              "#00E676",
+    # Chemical / drug group — cyan
+    "CHEMICAL":             "#00D4FF",
+    # Biological process / pathway group — mint
+    "BIOLOGICAL_PROCESS":   "#A8E6CF",
+    "PATHWAY":              "#A8E6CF",
+    # Cell group — purple
+    "CELL":                 "#7B61FF",
+    "CELL_TYPE":            "#7B61FF",
+    "CELL_LINE":            "#7B61FF",
+    # Organism group — yellow
+    "ORGANISM":             "#FFD600",
+    # Anatomy group — pink
+    "ANATOMY":              "#FF8B94",
+    # Procedure / other — grey
+    "LABORATORY_PROCEDURE": "#8899AA",
+    "ENTITY":               "#8899AA",
 }
 
 CANVAS_BACKGROUND = "#0A0F1E"

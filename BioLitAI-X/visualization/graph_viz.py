@@ -22,14 +22,45 @@ from visualization.layout_engine import compute_vos_layout
 
 logger = logging.getLogger(__name__)
 
+# Entity type → node color (Problem 2)
+_ENTITY_COLOR_MAP: Dict[str, str] = {
+    "DISEASE":              "#FF5252",
+    "CANCER":               "#FF5252",
+    "CHEMICAL":             "#00D4FF",
+    "SIMPLE_CHEMICAL":      "#00D4FF",
+    "GENE_OR_GENE_PRODUCT": "#00E676",
+    "GENE_OR_GENOME":       "#00E676",   # backward compat
+    "PROTEIN":              "#00E676",
+    "DNA":                  "#00E676",
+    "RNA":                  "#00E676",
+    "ORGANISM":             "#FFD600",
+    "TAXON":                "#FFD600",
+    "CELL_TYPE":            "#7B61FF",
+    "CELL_LINE":            "#7B61FF",
+    "CELL":                 "#7B61FF",   # backward compat
+    "ANATOMY":              "#FF8B94",
+    "PATHWAY":              "#A8E6CF",
+    "BIOLOGICAL_PROCESS":   "#A8E6CF",   # backward compat
+    "LABORATORY_PROCEDURE": "#8899AA",
+}
+_DEFAULT_KG_NODE_COLOR = "#8899AA"
+
 # ── Entity type → display shape ───────────────────────────────────────────────
 _ENTITY_SHAPE = {
-    "DISEASE": "dot",
-    "GENE_OR_GENOME": "diamond",
-    "CHEMICAL": "square",
-    "BIOLOGICAL_PROCESS": "ellipse",
-    "CELL": "triangle",
-    "ORGANISM": "star",
+    "DISEASE":              "dot",
+    "CANCER":               "dot",
+    "GENE_OR_GENOME":       "diamond",
+    "DNA":                  "diamond",
+    "RNA":                  "diamond",
+    "PROTEIN":              "diamond",
+    "CHEMICAL":             "square",
+    "BIOLOGICAL_PROCESS":   "ellipse",
+    "PATHWAY":              "ellipse",
+    "CELL":                 "triangle",
+    "CELL_TYPE":            "triangle",
+    "CELL_LINE":            "triangle",
+    "ORGANISM":             "star",
+    "ANATOMY":              "triangleDown",
     "LABORATORY_PROCEDURE": "triangleDown",
 }
 
@@ -43,6 +74,7 @@ _EDGE_COLORS = {
     "cause":               "#F97316",
     "associate":           "#EC4899",
     "semantic_similarity": "#9CA3AF",
+    "co-occurs with":      "#374151",
 }
 _DEFAULT_EDGE_COLOR = "#4B5563"
 
@@ -85,8 +117,8 @@ def _color_opacity(hex_color: str, opacity: float) -> str:
     return f"rgba({r},{g},{b},{opacity})"
 
 
-_MAX_KG_NODES = 150   # cap entity KG nodes sent to vis.js
-_MAX_KG_EDGES = 500   # cap entity KG edges sent to vis.js
+_DEFAULT_MAX_KG_NODES = 150  # default node cap; overrideable via render param
+_MAX_KG_EDGES = 500          # cap entity KG edges sent to vis.js
 
 # Scale factor applied to normalised [-1,1] positions when injecting into PyVis
 _KG_LAYOUT_SCALE = 2000
@@ -143,7 +175,6 @@ def _compute_kg_layout(G_sub: nx.MultiDiGraph) -> Dict[str, Tuple[float, float]]
     papers_df     = st.session_state.get("papers_df")
     embeddings    = st.session_state.get("embeddings_array")
     entities_df   = st.session_state.get("entities_df")
-    query         = st.session_state.get("current_query", "")
 
     pos = compute_vos_layout(
         G_sub,
@@ -151,7 +182,6 @@ def _compute_kg_layout(G_sub: nx.MultiDiGraph) -> Dict[str, Tuple[float, float]]
         papers_df=papers_df,
         embeddings_array=embeddings,
         entities_df=entities_df,
-        query=query,
     )
     st.session_state[ss_key] = pos
     return pos
@@ -189,6 +219,8 @@ def render_knowledge_graph(
     show_gap_nodes: bool = True,
     search_term: str = "",
     height: int = 800,
+    max_nodes: int = _DEFAULT_MAX_KG_NODES,
+    min_edge_cooccurrence: int = 2,
 ):
     """
     Render the full biomedical knowledge graph in VOSviewer style.
@@ -203,7 +235,7 @@ def render_knowledge_graph(
         return
 
     # ── Filter graph ──────────────────────────────────────────────────────────
-    allowed_entities = entity_type_filter or set(config.NER_ENTITY_TYPES)
+    allowed_entities = entity_type_filter or set(config.ENTITY_TYPE_COLORS.keys())
     nodes_to_keep = [
         n for n, d in G.nodes(data=True)
         if d.get("entity_type", "UNKNOWN") in allowed_entities
@@ -226,20 +258,33 @@ def render_knowledge_graph(
 
     # ── Node cap: keep top-N by paper_count to prevent vis.js freeze ─────────
     total_kg_nodes = G_sub.number_of_nodes()
-    if total_kg_nodes > _MAX_KG_NODES:
+    if total_kg_nodes > max_nodes:
         top_nodes = sorted(
             G_sub.nodes(data=True),
             key=lambda nd: nd[1].get("paper_count", 0),
             reverse=True,
-        )[:_MAX_KG_NODES]
+        )[:max_nodes]
         G_sub = G_sub.subgraph({nd[0] for nd in top_nodes}).copy()
         st.info(
-            f"Showing top {_MAX_KG_NODES} entities of {total_kg_nodes:,} by evidence strength. "
-            "Increase Min evidence or filter by entity type to change the selection."
+            f"Showing top {max_nodes} entities of {total_kg_nodes:,} by evidence strength. "
+            "Adjust the Max nodes slider or filter by entity type to change the selection."
         )
 
+    # Problem 4 — apply min_edge_cooccurrence filter directly on G_sub
+    edges_to_remove = [
+        (u, v, k) for u, v, k, d in G_sub.edges(data=True, keys=True)
+        if d.get("weight", len(d.get("evidence_pmids", []))) < min_edge_cooccurrence
+    ]
+    G_sub.remove_edges_from(edges_to_remove)
+    isolated = list(nx.isolates(G_sub))
+    G_sub.remove_nodes_from(isolated)
+
+    if G_sub.number_of_nodes() == 0:
+        st.warning("No nodes remain after applying the edge co-occurrence filter. Lower the Min edge co-occurrence slider.")
+        return
+
     # ── Lazy-load: only build vis.js HTML when user clicks Render ─────────────
-    render_key = f"kg_render_{total_kg_nodes}_{G_sub.number_of_edges()}_{min_evidence}_{search_term}"
+    render_key = f"kg_render_{total_kg_nodes}_{G_sub.number_of_edges()}_{min_evidence}_{min_edge_cooccurrence}_{max_nodes}_{search_term}"
     if not st.session_state.get(render_key):
         st.info(
             f"Entity graph ready: {G_sub.number_of_nodes()} nodes, "
@@ -265,8 +310,8 @@ def render_knowledge_graph(
     for node, data in G_sub.nodes(data=True):
         node_str = str(node)
         etype = data.get("entity_type", "UNKNOWN")
-        color = config.ENTITY_TYPE_COLORS.get(etype, "#9CA3AF")
-        size = float(data.get("size", config.NODE_SIZE_MIN))
+        color = _ENTITY_COLOR_MAP.get(etype, _DEFAULT_KG_NODE_COLOR)
+        size = float(max(10, min(60, data.get("paper_count", 1) * 3)))
         paper_count = data.get("paper_count", 0)
         umls_id = data.get("umls_id", "—")
         is_gap = data.get("is_gap_node", False) and show_gap_nodes
@@ -298,15 +343,17 @@ def render_knowledge_graph(
             for _, v, d in out_edges
         )
 
-        show_label = paper_count >= median_count or is_highlight or is_search_match
-        display_label = node_str[:28] if show_label else ""
+        # Always show label — white, 14px
+        display_label = node_str[:30]
+
+        node_pmids = data.get("evidence_pmids", [])[:3]
+        pmid_str = ", ".join(str(p) for p in node_pmids)
 
         tooltip = (
-            f"<b>{node_str}</b><br>"
-            f"Type: <span style='color:{color}'>{etype}</span><br>"
-            f"UMLS: {umls_id}<br>"
-            f"Papers: {paper_count}<br>"
-            f"Outgoing relationships:<br>{edge_summary or '(none)'}"
+            f"{node_str}\n"
+            f"Type: {etype}\n"
+            f"Papers: {paper_count}"
+            + (f"\nPMIDs: {pmid_str}" if pmid_str else "")
         )
 
         px, py = positions.get(node_str, (0.0, 0.0))
@@ -326,15 +373,18 @@ def render_knowledge_graph(
             borderWidth=border_width,
             title=tooltip,
             shape=_ENTITY_SHAPE.get(etype, "dot"),
-            font={"size": max(8, int(size * 0.3)), "color": config.TEXT_PRIMARY},
+            font={"size": 14, "color": "#FFFFFF", "face": "Open Sans"},
         )
 
-    # ── Add edges (capped at _MAX_KG_EDGES, top by confidence) ────────────────
+    # ── Add edges (capped at _MAX_KG_EDGES, verb-based preferred) ────────────
     total_edges = G_sub.number_of_edges()
+    # Sort: verb-based relationships first (not co-occurrence), then by confidence
     all_edges = sorted(
         G_sub.edges(data=True),
-        key=lambda e: e[2].get("confidence_score", 0.5),
-        reverse=True,
+        key=lambda e: (
+            0 if e[2].get("relationship_type", "") != "co-occurs with" else 1,
+            -e[2].get("confidence_score", 0.5),
+        ),
     )
     seen_edges: Set[tuple] = set()
     for u, v, data in all_edges:
@@ -343,13 +393,16 @@ def render_knowledge_graph(
         edge_key = (str(u), str(v))
         if edge_key in seen_edges:
             continue
+        # Enforce minimum co-occurrence evidence for edges
+        evidence_pmids = data.get("evidence_pmids", [])
+        if len(evidence_pmids) < min_edge_cooccurrence:
+            continue
         seen_edges.add(edge_key)
 
         rel_type = data.get("relationship_type", "unknown")
         evidence_pmids = data.get("evidence_pmids", [])
         confidence = data.get("confidence_score", 0.5)
-        edge_color = _EDGE_COLORS.get(rel_type, _DEFAULT_EDGE_COLOR)
-        edge_color_alpha = _color_opacity(edge_color, 0.5)
+        edge_color_alpha = data.get("color", "rgba(255,255,255,0.25)")
 
         pmid_str = ", ".join(str(p) for p in evidence_pmids[:3])
         tooltip = (
@@ -363,8 +416,8 @@ def render_knowledge_graph(
             str(u), str(v),
             color={"color": edge_color_alpha, "highlight": "#FFD700", "hover": "#FFFFFF"},
             title=tooltip,
-            label=rel_type if len(seen_edges) < 200 else "",
-            font={"size": 7, "color": config.TEXT_SECONDARY, "align": "middle"},
+            label=rel_type,
+            font={"size": 9, "color": "#CCCCCC", "align": "middle"},
         )
 
     if total_edges > _MAX_KG_EDGES:
@@ -374,25 +427,44 @@ def render_knowledge_graph(
         )
 
     extra_css = _GAP_NODE_CSS if has_gap_nodes else ""
-    cache_key = f"kg_{G_sub.number_of_nodes()}_{min(total_edges, _MAX_KG_EDGES)}_{search_lower}_{min_evidence}"
+    cache_key = f"kg_{G_sub.number_of_nodes()}_{min(total_edges, _MAX_KG_EDGES)}_{search_lower}_{min_evidence}_{min_edge_cooccurrence}_{max_nodes}"
     _render_html(net, height=height, extra_css=extra_css, cache_key=cache_key)
 
 
 def render_entity_legend():
-    """Render a color-coded entity type legend."""
+    """Render grouped entity type legend with node size note."""
     st.markdown(
-        "<p style='color:{};font-size:13px;font-weight:600;margin-bottom:6px'>"
-        "Entity Types</p>".format(config.TEXT_SECONDARY),
+        f"<p style='color:{config.TEXT_SECONDARY};font-size:13px;"
+        f"font-weight:600;margin-bottom:8px'>Entity Types</p>",
         unsafe_allow_html=True,
     )
-    for etype, color in config.ENTITY_TYPE_COLORS.items():
+    _LEGEND = [
+        ("Diseases",            "#FF5252",  "DISEASE, CANCER"),
+        ("Chemicals",           "#00D4FF",  "CHEMICAL"),
+        ("Genes & Proteins",    "#00E676",  "GENE, PROTEIN, DNA, RNA"),
+        ("Organisms",           "#FFD600",  "ORGANISM, TAXON"),
+        ("Cells",               "#7B61FF",  "CELL_TYPE, CELL_LINE"),
+        ("Anatomy",             "#FF8B94",  "ANATOMY"),
+        ("Pathways",            "#A8E6CF",  "PATHWAY"),
+    ]
+    for group_label, color, subtypes in _LEGEND:
         st.markdown(
-            f"<div style='display:flex;align-items:center;gap:8px;margin-bottom:4px'>"
-            f"<div style='width:12px;height:12px;border-radius:50%;background:{color};flex-shrink:0'></div>"
-            f"<span style='color:{config.TEXT_PRIMARY};font-size:12px'>{etype}</span>"
-            f"</div>",
+            f"<div style='display:flex;align-items:flex-start;gap:8px;margin-bottom:6px'>"
+            f"<div style='width:13px;height:13px;border-radius:50%;"
+            f"background:{color};flex-shrink:0;margin-top:2px'></div>"
+            f"<div>"
+            f"<span style='color:{config.TEXT_PRIMARY};font-size:11px;font-weight:600'>"
+            f"{group_label}</span>"
+            f"<br><span style='color:{config.TEXT_SECONDARY};font-size:9px'>{subtypes}</span>"
+            f"</div></div>",
             unsafe_allow_html=True,
         )
+    st.markdown(
+        f"<div style='margin-top:10px;padding:6px 8px;background:#1C2539;"
+        f"border-radius:4px;font-size:10px;color:{config.TEXT_SECONDARY}'>"
+        f"Node size = frequency across papers</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def render_relationship_evidence_table(relationships_df, papers_df=None):

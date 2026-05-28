@@ -36,7 +36,6 @@ class TopicModeler:
         Initialise BERTopic with UMAP/HDBSCAN parameters scaled to *n_papers*.
         embedding_model=None because pre-computed embeddings are passed in
         fit_transform(); this avoids a second full-corpus encoding pass.
-        calculate_probabilities=False cuts memory and time significantly.
         """
         import warnings
         # Suppress transformers internal path access noise
@@ -48,21 +47,24 @@ class TopicModeler:
         from hdbscan import HDBSCAN
         from sklearn.feature_extraction.text import CountVectorizer
 
-        # Scale UMAP/HDBSCAN to dataset size for balanced granularity.
-        # n_neighbors capped at 15: UMAP complexity is O(N * n_neighbors) so
-        # 15 is ~3x faster than 50 with negligible quality loss for NLP tasks.
-        # n_components=3 keeps enough structure for HDBSCAN while being faster.
-        n_neighbors = max(10, min(15, n_papers // 100))
-        min_cluster_size = max(config.BERTOPIC_MIN_TOPIC_SIZE, min(30, n_papers // 100))
-        min_samples = max(5, min_cluster_size // 3)
+        n_neighbors = max(5, min(15, n_papers // 10))
+        n_components_umap = max(5, min(15, n_papers // 10))
+        min_cluster_size = max(5, n_papers // 80)
+        target_topics = max(10, min(25, n_papers // 80))
+
+        # Store for auto-retry in fit_transform
+        self._min_cluster_size = min_cluster_size
+        self._target_topics = target_topics
+        self._n_papers = n_papers
 
         logger.info(
-            "Initialising BERTopic (n_papers=%d, n_neighbors=%d, min_cluster_size=%d)",
-            n_papers, n_neighbors, min_cluster_size,
+            "Initialising BERTopic (n_papers=%d, n_neighbors=%d, n_components=%d, "
+            "min_cluster_size=%d, target_topics=%d)",
+            n_papers, n_neighbors, n_components_umap, min_cluster_size, target_topics,
         )
 
         umap_model = UMAP(
-            n_components=3,
+            n_components=n_components_umap,
             n_neighbors=n_neighbors,
             min_dist=0.0,
             metric="cosine",
@@ -72,16 +74,35 @@ class TopicModeler:
         )
         hdbscan_model = HDBSCAN(
             min_cluster_size=min_cluster_size,
-            min_samples=min_samples,
+            min_samples=3,
             metric="euclidean",
             cluster_selection_method="leaf",
+            cluster_selection_epsilon=0.3,
             prediction_data=True,
             core_dist_n_jobs=-1,
         )
+        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+        _extra_stops = {
+            "study", "studies", "group", "groups", "patient", "patients",
+            "treatment", "treatments", "result", "results", "method", "methods",
+            "analysis", "analyses", "effect", "effects", "data", "model", "models",
+            "using", "used", "based", "significant", "significantly", "associated",
+            "association", "compared", "comparison", "including", "level", "levels",
+            "role", "showed", "shown", "shows", "identified", "found", "reported",
+            "observed", "performed", "conducted", "number", "total", "rate", "rates",
+            "sample", "samples", "mean", "median", "review", "clinical", "respectively",
+            "related", "factor", "factors", "potential", "possible", "different",
+            "differences", "common", "similar", "various", "multiple", "large", "small",
+            "new", "type", "types", "case", "cases", "high", "low", "increased",
+            "decreased", "increase", "decrease", "vs", "et", "al", "p", "ci",
+            "95", "hr", "or", "rr", "risk", "odds", "ratio", "doi", "fig",
+        }
         vectorizer_model = CountVectorizer(
-            stop_words="english",
+            stop_words=list(set(ENGLISH_STOP_WORDS) | _extra_stops),
             min_df=2,
             ngram_range=(1, 2),
+            max_features=10000,
+            token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b",  # minimum 2-char tokens
         )
 
         self.model = BERTopic(
@@ -90,9 +111,9 @@ class TopicModeler:
             hdbscan_model=hdbscan_model,
             vectorizer_model=vectorizer_model,
             min_topic_size=min_cluster_size,
-            nr_topics=None,
+            nr_topics=target_topics,
             verbose=False,
-            calculate_probabilities=False,
+            calculate_probabilities=True,
         )
 
         self._ready = True
@@ -163,11 +184,41 @@ class TopicModeler:
         for idx, topic in zip(valid_indices, topics_valid):
             full_topics[idx] = int(topic)
 
+        topic_info = self.model.get_topic_info()
+        n_topics = len(topic_info[topic_info["Topic"] >= 0])
+
+        # Auto-retry: if fewer than 5 real topics, reduce min_cluster_size by 30%
+        if n_topics < 5:
+            from hdbscan import HDBSCAN as _HDBSCAN
+            new_mcs = max(3, int(getattr(self, "_min_cluster_size", 5) * 0.7))
+            logger.info(
+                "Only %d topics found; retrying with min_cluster_size=%d",
+                n_topics, new_mcs,
+            )
+            self.model.hdbscan_model = _HDBSCAN(
+                min_cluster_size=new_mcs,
+                min_samples=2,
+                metric="euclidean",
+                cluster_selection_method="leaf",
+                cluster_selection_epsilon=0.2,
+                prediction_data=True,
+            )
+            try:
+                if valid_embeddings is not None:
+                    topics_valid, probs = self.model.fit_transform(valid_docs, valid_embeddings)
+                else:
+                    topics_valid, probs = self.model.fit_transform(valid_docs)
+                full_topics = [-1] * n_total
+                for idx, topic in zip(valid_indices, topics_valid):
+                    full_topics[idx] = int(topic)
+                topic_info = self.model.get_topic_info()
+                n_topics = len(topic_info[topic_info["Topic"] >= 0])
+            except Exception as retry_exc:
+                logger.warning("Auto-retry failed: %s", retry_exc)
+
         self._topics = full_topics
         self._probs = probs if probs is not None else np.array([])
 
-        topic_info = self.model.get_topic_info()
-        n_topics = len(topic_info[topic_info["Topic"] >= 0])
         _cb(n_total, n_total, f"Topic modeling complete: {n_topics} topics discovered")
         logger.info("fit_transform done: %d topics, %d/%d documents used", n_topics, len(valid_docs), n_total)
 
@@ -230,37 +281,96 @@ class TopicModeler:
 
     # ── Topic labels ──────────────────────────────────────────────────────────
 
-    def get_topic_labels(self) -> Dict[int, Dict]:
+    # Generic academic/statistical words that add no biomedical meaning to a label
+    _LABEL_STOPWORDS = {
+        "study", "studies", "group", "groups", "patient", "patients",
+        "treatment", "treatments", "result", "results", "method", "methods",
+        "analysis", "analyses", "effect", "effects", "data", "model", "models",
+        "using", "used", "based", "significant", "significantly", "associated",
+        "association", "compared", "comparison", "including", "level", "levels",
+        "role", "showed", "shown", "shows", "identified", "found", "reported",
+        "observed", "performed", "conducted", "number", "total", "rate", "rates",
+        "sample", "samples", "mean", "median", "review", "clinical", "respectively",
+        "related", "factor", "factors", "potential", "possible", "different",
+        "differences", "common", "similar", "various", "multiple", "large", "small",
+        "new", "type", "types", "case", "cases", "high", "low", "increased",
+        "decreased", "increase", "decrease", "vs", "et", "al",
+    }
+
+    def get_topic_labels(self, papers_df=None) -> Dict[int, Dict]:
         """
         Return human-readable topic labels with top keywords.
         Labels are generated from the data — never hardcoded.
 
-        Returns dict: {topic_id: {label, top_words, count}}
+        Returns dict: {topic_id: {label, top_words, words, count, avg_year}}
+        If papers_df is provided, avg_year is computed from publication years.
         """
         self._check_ready()
 
         topic_info = self.model.get_topic_info()
         labels: Dict[int, Dict] = {}
 
+        # Build topic → avg publication year mapping if papers_df provided
+        topic_years: Dict[int, List] = {}
+        if papers_df is not None and self._topics is not None:
+            for doc_i, tid in enumerate(self._topics):
+                if tid < 0 or doc_i >= len(papers_df):
+                    continue
+                try:
+                    year = int(papers_df.iloc[doc_i].get("pub_year", 0) or 0)
+                except Exception:
+                    year = 0
+                if year > 0:
+                    topic_years.setdefault(tid, []).append(year)
+
         for _, row in topic_info.iterrows():
             tid = int(row["Topic"])
             if tid == -1:
-                continue  # outlier bucket
+                continue
 
             top_words_data = self.model.get_topic(tid)
-            top_words = (
-                [w for w, _ in top_words_data[:10]]
-                if top_words_data
-                else []
-            )
+            top_words = [w for w, _ in top_words_data[:15]] if top_words_data else []
 
-            # Build a concise label from top 3 keywords
-            label = " | ".join(top_words[:3]) if top_words else f"Topic {tid}"
+            # Separate multi-word phrases (bigrams) from single words
+            phrases = [w for w in top_words if " " in w]
+            singles = [
+                w for w in top_words
+                if " " not in w
+                and w.lower() not in self._LABEL_STOPWORDS
+                and len(w) >= 4
+            ]
+
+            # Prefer specific bigrams; deduplicate components already covered
+            selected: List[str] = []
+            covered_tokens: set = set()
+            for phrase in phrases:
+                tokens = set(phrase.lower().split())
+                if not tokens & covered_tokens:
+                    selected.append(phrase)
+                    covered_tokens |= tokens
+                if len(selected) == 3:
+                    break
+
+            # Fill remaining slots with specific single words
+            for word in singles:
+                if word.lower() not in covered_tokens and len(selected) < 3:
+                    selected.append(word)
+                    covered_tokens.add(word.lower())
+
+            if not selected:
+                selected = top_words[:3]
+
+            label = " | ".join(w.title() for w in selected) or f"Topic {tid}"
+
+            yrs = topic_years.get(tid, [])
+            avg_year = round(sum(yrs) / len(yrs)) if yrs else None
 
             labels[tid] = {
                 "label": label,
-                "top_words": top_words,
+                "top_words": top_words[:10],
+                "words": top_words[:10],
                 "count": int(row.get("Count", 0)),
+                "avg_year": avg_year,
             }
 
         return labels

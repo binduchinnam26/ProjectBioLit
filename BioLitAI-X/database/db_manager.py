@@ -27,20 +27,22 @@ class DatabaseManager:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _get_connection(self) -> sqlite3.Connection:
-        # timeout=30: wait up to 30 s for the lock instead of the default 5 s.
-        # On Windows with WAL mode, Streamlit reruns can leave a connection
-        # holding the lock for a few seconds; 30 s gives ample headroom.
-        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+        # timeout=5: short wait so UI page loads never hang more than 5 s.
+        # WAL mode allows concurrent reads even during background writes, so
+        # 5 s is ample for any transient lock.
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=5)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            # Disk full — WAL sidecar file can't be written; fall back to in-memory journal
+            conn.execute("PRAGMA journal_mode=MEMORY")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=100000")
         conn.execute("PRAGMA temp_store=MEMORY")
         conn.execute("PRAGMA mmap_size=268435456")
         conn.execute("PRAGMA foreign_keys=ON")
-        # busy_timeout (ms) is a belt-and-suspenders duplicate of the Python
-        # timeout above; it also covers lock waits inside multi-statement scripts.
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     @contextmanager
