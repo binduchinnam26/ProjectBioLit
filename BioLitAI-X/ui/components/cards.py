@@ -1,8 +1,11 @@
 """Reusable UI card components for BioLitAI-X."""
 
 from typing import List, Optional
+
 import streamlit as st
+
 import config
+from utils.helpers import pubmed_url, truncate
 
 
 def paper_card(
@@ -16,7 +19,6 @@ def paper_card(
     expanded: bool = False,
 ):
     """Render a single paper result card."""
-    from utils.helpers import pubmed_url, truncate
     url = pubmed_url(pmid)
     score_html = ""
     if score is not None:
