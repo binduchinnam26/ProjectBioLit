@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/database/
+data/embeddings/
+data/raw/
+data/processed/
+*.db
+*.log
